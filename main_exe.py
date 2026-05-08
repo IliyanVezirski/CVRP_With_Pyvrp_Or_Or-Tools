@@ -7,6 +7,7 @@ import sys
 import os
 import logging
 import shutil
+import argparse
 from pathlib import Path
 import importlib.util
 
@@ -243,6 +244,42 @@ def main_exe():
         print(f"\n❌ Грешка при изпълнение: {e}")
         logging.error(f"EXE грешка: {e}", exc_info=True)
 
+
+def server_exe():
+    """Стартира API сървъра в EXE режим."""
+    try:
+        parser = argparse.ArgumentParser(description="CVRP Optimizer API server")
+        parser.add_argument("--server", "--api", action="store_true")
+        parser.add_argument("--host", default=None)
+        parser.add_argument("--port", type=int, default=None)
+        args, _ = parser.parse_known_args()
+
+        setup_exe_environment()
+        load_config()
+
+        import config
+        api_config = config.get_config().api
+        host = args.host or getattr(api_config, "api_host", "0.0.0.0")
+        port = args.port or int(getattr(api_config, "api_port", 8088))
+        endpoint = getattr(api_config, "api_endpoint", "/solve")
+        public_url = (getattr(api_config, "api_public_url", "") or "").strip().rstrip("/")
+        if not public_url:
+            display_host = "127.0.0.1" if host == "0.0.0.0" else host
+            public_url = f"http://{display_host}:{port}"
+
+        from cvrp_api_server import run_server
+
+        print(f"🌐 CVRP API сървър: http://{host}:{port}")
+        print(f"🔗 URL за извикване: {public_url}{endpoint}")
+        print("Натиснете Ctrl+C за спиране.")
+        run_server(host, port)
+    except KeyboardInterrupt:
+        print("\n⚠️ API сървърът е спрян от потребителя.")
+    except Exception as e:
+        print(f"\n❌ Грешка при стартиране на API сървър: {e}")
+        logging.error(f"EXE API server грешка: {e}", exc_info=True)
+
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
@@ -251,5 +288,7 @@ if __name__ == "__main__":
         # Стартираме GUI за настройки
         from config_gui import main as gui_main
         gui_main()
+    elif "--server" in sys.argv or "--api" in sys.argv:
+        server_exe()
     else:
         main_exe()

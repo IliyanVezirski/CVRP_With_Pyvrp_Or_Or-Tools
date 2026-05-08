@@ -117,6 +117,8 @@ class ConfigGUI:
 
         # ─── Tab 6: Изходни данни ───
         self._add_output_tab(nb)
+        self._add_api_tab(nb)
+        self._add_set_data_tab(nb)
 
         # ─── Tab 7: Планировчик ───
         self._add_scheduler_tab(nb)
@@ -507,6 +509,14 @@ class ConfigGUI:
                          "combo", ["excel", "http_json"]); r += 1
         self._add_field(f, r, "input.excel_file_path", "Excel файл:", inp.excel_file_path); r += 1
         self._add_field(f, r, "input.json_url", "JSON URL:", inp.json_url); r += 1
+        self._add_field(f, r, "input.json_http_method", "JSON HTTP метод:", getattr(inp, "json_http_method", "GET"),
+                         "combo", ["GET", "POST"]); r += 1
+        self._add_field(f, r, "input.json_command", "cmd:", getattr(inp, "json_command", "getData")); r += 1
+        self._add_field(f, r, "input.json_date_field", "JSON поле за дата:", getattr(inp, "json_date_field", "date")); r += 1
+        self._add_field(f, r, "input.json_sklad", "Sklad:", getattr(inp, "json_sklad", "106")); r += 1
+        self._add_field(f, r, "input.json_done_flag", "DoneFlag:", getattr(inp, "json_done_flag", "1973")); r += 1
+        self._add_field(f, r, "input.json_extra_query", "Допълнителни GET параметри:", getattr(inp, "json_extra_query", ""),
+                         tooltip="Формат: key=value&key2=value2. По желание."); r += 1
         self._add_field(f, r, "input.json_override_date", "Конкретна дата (DD/MM/YYYY):", inp.json_override_date,
                          tooltip="Празно = автоматично следващ работен ден"); r += 1
         self._add_field(f, r, "input.json_timeout_seconds", "HTTP таймаут (сек):", inp.json_timeout_seconds); r += 1
@@ -518,6 +528,8 @@ class ConfigGUI:
         self._add_field(f, r, "input.json_client_name_field", "Име на клиент:", inp.json_client_name_field); r += 1
         self._add_field(f, r, "input.json_volume_field", "Обем (стекове):", inp.json_volume_field); r += 1
         self._add_field(f, r, "input.json_document_field", "Номер документ:", inp.json_document_field); r += 1
+        self._add_field(f, r, "input.json_plas_doc_field", "IdPlasDoc поле:", getattr(inp, "json_plas_doc_field", "IdPlasDoc")); r += 1
+        self._add_field(f, r, "input.json_id_skld_field", "IdSkld поле:", getattr(inp, "json_id_skld_field", "IdSkld")); r += 1
 
         ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
         ttk.Label(f, text="Картографиране на Excel колони:", font=("", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
@@ -557,6 +569,8 @@ class ConfigGUI:
             prefix = f"vehicle.{i}"
             self._add_field(f, r, f"{prefix}.enabled", "Активен:", v.enabled, "bool"); r += 1
             self._add_field(f, r, f"{prefix}.count", "Брой:", v.count); r += 1
+            self._add_field(f, r, f"{prefix}.fixed_cost", "Цена за използване:", getattr(v, "fixed_cost", 40000),
+                            tooltip="Глоба за всеки използван бус. 40000 е приблизително като 40 км."); r += 1
             self._add_field(f, r, f"{prefix}.capacity", "Капацитет (ст.):", v.capacity); r += 1
             self._add_field(f, r, f"{prefix}.max_time_hours", "Макс. време (ч.):", v.max_time_hours); r += 1
             self._add_field(f, r, f"{prefix}.service_time_minutes", "Обслужване (мин):", v.service_time_minutes); r += 1
@@ -602,6 +616,18 @@ class ConfigGUI:
         self._add_field(basic, r, "cvrp.solver_type", "Тип солвър:", c.solver_type,
                          "combo", ["pyvrp", "or_tools"]); r += 1
         self._add_field(basic, r, "cvrp.time_limit_seconds", "Време за решение (сек):", c.time_limit_seconds); r += 1
+
+        routing, r = self._add_group(
+            f,
+            "Routing",
+            "Настройки за пътната матрица, която се подава към solver-а.",
+        )
+        routing_cfg = self.cfg.routing
+        self._add_field(routing, r, "routing.enable_curbside_approach", "Спазвай страна на улицата:", getattr(routing_cfg, "enable_curbside_approach", False), "bool",
+                        tooltip="При OSRM добавя approaches=curb. При Valhalla добавя preferred_side към локациите."); r += 1
+        self._add_field(routing, r, "routing.valhalla_preferred_side", "Valhalla preferred side:", getattr(routing_cfg, "valhalla_preferred_side", "same"),
+                         "combo", ["same", "either", "opposite"],
+                         tooltip="same = клиентът да е от страната на движение. За България това обикновено значи отдясно."); r += 1
 
         dropping, r = self._add_group(
             f,
@@ -679,6 +705,8 @@ class ConfigGUI:
         self._add_field(f, r, "locations.enable_center_zone_restrictions", "Ограничения за център:", loc.enable_center_zone_restrictions, "bool"); r += 1
         self._add_field(f, r, "locations.discount_center_bus", "Отстъпка CENTER_BUS:", loc.discount_center_bus,
                          tooltip="0.5 = плаща 50% от разстоянието"); r += 1
+        self._add_field(f, r, "locations.center_bus_outside_center_penalty", "Глоба CENTER_BUS извън център:", getattr(loc, "center_bus_outside_center_penalty", 50000.0),
+                         tooltip="Добавя се към цената, когато CENTER_BUS обслужва клиент извън център зоната."); r += 1
 
         ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
         ttk.Label(f, text="Глоби за влизане в център зоната:", font=("", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
@@ -720,13 +748,17 @@ class ConfigGUI:
 
         ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
         ttk.Label(f, text="Excel:", font=("", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+        self._add_field(f, r, "output.enable_excel_output", "Генериране на Excel отчет:", getattr(out, "enable_excel_output", True), "bool"); r += 1
         self._add_field(f, r, "output.excel_output_dir", "Директория Excel:", out.excel_output_dir); r += 1
         self._add_field(f, r, "output.routes_excel_file", "Файл маршрути:", out.routes_excel_file); r += 1
         self._add_field(f, r, "output.warehouse_excel_file", "Файл склад:", out.warehouse_excel_file); r += 1
         self._add_field(f, r, "output.efficiency_excel_file", "Файл ефективност:", out.efficiency_excel_file); r += 1
+        self._add_field(f, r, "output.excel_bus_number_prefix", "Префикс номер бус:", getattr(out, "excel_bus_number_prefix", "10045010")); r += 1
+        self._add_field(f, r, "output.excel_bus_number_digits", "Цифри след префикса:", getattr(out, "excel_bus_number_digits", 2), "int"); r += 1
 
         ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
         ttk.Label(f, text="CSV:", font=("", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+        self._add_field(f, r, "output.enable_csv_output", "Генериране на CSV:", getattr(out, "enable_csv_output", True), "bool"); r += 1
         self._add_field(f, r, "output.csv_output_file", "Файл CSV:", out.csv_output_file); r += 1
 
         ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
@@ -735,6 +767,103 @@ class ConfigGUI:
         self._add_field(f, r, "output.charts_output_dir", "Директория графики:", out.charts_output_dir); r += 1
 
     # ── Tab: Планировчик ────────────────────────────────────
+
+    # API server settings
+
+    def _add_api_tab(self, nb):
+        tab = ttk.Frame(nb)
+        nb.add(tab, text=" API сървър ")
+        f = self._make_scrollable_frame(tab)
+        f.columnconfigure(1, weight=1)
+        api = getattr(self.cfg, "api", None)
+        r = 0
+
+        self._add_field(
+            f,
+            r,
+            "api.api_host",
+            "Адрес за слушане:",
+            getattr(api, "api_host", "0.0.0.0"),
+            tooltip="0.0.0.0 = приема заявки от други компютри. 127.0.0.1 = само локално.",
+        ); r += 1
+        self._add_field(f, r, "api.api_port", "Порт:", getattr(api, "api_port", 8088)); r += 1
+        self._add_field(
+            f,
+            r,
+            "api.api_public_url",
+            "URL за извикване:",
+            getattr(api, "api_public_url", ""),
+            tooltip="Празно = автоматично от адреса и порта. Пример: http://10.10.100.134:8088 или https://domain.com/cvrp.",
+        ); r += 1
+        self._add_field(f, r, "api.api_endpoint", "POST endpoint:", getattr(api, "api_endpoint", "/solve")); r += 1
+        self._add_field(f, r, "api.health_endpoint", "Health endpoint:", getattr(api, "health_endpoint", "/health")); r += 1
+
+    def _add_set_data_tab(self, nb):
+        tab = ttk.Frame(nb)
+        nb.add(tab, text=" setData ")
+        f = self._make_scrollable_frame(tab)
+        f.columnconfigure(1, weight=1)
+        set_data = getattr(self.cfg, "set_data", None)
+        r = 0
+
+        self._add_field(f, r, "set_data.enable_set_data_upload", "Изпращай setData:", getattr(set_data, "enable_set_data_upload", False), "bool",
+                        tooltip="Когато е включено, след успешно решение изпраща по една setData заявка за всеки обслужен клиент."); r += 1
+        self._add_field(f, r, "set_data.set_data_url", "setData URL:", getattr(set_data, "set_data_url", "http://sio.effect.bg:7080/lubiv_Bizant")); r += 1
+        self._add_field(f, r, "set_data.set_data_http_method", "HTTP метод:", getattr(set_data, "set_data_http_method", "GET"),
+                         "combo", ["GET", "POST"]); r += 1
+        self._add_field(f, r, "set_data.set_data_command", "cmd:", getattr(set_data, "set_data_command", "setData")); r += 1
+        self._add_field(f, r, "set_data.set_data_done_flag", "DoneFlag:", getattr(set_data, "set_data_done_flag", "1973")); r += 1
+        self._add_field(f, r, "set_data.set_data_id_skld", "IdSkld основно депо:", getattr(set_data, "set_data_id_skld", "128")); r += 1
+        self._add_field(f, r, "set_data.set_data_vratza_id_skld", "IdSkld Враца:", getattr(set_data, "set_data_vratza_id_skld", "106")); r += 1
+        self._add_field(
+            f,
+            r,
+            "set_data.set_data_depot_id_skld_map",
+            "Корекции по депо:",
+            getattr(set_data, "set_data_depot_id_skld_map", "Главно депо=128;Враца=106"),
+            tooltip="Формат: Главно депо=128;Враца=106. Имената са същите като депата в таб Локации.",
+        ); r += 1
+        self._add_field(f, r, "set_data.set_data_id_grafik", "IdGrafik:", getattr(set_data, "set_data_id_grafik", "")); r += 1
+        self._add_field(
+            f,
+            r,
+            "set_data.set_data_id_grafik_template",
+            "IdGrafik шаблон:",
+            getattr(set_data, "set_data_id_grafik_template", "{bus_number}"),
+            tooltip="Default {bus_number} = номерът на буса от Excel, напр. 1004501001.",
+        ); r += 1
+        self._add_field(
+            f,
+            r,
+            "set_data.set_data_bukva_template",
+            "Bukva шаблон:",
+            getattr(set_data, "set_data_bukva_template", "БХ{route_number}-{stop_number}"),
+            tooltip="Позволени: {bus_number}, {route_number}, {stop_number}, {vehicle_type}, {customer_id}, {customer_document}, {id_skld}, {id_grafik}, {done_flag}.",
+        ); r += 1
+        ttk.Separator(f, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="we", pady=8); r += 1
+        ttk.Label(f, text="Необслужени клиенти:", font=("", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+        self._add_field(f, r, "set_data.enable_unserved_set_data_upload", "Изпращай необслужени:", getattr(set_data, "enable_unserved_set_data_upload", True), "bool",
+                        tooltip="Праща към setData и клиентите за склад/пропуснатите. IdSkld се взима от GET полето IdSkld на клиента."); r += 1
+        self._add_field(f, r, "set_data.set_data_unserved_id_grafik", "IdGrafik необслужени:", getattr(set_data, "set_data_unserved_id_grafik", "")); r += 1
+        self._add_field(
+            f,
+            r,
+            "set_data.set_data_unserved_id_grafik_template",
+            "IdGrafik шаблон необслужени:",
+            getattr(set_data, "set_data_unserved_id_grafik_template", "{id_grafik}"),
+            tooltip="Позволени: {id_grafik}, {customer_id}, {customer_document}, {id_plas_doc}, {id_skld}, {stop_number}.",
+        ); r += 1
+        self._add_field(
+            f,
+            r,
+            "set_data.set_data_unserved_bukva_template",
+            "Bukva шаблон необслужени:",
+            getattr(set_data, "set_data_unserved_bukva_template", "HOF-{id_plas_doc}"),
+            tooltip="Позволени: {id_grafik}, {customer_id}, {customer_document}, {id_plas_doc}, {id_skld}, {stop_number}.",
+        ); r += 1
+        self._add_field(f, r, "set_data.enable_make_group", "Изпращай makeGroup:", getattr(set_data, "enable_make_group", True), "bool"); r += 1
+        self._add_field(f, r, "set_data.set_data_make_group_command", "makeGroup cmd:", getattr(set_data, "set_data_make_group_command", "makeGroup")); r += 1
+        self._add_field(f, r, "set_data.set_data_timeout_seconds", "Таймаут (сек):", getattr(set_data, "set_data_timeout_seconds", 30)); r += 1
 
     TASK_NAME = "CVRP_Optimizer_Auto"
 
@@ -905,6 +1034,12 @@ class ConfigGUI:
             "input.input_source": ("input_source", "str"),
             "input.excel_file_path": ("excel_file_path", "path"),
             "input.json_url": ("json_url", "str"),
+            "input.json_http_method": ("json_http_method", "str"),
+            "input.json_command": ("json_command", "str"),
+            "input.json_date_field": ("json_date_field", "str"),
+            "input.json_sklad": ("json_sklad", "str"),
+            "input.json_done_flag": ("json_done_flag", "str"),
+            "input.json_extra_query": ("json_extra_query", "str"),
             "input.json_override_date": ("json_override_date", "str"),
             "input.json_timeout_seconds": ("json_timeout_seconds", "int"),
             "input.json_gps_field": ("json_gps_field", "str"),
@@ -912,11 +1047,16 @@ class ConfigGUI:
             "input.json_client_name_field": ("json_client_name_field", "str"),
             "input.json_volume_field": ("json_volume_field", "str"),
             "input.json_document_field": ("json_document_field", "str"),
+            "input.json_plas_doc_field": ("json_plas_doc_field", "str"),
+            "input.json_id_skld_field": ("json_id_skld_field", "str"),
             "input.gps_column": ("gps_column", "str"),
             "input.client_id_column": ("client_id_column", "str"),
             "input.client_name_column": ("client_name_column", "str"),
             "input.volume_column": ("volume_column", "str"),
             "input.document_column": ("document_column", "str"),
+            # Routing
+            "routing.enable_curbside_approach": ("enable_curbside_approach", "bool"),
+            "routing.valhalla_preferred_side": ("valhalla_preferred_side", "str"),
             # Warehouse
             "warehouse.enable_warehouse": ("enable_warehouse", "bool"),
             "warehouse.sort_by_volume": ("sort_by_volume", "bool"),
@@ -946,6 +1086,7 @@ class ConfigGUI:
             "locations.enable_center_zone_priority": ("enable_center_zone_priority", "bool"),
             "locations.enable_center_zone_restrictions": ("enable_center_zone_restrictions", "bool"),
             "locations.discount_center_bus": ("discount_center_bus", "float"),
+            "locations.center_bus_outside_center_penalty": ("center_bus_outside_center_penalty", "float"),
             "locations.internal_bus_center_penalty": ("internal_bus_center_penalty", "float"),
             "locations.external_bus_center_penalty": ("external_bus_center_penalty", "float"),
             "locations.special_bus_center_penalty": ("special_bus_center_penalty", "float"),
@@ -960,13 +1101,42 @@ class ConfigGUI:
             "output.map_provider": ("map_provider", "str"),
             "output.folium_tiles": ("folium_tiles", "str"),
             "output.google_maps_api_key": ("google_maps_api_key", "str"),
+            "output.enable_excel_output": ("enable_excel_output", "bool"),
             "output.excel_output_dir": ("excel_output_dir", "path"),
             "output.routes_excel_file": ("routes_excel_file", "str"),
             "output.warehouse_excel_file": ("warehouse_excel_file", "str"),
             "output.efficiency_excel_file": ("efficiency_excel_file", "str"),
+            "output.excel_bus_number_prefix": ("excel_bus_number_prefix", "str"),
+            "output.excel_bus_number_digits": ("excel_bus_number_digits", "int"),
+            "output.enable_csv_output": ("enable_csv_output", "bool"),
             "output.csv_output_file": ("csv_output_file", "path"),
             "output.enable_charts": ("enable_charts", "bool"),
             "output.charts_output_dir": ("charts_output_dir", "path"),
+            # API server
+            "api.api_host": ("api_host", "str"),
+            "api.api_port": ("api_port", "int"),
+            "api.api_public_url": ("api_public_url", "str"),
+            "api.api_endpoint": ("api_endpoint", "str"),
+            "api.health_endpoint": ("health_endpoint", "str"),
+            # Bizant setData
+            "set_data.enable_set_data_upload": ("enable_set_data_upload", "bool"),
+            "set_data.set_data_url": ("set_data_url", "str"),
+            "set_data.set_data_http_method": ("set_data_http_method", "str"),
+            "set_data.set_data_command": ("set_data_command", "str"),
+            "set_data.set_data_done_flag": ("set_data_done_flag", "str"),
+            "set_data.set_data_id_skld": ("set_data_id_skld", "str"),
+            "set_data.set_data_vratza_id_skld": ("set_data_vratza_id_skld", "str"),
+            "set_data.set_data_depot_id_skld_map": ("set_data_depot_id_skld_map", "str"),
+            "set_data.set_data_id_grafik": ("set_data_id_grafik", "str"),
+            "set_data.set_data_id_grafik_template": ("set_data_id_grafik_template", "str"),
+            "set_data.set_data_bukva_template": ("set_data_bukva_template", "str"),
+            "set_data.enable_unserved_set_data_upload": ("enable_unserved_set_data_upload", "bool"),
+            "set_data.set_data_unserved_id_grafik": ("set_data_unserved_id_grafik", "str"),
+            "set_data.set_data_unserved_id_grafik_template": ("set_data_unserved_id_grafik_template", "str"),
+            "set_data.set_data_unserved_bukva_template": ("set_data_unserved_bukva_template", "str"),
+            "set_data.enable_make_group": ("enable_make_group", "bool"),
+            "set_data.set_data_make_group_command": ("set_data_make_group_command", "str"),
+            "set_data.set_data_timeout_seconds": ("set_data_timeout_seconds", "int"),
         }
 
         import re
@@ -1159,6 +1329,7 @@ class ConfigGUI:
         vehicle_fields = {
             "enabled": "bool",
             "count": "int",
+            "fixed_cost": "int",
             "capacity": "int",
             "max_time_hours": "int",
             "service_time_minutes": "int",

@@ -2473,12 +2473,12 @@ class ExcelExporter:
         
         # Заглавни редове
         headers = [
-            'Маршрут', 'Превозно средство', 'Ред в маршрута', 
+            'ID бус', 'Маршрут', 'Превозно средство', 'Ред в маршрута',
             'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Обем (ст.)', 'GPS координати',
             'Разстояние до центъра (км)', 'Депо стартова точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
-            'Време от предишен (мин)', 'Накоплено време (мин)',
-            'Стартово време (мин)', 'Време с натрупване (мин)', 'Време с натрупване (чч:мм)'
+            'Време от предишен (ч)', 'Накоплено време (ч)',
+            'Стартово време (чч:мм)', 'Време с натрупване (ч)', 'Време с натрупване (чч:мм)'
         ]
         
         # Стилове за заглавния ред
@@ -2498,7 +2498,7 @@ class ExcelExporter:
         center_location = get_config().locations.center_location
         
         for i, route in enumerate(solution.routes):
-            vehicle_name = VEHICLE_SETTINGS.get(route.vehicle_type.value, {}).get('name', 'Неизвестен')
+            vehicle_name = self._get_report_vehicle_name(route.vehicle_type)
             
             # Изчисляваме стартово време за този тип превозно средство
             start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
@@ -2539,7 +2539,8 @@ class ExcelExporter:
                 is_in_center_zone = is_location_in_center_zone(customer.coordinates, get_config().locations)
                 
                 data = [
-                    i + 1,  # Маршрут
+                    self._format_report_bus_number(i),  # Маршрут / номер бус
+                    i + 1,  # Номер маршрут
                     vehicle_name,  # Превозно средство
                     j + 1,  # Ред в маршрута
                     self._format_movement_direction(previous_stop_name, customer.name),
@@ -2552,10 +2553,10 @@ class ExcelExporter:
                     f"{route.depot_location[0]:.6f}, {route.depot_location[1]:.6f}",  # Депо
                     round(distance_from_previous, 2),  # Разстояние от предишен
                     round(cumulative_distance, 2),  # Накоплено разстояние
-                    round(total_time_for_this_step, 1),  # Време от предишен + service time
-                    round(cumulative_time, 1),  # Накоплено време
-                    start_time_minutes,  # Стартово време (мин)
-                    round(total_time_with_start, 1),  # Време с натрупване (мин)
+                    self._minutes_to_hours(total_time_for_this_step),  # Време от предишен + service time
+                    self._minutes_to_hours(cumulative_time),  # Накоплено време
+                    self._format_time_hh_mm(start_time_minutes),  # Стартово време
+                    self._minutes_to_hours(total_time_with_start),  # Време с натрупване
                     self._format_time_hh_mm(int(total_time_with_start))  # Време с натрупване (чч:мм)
                 ]
                 
@@ -2656,7 +2657,7 @@ class ExcelExporter:
             ("Необслужени клиенти", len(warehouse_customers)),
             ("Брой маршрути", len(solution.routes)),
             ("Общо разстояние (км)", round(solution.total_distance_km, 2)),
-            ("Общо време (мин)", round(solution.total_time_minutes, 2)),
+            ("Общо време (ч)", self._minutes_to_hours(solution.total_time_minutes)),
             ("Общ обем (ст.)", round(sum(route.total_volume for route in solution.routes), 2))
         ]
         
@@ -2668,12 +2669,12 @@ class ExcelExporter:
         
         # Информация за стартови времена
         row += 2
-        ws[f'A{row}'] = "СТАРТОВИ ВРЕМЕНА ПО ТИП АВТОБУС"
+        ws[f'A{row}'] = "СТАРТОВИ ВРЕМЕНА ПО ТИП БУС"
         ws[f'A{row}'].font = title_font
         row += 1
         
         # Заглавни редове за стартови времена
-        start_time_headers = ['Тип автобус', 'Стартово време (мин)', 'Стартово време (чч:мм)']
+        start_time_headers = ['Тип бус', 'Стартово време (чч:мм)']
         for col, header in enumerate(start_time_headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = header_font
@@ -2685,21 +2686,20 @@ class ExcelExporter:
         for route in solution.routes:
             if route.vehicle_type.value not in vehicle_types_seen:
                 vehicle_types_seen.add(route.vehicle_type.value)
-                vehicle_name = VEHICLE_SETTINGS.get(route.vehicle_type.value, {}).get('name', route.vehicle_type.value)
+                vehicle_name = self._get_report_vehicle_name(route.vehicle_type, route.vehicle_type.value)
                 start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
                 
                 data = [
                     vehicle_name,
-                    start_time_minutes,
                     self._format_time_hh_mm(start_time_minutes)
                 ]
                 for col, value in enumerate(data, 1):
                     ws.cell(row=row, column=col, value=value)
                 row += 1
         
-        # Статистики по тип автобус
+        # Статистики по тип бус
         row += 2
-        ws[f'A{row}'] = "СТАТИСТИКИ ПО ТИП АВТОБУС"
+        ws[f'A{row}'] = "СТАТИСТИКИ ПО ТИП БУС"
         ws[f'A{row}'].font = title_font
         row += 1
         
@@ -2716,7 +2716,7 @@ class ExcelExporter:
             vehicle_stats[vehicle_type]['customers'] += len(route.customers)
         
         # Заглавни редове за статистики
-        headers = ['Тип автобус', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
+        headers = ['Тип бус', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = header_font
@@ -2725,7 +2725,7 @@ class ExcelExporter:
         
         # Данни за статистики
         for vehicle_type, stats in vehicle_stats.items():
-            vehicle_name = VEHICLE_SETTINGS.get(vehicle_type, {}).get('name', vehicle_type)
+            vehicle_name = VEHICLE_SETTINGS.get(vehicle_type, {}).get('name', vehicle_type).replace("автобус", "бус").replace("Автобус", "Бус")
             data = [
                 vehicle_name,
                 stats['count'],
@@ -2751,12 +2751,12 @@ class ExcelExporter:
             ws.column_dimensions[column_letter].width = adjusted_width
     
     def _create_vehicle_stats_sheet(self, wb, solution: CVRPSolution):
-        """Създава sheet със статистики по отделни автобуси"""
-        ws = wb.create_sheet("Статистики по автобуси")
+        """Създава sheet със статистики по отделни бусове"""
+        ws = wb.create_sheet("Статистики по бусове")
         
         headers = [
-            'Маршрут', 'Тип автобус', 'Брой клиенти', 'Общ обем (ст.)',
-            'Разстояние (км)', 'Време (мин)', 'Капацитет използване (%)',
+            'ID бус', 'Маршрут', 'Тип бус', 'Брой клиенти', 'Общ обем (ст.)',
+            'Разстояние (км)', 'Време (ч)', 'Капацитет използване (%)',
             'Средно разстояние до центъра (км)', 'Депо стартова точка', 'Стартово време (чч:мм)'
         ]
         
@@ -2777,7 +2777,7 @@ class ExcelExporter:
         row = 2
         
         for i, route in enumerate(solution.routes):
-            vehicle_name = VEHICLE_SETTINGS.get(route.vehicle_type.value, {}).get('name', 'Неизвестен')
+            vehicle_name = self._get_report_vehicle_name(route.vehicle_type)
             
             # Изчисляваме средното разстояние до центъра
             distances_to_center = []
@@ -2796,12 +2796,13 @@ class ExcelExporter:
             start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
             
             data = [
-                i + 1,  # Маршрут
-                vehicle_name,  # Тип автобус
+                self._format_report_bus_number(i),  # Маршрут / номер бус
+                i + 1,  # Номер маршрут
+                vehicle_name,  # Тип бус
                 len(route.customers),  # Брой клиенти
                 round(route.total_volume, 2),  # Общ обем
                 round(route.total_distance_km, 2),  # Разстояние
-                round(route.total_time_minutes, 2),  # Време
+                self._minutes_to_hours(route.total_time_minutes),  # Време
                 round(capacity_usage, 1),  # Капацитет използване
                 round(avg_distance_to_center, 2),  # Средно разстояние до центъра
                 f"{route.depot_location[0]:.6f}, {route.depot_location[1]:.6f}",  # Депо
@@ -2900,6 +2901,25 @@ class ExcelExporter:
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return f"{hours:02d}:{minutes:02d}"
+
+    def _minutes_to_hours(self, total_minutes) -> float:
+        """Връща продължителност в часове за CVRP отчета."""
+        return round(float(total_minutes or 0) / 60, 2)
+
+    def _format_report_bus_number(self, route_index: int) -> str:
+        """Форматира номера на буса за Excel отчетите."""
+        prefix = str(getattr(self.config, "excel_bus_number_prefix", "10045010") or "")
+        try:
+            digits = int(getattr(self.config, "excel_bus_number_digits", 2) or 2)
+        except (TypeError, ValueError):
+            digits = 2
+        digits = max(1, digits)
+        return f"{prefix}{route_index + 1:0{digits}d}"
+
+    def _get_report_vehicle_name(self, vehicle_type, default="Неизвестен") -> str:
+        """Име на превозното средство за CVRP отчета."""
+        name = VEHICLE_SETTINGS.get(vehicle_type.value, {}).get('name', default)
+        return name.replace("автобус", "бус").replace("Автобус", "Бус")
     
     def export_warehouse_orders(self, warehouse_customers: List[Customer]) -> str:
         """Експортира заявките в склада (за съвместимост)"""
@@ -2940,6 +2960,7 @@ class ExcelExporter:
             previous_stop_name = "Депо"
             for j, customer in enumerate(route.customers):
                 data.append({
+                    'ID бус': self._format_report_bus_number(i),
                     'Маршрут': i + 1,
                     'Превозно средство': vehicle_name,
                     'Ред в маршрута': j + 1,
@@ -3264,7 +3285,7 @@ class OutputHandler:
         output_files = {}
 
         # 1. Интерактивна карта (обща)
-        if self.config.enable_interactive_map:
+        if getattr(self.config, "enable_interactive_map", True):
             map_gen = InteractiveMapGenerator(self.config)
             route_map = map_gen.create_map(solution, warehouse_allocation, depot_location)
             map_file = map_gen.save_map(route_map)
@@ -3281,28 +3302,40 @@ class OutputHandler:
                 output_files[f'route_map_{route_number}'] = saved_route_file
             logger.info(f"Генерирани {len(solution.routes)} отделни HTML карти в {routes_dir}")
         
+        else:
+            logger.info("Генерирането на карти е изключено от настройките.")
+
         # 2. Обединяване на всички необслужени клиенти
         all_unserviced_customers = warehouse_allocation.warehouse_customers + solution.dropped_customers
         
         # 3. Експорт в един общ Excel файл с отделни sheets
-        if solution.routes or all_unserviced_customers:
-            excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
-            if excel_file:
-                output_files['excel_report'] = excel_file
+        if getattr(self.config, "enable_excel_output", True):
+            if solution.routes or all_unserviced_customers:
+                excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
+                if excel_file:
+                    output_files['excel_report'] = excel_file
+        else:
+            logger.info("Генерирането на Excel отчет е изключено от настройките.")
         
         # 4. CSV файл с маршрутите
-        if solution.routes:
-            csv_file = self.excel_exporter.export_routes_csv(solution)
-            if csv_file:
-                output_files['csv_routes'] = csv_file
+        if getattr(self.config, "enable_csv_output", True):
+            if solution.routes:
+                csv_file = self.excel_exporter.export_routes_csv(solution)
+                if csv_file:
+                    output_files['csv_routes'] = csv_file
+        else:
+            logger.info("Генерирането на CSV е изключено от настройките.")
         
         # 5. Графики (charts)
-        try:
-            chart_gen = ChartGenerator(self.config)
-            chart_files = chart_gen.generate_all_charts(solution, all_unserviced_customers)
-            output_files.update(chart_files)
-        except Exception as e:
-            logger.error(f"Грешка при генериране на графики: {e}")
+        if getattr(self.config, "enable_charts", True):
+            try:
+                chart_gen = ChartGenerator(self.config)
+                chart_files = chart_gen.generate_all_charts(solution, all_unserviced_customers)
+                output_files.update(chart_files)
+            except Exception as e:
+                logger.error(f"Грешка при генериране на графики: {e}")
+        else:
+            logger.info("Генерирането на графики е изключено от настройките.")
         
         logger.info(f"Генерирани {len(output_files)} изходни файла")
         return output_files

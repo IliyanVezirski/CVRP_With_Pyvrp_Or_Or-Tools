@@ -214,10 +214,14 @@ class OSRMClient:
     
     def __init__(self, config: Optional[OSRMConfig] = None):
         self.config = config or get_config().osrm
+        self.routing_config = get_config().routing
         self.cache = OSRMCache(
             cache_file=os.path.join(get_config().cache.cache_dir, get_config().cache.osrm_cache_file),
             expiry_hours=self.config.cache_expiry_hours
-        ) if self.config.use_cache else None
+        ) if self.config.use_cache and not self._curbside_enabled() else None
+
+        if self.config.use_cache and self._curbside_enabled():
+            logger.info("OSRM кешът е пропуснат, защото curbside routing е включен.")
         
         # Оптимизиран HTTP session за по-бързи заявки
         self.session = requests.Session()
@@ -246,6 +250,30 @@ class OSRMClient:
         
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+
+    def _curbside_enabled(self) -> bool:
+        return bool(getattr(self.routing_config, "enable_curbside_approach", False))
+
+    def _approaches_query(self, count: int) -> str:
+        if not self._curbside_enabled():
+            return ""
+        return "&approaches=" + ";".join(["curb"] * count)
+
+    def _build_route_url(
+        self,
+        origin: Tuple[float, float],
+        destination: Tuple[float, float],
+        base_url: Optional[str] = None,
+    ) -> str:
+        lat1, lon1 = origin
+        lat2, lon2 = destination
+        clean_base_url = (base_url or self.config.base_url).rstrip("/")
+        route_url = (
+            f"{clean_base_url}/route/v1/{self.config.profile}/"
+            f"{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}"
+            "?overview=false&steps=false"
+        )
+        return route_url + self._approaches_query(2)
     
     def get_distance_matrix(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Получава матрица с разстояния използвайки интелигентен batch подход"""
@@ -593,10 +621,7 @@ class OSRMClient:
                     
                     try:
                         # Route заявка
-                        lat1, lon1 = locations[i]
-                        lat2, lon2 = locations[j]
-                        clean_base_url = base_url.rstrip('/')
-                        route_url = f"{clean_base_url}/route/v1/driving/{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}?overview=false&steps=false"
+                        route_url = self._build_route_url(locations[i], locations[j], base_url)
                         
                         response = self.session.get(route_url, timeout=10)  # по-кратък timeout
                         response.raise_for_status()
@@ -644,11 +669,7 @@ class OSRMClient:
 
     def _single_route_request(self, src_loc: Tuple[float, float], dest_loc: Tuple[float, float]) -> dict:
         """Прави една Route API заявка за fallback"""
-        lat1, lon1 = src_loc
-        lat2, lon2 = dest_loc
-        
-        clean_base_url = self.config.base_url.rstrip('/')
-        route_url = f"{clean_base_url}/route/v1/driving/{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}?overview=false&steps=false"
+        route_url = self._build_route_url(src_loc, dest_loc)
         
         response = self.session.get(route_url, timeout=5)
         response.raise_for_status()
@@ -751,7 +772,8 @@ class OSRMClient:
         base_url = base_url.rstrip('/')
         coords_str = ';'.join([f"{lon:.6f},{lat:.6f}" for lat, lon in locations])
         # Добавяме annotations=distance,duration, за да получим разстояния и времена
-        return f"{base_url}/table/v1/{self.config.profile}/{coords_str}?annotations=distance,duration"
+        url = f"{base_url}/table/v1/{self.config.profile}/{coords_str}?annotations=distance,duration"
+        return url + self._approaches_query(len(locations))
     
     def _make_post_request(self, locations: List[Tuple[float, float]], base_url: str) -> requests.Response:
         """Прави POST заявка за големи координатни списъци"""
@@ -764,6 +786,8 @@ class OSRMClient:
             "coordinates": coordinates,
             "annotations": ["distance", "duration"]
         }
+        if self._curbside_enabled():
+            post_data["approaches"] = ["curb"] * len(locations)
         
         response = self.session.post(
             url, 
@@ -1280,6 +1304,10 @@ def get_customer_distance_matrix(customers, depot_location: Tuple[float, float])
 def get_distance_matrix_from_central_cache(locations: List[Tuple[float, float]]) -> Optional[DistanceMatrix]:
     """Получава матрица с разстояния директно от централния кеш (ПОДОБРЕНО с submatrix extraction)"""
     try:
+        if getattr(get_config().routing, "enable_curbside_approach", False):
+            logger.info("Централният OSRM кеш е пропуснат, защото curbside routing е включен.")
+            return None
+
         # Създаваме кеш инстанция
         cache = OSRMCache(
             cache_file=os.path.join(get_config().cache.cache_dir, get_config().cache.osrm_cache_file),

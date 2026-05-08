@@ -53,7 +53,10 @@ def setup_logging():
         logger.addHandler(file_handler)
 
 
-def prepare_data(input_file: Optional[str]) -> Tuple[Optional[InputData], Optional[WarehouseAllocation]]:
+def prepare_data(
+    input_file: Optional[str],
+    input_data_override: Optional[InputData] = None,
+) -> Tuple[Optional[InputData], Optional[WarehouseAllocation]]:
     """
     Стъпка 1: Подготвя всички входни данни.
     """
@@ -62,11 +65,16 @@ def prepare_data(input_file: Optional[str]) -> Tuple[Optional[InputData], Option
     logger.info("СТЪПКА 1: ПОДГОТОВКА НА ДАННИ")
     logger.info("="*60)
     
-    input_handler = InputHandler()
     warehouse_manager = WarehouseManager()
 
     try:
-        input_data = input_handler.load_data(input_file)
+        if input_data_override is not None:
+            input_data = input_data_override
+            logger.info("Използвам клиентски данни, подадени директно към процеса.")
+        else:
+            input_handler = InputHandler()
+            input_data = input_handler.load_data(input_file)
+
         if not input_data or not input_data.customers:
             logger.error("Не са намерени валидни клиенти във входния файл.")
             return None, None
@@ -273,6 +281,7 @@ def process_results(
     logger.info("="*60)
     logger.info("CVRP ОПТИМИЗАЦИЯ ЗАВЪРШЕНА УСПЕШНО")
     logger.info("="*60)
+    return output_files
 
 
 def _print_summary(input_data, warehouse_allocation, solution, output_files, execution_time):
@@ -309,8 +318,71 @@ def _print_summary(input_data, warehouse_allocation, solution, output_files, exe
     logger.info("="*50)
 
 
-def main():
-    """Главна функция - оркестратор."""
+def _solution_to_api_response(
+    solution: CVRPSolution,
+    input_data: InputData,
+    warehouse_allocation: WarehouseAllocation,
+    output_files: Dict[str, str],
+    execution_time: float,
+    set_data_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Създава JSON-съвместимо резюме за API отговора."""
+    response = {
+        "status": "ok",
+        "execution_time_seconds": round(execution_time, 2),
+        "customers_total": len(input_data.customers),
+        "customers_for_routes": len(warehouse_allocation.vehicle_customers),
+        "customers_for_warehouse": len(warehouse_allocation.warehouse_customers),
+        "routes_count": len(solution.routes),
+        "dropped_customers_count": len(solution.dropped_customers),
+        "total_vehicles_used": solution.total_vehicles_used,
+        "total_distance_km": round(solution.total_distance_km, 2),
+        "total_time_minutes": round(solution.total_time_minutes, 1),
+        "fitness_score": round(solution.fitness_score, 2),
+        "output_files": output_files,
+        "routes": [
+            {
+                "vehicle_type": route.vehicle_type.value,
+                "customers_count": len(route.customers),
+                "total_volume": route.total_volume,
+                "total_distance_km": round(route.total_distance_km, 2),
+                "total_time_minutes": round(route.total_time_minutes, 1),
+                "customers": [
+                    {
+                        "id": customer.id,
+                        "name": customer.name,
+                        "volume": customer.volume,
+                        "document": customer.document,
+                        "plas_doc": getattr(customer, "plas_doc", ""),
+                        "source_id_skld": getattr(customer, "source_id_skld", ""),
+                    }
+                    for customer in route.customers
+                ],
+            }
+            for route in solution.routes
+        ],
+        "dropped_customers": [
+            {
+                "id": customer.id,
+                "name": customer.name,
+                "volume": customer.volume,
+                "document": customer.document,
+                "plas_doc": getattr(customer, "plas_doc", ""),
+                "source_id_skld": getattr(customer, "source_id_skld", ""),
+            }
+            for customer in solution.dropped_customers
+        ],
+    }
+    if set_data_result is not None:
+        response["set_data"] = set_data_result
+    return response
+
+
+def run_optimization(
+    input_file: Optional[str] = None,
+    input_data_override: Optional[InputData] = None,
+) -> Dict[str, Any]:
+    """Изпълнява цялата CVRP оптимизация и връща JSON-съвместимо резюме."""
     start_time = time.time()
     
     setup_logging()
@@ -318,17 +390,15 @@ def main():
     
     config = get_config()
 
-    input_file = sys.argv[1] if len(sys.argv) > 1 else None
-
-    input_data, warehouse_allocation = prepare_data(input_file)
+    input_data, warehouse_allocation = prepare_data(input_file, input_data_override)
     if not input_data or not warehouse_allocation:
-        sys.exit(1)
+        raise RuntimeError("Не са намерени валидни клиенти във входните данни.")
 
     # --- Стъпка 1.5: Изчисляване на матрица с разстояния ---
     distance_matrix = get_distance_matrix(warehouse_allocation, config.locations)
     if not distance_matrix:
         logger.error("Не може да се изчисли матрица с разстояния. Прекратявам работа.")
-        sys.exit(1)
+        raise RuntimeError("Не може да се изчисли матрица с разстояния.")
 
     logger.info("="*60)
     logger.info("СТЪПКА 2: РЕШАВАНЕ НА CVRP ПРОБЛЕМА")
@@ -403,11 +473,36 @@ def main():
         other_depots = sorted([d for d in unique_depots if d != config.locations.depot_location], key=lambda x: (x[0], x[1]))
         sorted_depots.extend(other_depots)
         
-        process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots)
+        output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots)
+        set_data_result = None
+        try:
+            from setdata_client import upload_solution_set_data
+            set_data_result = upload_solution_set_data(best_solution, config, warehouse_allocation)
+        except Exception as exc:
+            logger.error(f"setData изпращането завърши с грешка: {exc}", exc_info=True)
+            set_data_result = {"enabled": True, "attempted": 0, "succeeded": 0, "failed": 1, "errors": [{"error": str(exc)}]}
         print("\n[OK] CVRP оптимизация завършена успешно!")
+        return _solution_to_api_response(
+            best_solution,
+            input_data,
+            warehouse_allocation,
+            output_files,
+            execution_time,
+            set_data_result,
+        )
     else:
         logger.error("[ERROR] Не успях да намеря решение на проблема.")
         print("\n[ERROR] CVRP оптимизация завършена с грешки!")
+        raise RuntimeError("Не успях да намеря решение на проблема.")
+
+
+def main():
+    """Главна функция - оркестратор."""
+    input_file = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        run_optimization(input_file=input_file)
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"Критична грешка: {exc}", exc_info=True)
         sys.exit(1)
 
 
@@ -419,5 +514,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.error(f"Критична грешка: {e}", exc_info=True)
+        logging.getLogger(__name__).error(f"Критична грешка: {e}", exc_info=True)
         sys.exit(1)

@@ -81,6 +81,12 @@ class ValhallaClient:
                 }
             }
         }
+
+    def _build_location(self, lat: float, lon: float) -> dict:
+        location = {"lat": lat, "lon": lon}
+        if getattr(self.routing_config, "enable_curbside_approach", False):
+            location["preferred_side"] = getattr(self.routing_config, "valhalla_preferred_side", "same")
+        return location
     
     def get_distance_matrix(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Получава матрица с разстояния и времена от Valhalla"""
@@ -121,7 +127,7 @@ class ValhallaClient:
         print(f"   URL: {self.config.base_url}/sources_to_targets")
         
         # Подготовка на локациите
-        valhalla_locations = [{"lat": lat, "lon": lon} for lat, lon in locations]
+        valhalla_locations = [self._build_location(lat, lon) for lat, lon in locations]
         
         # Построяване на заявката
         request_body = {
@@ -282,8 +288,8 @@ class ValhallaClient:
     def _get_submatrix(self, sources: List[Tuple[float, float]], 
                        targets: List[Tuple[float, float]]) -> dict:
         """Получава подматрица от Valhalla"""
-        valhalla_sources = [{"lat": lat, "lon": lon} for lat, lon in sources]
-        valhalla_targets = [{"lat": lat, "lon": lon} for lat, lon in targets]
+        valhalla_sources = [self._build_location(lat, lon) for lat, lon in sources]
+        valhalla_targets = [self._build_location(lat, lon) for lat, lon in targets]
         
         request_body = {
             "sources": valhalla_sources,
@@ -323,8 +329,8 @@ class ValhallaClient:
         """Получава маршрут между две точки"""
         request_body = {
             "locations": [
-                {"lat": origin[0], "lon": origin[1]},
-                {"lat": destination[0], "lon": destination[1]}
+                self._build_location(origin[0], origin[1]),
+                self._build_location(destination[0], destination[1])
             ],
             "costing": self.config.costing,
             "directions_options": {"units": "kilometers"}

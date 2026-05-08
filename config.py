@@ -47,6 +47,7 @@ class VehicleConfig:
     vehicle_type: VehicleType  # Тип на превозното средство (от VehicleType enum)
     capacity: int              # Максимален капацитет/обем (в стекове, грамове или друга единица)
     count: int                 # Брой налични превозни средства от този тип
+    fixed_cost: int = 40000    # Цена/глоба за използване на един бус. По-висока стойност намалява броя използвани бусове.
     max_distance_km: Optional[int] = None  # Максимален пробег в километри за един маршрут. None означава без лимит.
     max_time_hours: int = 8    # Максимално време за работа по един маршрут в часове (включва пътуване и обслужване).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
@@ -64,17 +65,48 @@ class LocationConfig:
     center_location: Tuple[float, float] = (42.69735652560932, 23.323809998750914) # Специална локация "Център", използвана за CENTER_BUS.
     vratza_depot_location: Tuple[float, float] = (43.221042895146915, 23.5344026186417)  # Депо във Враца
     depot_locations: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {})
-    center_zone_mode: str = "circle"  # "circle" = радиус, "polygon" = начертана зона
+    center_zone_mode: str = "polygon"  # "circle" = радиус, "polygon" = начертана зона
     center_zone_polygon: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (42.73516132, 23.24878693),
-        (42.7076687, 23.29856873),
-        (42.71094827, 23.30062866),
-        (42.71548894, 23.30989838),
-        (42.73188302, 23.31264496),
-        (42.74196953, 23.31813812),
-        (42.75785246, 23.32122803),
-        (42.76969898, 23.28620911),
-        (42.75961698, 23.26595306)
+        (42.70770023, 23.29886913),
+        (42.70672263, 23.30091834),
+        (42.70618653, 23.30545664),
+        (42.70652554, 23.30671191),
+        (42.70546908, 23.32292318),
+        (42.70684089, 23.3228159),
+        (42.70734546, 23.32413554),
+        (42.70821268, 23.32922101),
+        (42.70804712, 23.33158135),
+        (42.7071799, 23.33274007),
+        (42.70574502, 23.3329761),
+        (42.70532716, 23.33366275),
+        (42.70472797, 23.33340526),
+        (42.69980805, 23.34409118),
+        (42.69772643, 23.34685922),
+        (42.69643326, 23.34652662),
+        (42.69754507, 23.35490584),
+        (42.69555011, 23.35489511),
+        (42.69249841, 23.35491657),
+        (42.68736458, 23.35199833),
+        (42.68569265, 23.35019588),
+        (42.68305058, 23.34660172),
+        (42.68971468, 23.33787918),
+        (42.68578729, 23.33202124),
+        (42.68569265, 23.33164573),
+        (42.68658383, 23.33047628),
+        (42.68223034, 23.31735492),
+        (42.68174922, 23.31405044),
+        (42.68189119, 23.3107996),
+        (42.68401278, 23.3136642),
+        (42.68675733, 23.31032753),
+        (42.68421784, 23.30075741),
+        (42.68656017, 23.29970598),
+        (42.68691506, 23.29928756),
+        (42.69073986, 23.30701232),
+        (42.69270343, 23.30527425),
+        (42.69443038, 23.30867529),
+        (42.69502967, 23.3084929),
+        (42.69842031, 23.30952287),
+        (42.70035998, 23.2969594)
     ])  # Точки на полигона: [(lat, lon), ...]
     center_zone_radius_km: float = 1.9  # Радиус на център зоната в километри
     enable_center_zone_priority: bool = True  # Дали да се прилага приоритет за център зоната
@@ -86,6 +118,7 @@ class LocationConfig:
     vratza_bus_center_penalty: float = 40000.0   # Множител за глоба на VRATZA_BUS за влизане в центъра (като EXTERNAL_BUS)
     enable_center_zone_restrictions: bool = True  # Дали да се прилагат ограничения за влизане в центъра
     discount_center_bus: float = 0.9  # Отстъпка за CENTER_BUS в център зоната (намалява разходите с 90%)
+    center_bus_outside_center_penalty: float = 0.0  # Глоба за CENTER_BUS при обслужване извън център зоната
     
     # Параметри за градски трафик (задръствания в София)
     city_center_coords: Tuple[float, float] = (42.6977, 23.3219)  # Център на София (площад Независимост)
@@ -236,6 +269,8 @@ class RoutingConfig:
     # Ако е VALHALLA и enable_time_dependent е True, ще се използва time-dependent routing
     enable_time_dependent: bool = True  # Дали да се използва time-dependent routing (само за Valhalla)
     departure_time: str = "08:00"  # Час на тръгване (HH:MM) за time-dependent routing
+    enable_curbside_approach: bool = False  # Ако е True, маршрутите се строят така, че клиентът да е от правилната страна на улицата.
+    valhalla_preferred_side: str = "same"  # same = клиентът да е от страната на движение; either = без ограничение.
 
 
 @dataclass
@@ -284,14 +319,22 @@ class OSRMConfig:
 class InputConfig:
     """Конфигурации за обработка на входните данни от Excel файл или HTTP JSON."""
     input_source: str = "http_json"  # Източник на данни: "excel" или "http_json"
-    excel_file_path: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\input/input.xlsx") # Път до входния Excel файл.
-    json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="excel")
+    excel_file_path: str = _abs_path("C:\\Users\\shaman\\Documents\\New project 2\\CVRP_With_Pyvrp_Or_Or-Tools\\data/input.xlsx") # Път до входния Excel файл.
+    json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
+    json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
+    json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
+    json_sklad: str = "106"  # Стойност за Sklad параметъра.
+    json_done_flag: str = "1974"  # Стойност за DoneFlag параметъра.
+    json_extra_query: str = ""  # Допълнителни GET параметри във формат key=value&key2=value2.
+    json_date_field: str = "Date"  # Име на полето/параметъра за датата при HTTP JSON заявка.
     json_gps_field: str = "GPS"          # Име на JSON полето с GPS координати.
     json_client_id_field: str = "IdCust"  # Име на JSON полето с клиентски номер.
     json_client_name_field: str = "CustName"  # Име на JSON полето с име на клиента.
     json_volume_field: str = "Volume"     # Име на JSON полето с брой стекове.
     json_document_field: str = "IdDoc"  # Име на JSON полето с номер на документа.
-    json_override_date: str = "28/04/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
+    json_plas_doc_field: str = "IdPlasDoc"  # Име на JSON полето за IdPlasDoc, което се връща към setData.
+    json_id_skld_field: str = "IdSkld"  # Име на JSON полето с оригиналния склад на заявката.
+    json_override_date: str = ""  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
     gps_column: str = "GPS"         # Име на колоната с GPS координатите на клиентите.
     client_id_column: str = "IdCust"      # Име на колоната с ID на клиента.
@@ -322,7 +365,7 @@ class CVRPConfig:
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 120
+    time_limit_seconds: int = 20
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
 
     first_solution_strategy: str = "PARALLEL_CHEAPEST_INSERTION"
@@ -364,10 +407,10 @@ class CVRPConfig:
     # --- Настройки за паралелна обработка ---
     enable_priority_dropping: bool = True
     # True = large close-to-depot customers get lower skip penalty/prize.
-    drop_volume_weight: float = 0.7
-    drop_closeness_weight: float = 0.3
+    drop_volume_weight: float = 1.0
+    drop_closeness_weight: float = 1.0
     min_customer_drop_penalty: int = 45000
-    max_customer_drop_penalty: int = 150000
+    max_customer_drop_penalty: int = 500000
 
     enable_parallel_solving: bool = False  # Keep disabled for PyVRP stability
     # Описание: Дали да се стартират няколко solver-а паралелно с различни стратегии.
@@ -433,12 +476,16 @@ class OutputConfig:
     show_vehicle_info: bool = True # Дали да се показва информация за превозното средство при клик на маршрут.
     
     # Excel файлове
+    enable_excel_output: bool = True # Дали да се генерира Excel CVRP отчет.
     excel_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/excel") # Директория за запис на Excel отчетите.
     warehouse_excel_file: str = "warehouse_orders.xlsx" # Име на файла с необслужените клиенти (за склада).
     routes_excel_file: str = "vehicle_routes.xlsx" # Име на файла с детайли за всеки маршрут.
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
+    excel_bus_number_prefix: str = "10045010" # Префикс за номерата на бусове в Excel отчета.
+    excel_bus_number_digits: int = 2 # Брой цифри след префикса: 01, 02, 03...
     
     # CSV файл с маршрути
+    enable_csv_output: bool = True # Дали да се генерира CSV файл с маршрутите.
     csv_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes.csv") # Път и име на CSV файла с маршрутите.
     
     # Графики и анализи
@@ -489,6 +536,39 @@ class PerformanceConfig:
 
 
 @dataclass
+class APIConfig:
+    """Настройки за HTTP API сървъра, който приема POST заявки от други програми."""
+    api_host: str = "0.0.0.0"  # 0.0.0.0 = приема заявки от други компютри в мрежата.
+    api_port: int = 8088
+    api_public_url: str = ""  # URL за извикване от друга програма, напр. http://10.10.100.134:8088 или https://domain.com/cvrp
+    api_endpoint: str = "/solve"
+    health_endpoint: str = "/health"
+
+
+@dataclass
+class SetDataConfig:
+    """Настройки за връщане на готовите маршрути към Bizant чрез cmd=setData."""
+    enable_set_data_upload: bool = True  # Включва изпращане на резултата към setData след успешно решение.
+    set_data_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за setData endpoint.
+    set_data_http_method: str = "GET"  # HTTP метод за setData: GET или POST.
+    set_data_command: str = "setData"  # cmd параметър.
+    set_data_done_flag: str = "1973"  # DoneFlag параметър.
+    set_data_id_skld: str = "106"  # IdSkld за маршрути от основното депо.
+    set_data_vratza_id_skld: str = "128"  # IdSkld за маршрути от депо Враца.
+    set_data_depot_id_skld_map: str = ""  # Корекции по депо: Име=IdSkld;Име2=IdSkld2.
+    set_data_id_grafik: str = ""  # IdGrafik параметър.
+    set_data_id_grafik_template: str = "{bus_number}"  # Шаблон за IdGrafik. По подразбиране е номерът на буса от Excel.
+    set_data_bukva_template: str = "БХ{route_number}-{stop_number}"  # Шаблон за Bukva, напр. БХ1-1.
+    enable_unserved_set_data_upload: bool = True  # Дали да се изпращат и необслужените клиенти към setData.
+    set_data_unserved_id_grafik: str = ""  # IdGrafik за необслужени клиенти, ако няма шаблон.
+    set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
+    set_data_unserved_bukva_template: str = "HOF-{id_plas_doc}"  # Шаблон за Bukva на необслужени клиенти.
+    enable_make_group: bool = False  # Дали след успешни setData заявки да се изпрати cmd=makeGroup по склад.
+    set_data_make_group_command: str = "makeGroup"  # cmd за групиране след успешни setData заявки.
+    set_data_timeout_seconds: int = 30  # Таймаут за setData заявка.
+
+
+@dataclass
 class MainConfig:
     """Главна конфигурация, която обединява всички останали модулни конфигурации."""
     # Модулни конфигурации
@@ -504,6 +584,8 @@ class MainConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+    api: APIConfig = field(default_factory=APIConfig)
+    set_data: SetDataConfig = field(default_factory=SetDataConfig)
     
     # Глобални настройки на приложението
     debug_mode: bool = True # Включва/изключва дебъг режим с по-детайлни логове.
@@ -530,20 +612,22 @@ class MainConfig:
                 vehicle_type=VehicleType.INTERNAL_BUS,
                 capacity=385,
                 count=6,
+                fixed_cost=40000,
                 max_distance_km=None, # Премахнато
                 max_time_hours=8,
                 service_time_minutes=9,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.69735652560932, 23.323809998750914),  # Тръгва от центъра
+                start_location=(42.695785029219415, 23.23165887245312),  # Тръгва от центъра
                 start_time_minutes=480,  # 8:00
-                tsp_depot_location=(42.69735652560932, 23.323809998750914)  # TSP оптимизация от главното депо
+                tsp_depot_location=(42.695785029219415, 23.23165887245312)  # TSP оптимизация от главното депо
             ),
             # 2. Център бус - 1 бр.
             VehicleConfig(
                 vehicle_type=VehicleType.CENTER_BUS,
                 capacity=320,
                 count=1,
+                fixed_cost=40000,
                 max_distance_km=None, # Премахнато
                 max_time_hours=8,
                 service_time_minutes=8,
@@ -558,6 +642,7 @@ class MainConfig:
                 vehicle_type=VehicleType.EXTERNAL_BUS,
                 capacity=320,
                 count=1,
+                fixed_cost=45000,
                 max_distance_km=None, # Премахнато
                 max_time_hours=8,   
                 service_time_minutes=9, # КОРИГИРАНО
@@ -572,6 +657,7 @@ class MainConfig:
                 vehicle_type=VehicleType.SPECIAL_BUS,
                 capacity=300,
                 count=2,
+                fixed_cost=40000,
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=6,
@@ -586,6 +672,7 @@ class MainConfig:
                 vehicle_type=VehicleType.VRATZA_BUS,
                 capacity=385,
                 count=3,
+                fixed_cost=40000,
                 max_distance_km=None,
                 max_time_hours=8,   
                 service_time_minutes=7,

@@ -181,6 +181,9 @@ class ORToolsSolver:
             
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+            for vehicle_id, fixed_cost in enumerate(data.get('vehicle_fixed_costs', [])):
+                routing.SetFixedCostOfVehicle(int(fixed_cost), vehicle_id)
+            logger.info(f"Vehicle fixed costs: {data.get('vehicle_fixed_costs', [])}")
 
             # 3. ОГРАНИЧЕНИЯ (DIMENSIONS) - ВСИЧКИ СА АКТИВНИ
             # Обем
@@ -392,10 +395,14 @@ class ORToolsSolver:
             # 5. ПРИОРИТИЗИРАНЕ НА CENTER_BUS ЗА ЦЕНТЪР ЗОНАТА
             if self.center_zone_customers and data['center_bus_vehicle_ids']:
                 logger.info("🎯 Прилагане на приоритет за CENTER_BUS в център зоната")
+                center_bus_outside_penalty = (
+                    getattr(self.location_config, "center_bus_outside_center_penalty", 50000)
+                    if self.location_config
+                    else 50000
+                )
                 
                 # Създаваме callback за приоритизиране на CENTER_BUS
-                # CENTER_BUS получава САМО discount за клиенти в центъра
-                # (penalty за извън центъра не се прилага, защото блокира стартирането)
+                # CENTER_BUS получава discount за клиенти в центъра и глоба за клиенти извън център зоната.
                 def center_bus_priority_callback(from_index, to_index):
                     from_node = manager.IndexToNode(from_index)
                     to_node = manager.IndexToNode(to_index)
@@ -411,7 +418,10 @@ class ORToolsSolver:
                             # DISCOUNT: Намаляваме разходите за CENTER_BUS за клиенти В ЦЕНТЪРА
                             return int(base_distance * self.location_config.discount_center_bus)
                     
-                    # За всички други клиенти - нормално разстояние (без penalty)
+                    # За клиенти извън център зоната - конфигурируема глоба.
+                    if to_node >= len(self.unique_depots):
+                        return base_distance + int(center_bus_outside_penalty)
+
                     return base_distance
                 
                 # Регистрираме callback-а за CENTER_BUS превозните средства
@@ -421,6 +431,7 @@ class ORToolsSolver:
                     routing.SetArcCostEvaluatorOfVehicle(center_bus_callback_index, vehicle_id)
                     
                 logger.info(f"  - CENTER_BUS discount for center clients: {self.location_config.discount_center_bus}")
+                logger.info(f"  - CENTER_BUS outside-center penalty: {center_bus_outside_penalty}")
                 logger.info(f"  - Center zone customers: {len(self.center_zone_customers)}")
             
             def _customer_is_in_center_zone(customer: Customer) -> bool:
@@ -643,6 +654,7 @@ class ORToolsSolver:
         vehicle_max_times = []
         vehicle_starts = []
         vehicle_ends = []
+        vehicle_fixed_costs = []
         
         logger.info("  - Зареждане на твърди ограничения от конфигурацията...")
         
@@ -690,6 +702,7 @@ class ORToolsSolver:
 
                     # 4. Време (Time) - стриктно
                     vehicle_max_times.append(int(v_config.max_time_hours * 3600))
+                    vehicle_fixed_costs.append(int(getattr(v_config, "fixed_cost", 0) or 0))
                     
                     vehicle_starts.append(depot_index)
                     vehicle_ends.append(depot_index)
@@ -701,6 +714,7 @@ class ORToolsSolver:
         data['vehicle_max_times'] = vehicle_max_times
         data['vehicle_starts'] = vehicle_starts
         data['vehicle_ends'] = vehicle_ends
+        data['vehicle_fixed_costs'] = vehicle_fixed_costs
         data['depot'] = 0 
         data['center_bus_vehicle_ids'] = center_bus_vehicle_ids
         data['external_bus_vehicle_ids'] = external_bus_vehicle_ids
@@ -712,6 +726,7 @@ class ORToolsSolver:
         logger.info(f"  - Макс. разстояния (м): {data['vehicle_max_distances']}")
         logger.info(f"  - Макс. спирки: {data['vehicle_max_stops']}")
         logger.info(f"  - Макс. времена (сек): {data['vehicle_max_times']}")
+        logger.info(f"  - Fixed costs: {data['vehicle_fixed_costs']}")
         logger.info(f"  - CENTER_BUS превозни средства: {center_bus_vehicle_ids}")
         logger.info(f"  - EXTERNAL_BUS превозни средства: {external_bus_vehicle_ids}")
         logger.info(f"  - INTERNAL_BUS превозни средства: {internal_bus_vehicle_ids}")
@@ -1446,6 +1461,9 @@ class ORToolsSolver:
             logger.info("="*60)
             
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+            for vehicle_id, fixed_cost in enumerate(data.get('vehicle_fixed_costs', [])):
+                routing.SetFixedCostOfVehicle(int(fixed_cost), vehicle_id)
+            logger.info(f"Vehicle fixed costs: {data.get('vehicle_fixed_costs', [])}")
             logger.info(f"✓ Arc cost evaluator зададен за всички превозни средства")
 
             # 6. Добавяне на ограничение за капацитет - точно като в примера
@@ -1625,6 +1643,7 @@ class ORToolsSolver:
         
         # Vehicle capacities - всички превозни средства
         data['vehicle_capacities'] = []
+        data['vehicle_fixed_costs'] = []
         for v_config in self.vehicle_configs:
             if v_config.enabled:
                 # Скалираме капацитета в СЪЩИЯ мащаб като изискванията
@@ -1632,12 +1651,14 @@ class ORToolsSolver:
                 logger.info(f"🚚 Превозно средство {v_config.vehicle_type.value}: капацитет {v_config.capacity} → {capacity} (scaled)")
                 for _ in range(v_config.count):
                     data['vehicle_capacities'].append(capacity)
+                    data['vehicle_fixed_costs'].append(int(getattr(v_config, "fixed_cost", 0) or 0))
         
         # Проверка дали имаме превозни средства
         if not data['vehicle_capacities']:
             # Ако няма конфигурирани превозни средства, добавяме едно по подразбиране с голям капацитет
             default_capacity = int(1000 * SCALE_FACTOR)
             data['vehicle_capacities'] = [default_capacity]
+            data['vehicle_fixed_costs'] = [0]
             logger.warning(f"⚠️ Няма конфигурирани превозни средства, добавяме по подразбиране с капацитет {default_capacity}")
         
         # Брой превозни средства

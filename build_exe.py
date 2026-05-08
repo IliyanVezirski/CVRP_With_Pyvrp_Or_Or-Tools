@@ -160,6 +160,7 @@ explicit_hiddenimports = [
     "main",
     "config",
     "config_gui",
+    "cvrp_api_server",
     "input_handler",
     "warehouse_manager",
     "cvrp_solver",
@@ -199,8 +200,12 @@ explicit_hiddenimports = [
 
     # Input/runtime helpers.
     "urllib.request",
+    "urllib.error",
     "ssl",
     "json",
+    "argparse",
+    "http.server",
+    "socketserver",
     "multiprocessing",
 ]
 extend_unique(hiddenimports, explicit_hiddenimports)
@@ -395,12 +400,71 @@ if exist "%APP_DIR%CVRP_Optimizer.exe" (
 )
 '''
 
+    server_content = r'''@echo off
+set "APP_DIR=%~dp0"
+cd /d "%APP_DIR%"
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+set "_MEIPASS2="
+
+echo CVRP Optimizer - API Server
+echo.
+echo Default listen address is configured in config.py / Settings.
+echo Use 0.0.0.0 to accept requests from other computers.
+echo.
+
+if exist "%APP_DIR%CVRP_Optimizer.exe" (
+    "%APP_DIR%CVRP_Optimizer.exe" --server
+) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
+    "%APP_DIR%.venv\Scripts\python.exe" "%APP_DIR%cvrp_api_server.py"
+) else (
+    echo Python virtual environment not found.
+    echo Run: python -m venv .venv
+    echo Then: .venv\Scripts\python.exe -m pip install -r requirements.txt
+    pause
+    exit /b 1
+)
+'''
+
+    hidden_server_content = r'''@echo off
+set "APP_DIR=%~dp0"
+cd /d "%APP_DIR%"
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+set "_MEIPASS2="
+
+if exist "%APP_DIR%CVRP_Optimizer.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%APP_DIR%CVRP_Optimizer.exe' -ArgumentList '--server' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+) else if exist "%APP_DIR%.venv\Scripts\pythonw.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%APP_DIR%.venv\Scripts\pythonw.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%APP_DIR%.venv\Scripts\python.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+) else (
+    where pythonw.exe >nul 2>nul
+    if not errorlevel 1 (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'pythonw.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+        exit /b 0
+    )
+
+    where python.exe >nul 2>nul
+    if not errorlevel 1 (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'python.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+        exit /b 0
+    )
+
+    echo Python not found.
+    echo Install Python or build CVRP_Optimizer.exe first.
+    pause
+    exit /b 1
+)
+'''
+
     for directory in [PROJECT_DIR, DIST_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "start_cvrp.bat").write_text(start_content, encoding="utf-8-sig", newline="\r\n")
         (directory / "Settings.bat").write_text(settings_content, encoding="utf-8-sig", newline="\r\n")
+        (directory / "start_api_server.bat").write_text(server_content, encoding="utf-8-sig", newline="\r\n")
+        (directory / "start_api_server_hidden.bat").write_text(hidden_server_content, encoding="utf-8-sig", newline="\r\n")
 
-    print("Created start_cvrp.bat and Settings.bat")
+    print("Created start_cvrp.bat, Settings.bat, start_api_server.bat and start_api_server_hidden.bat")
 
 
 def copy_runtime_files() -> None:

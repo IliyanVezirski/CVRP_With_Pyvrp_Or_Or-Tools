@@ -9,6 +9,8 @@ PyVRP е специализирана библиотека за VRP оптими
 
 """
 
+from __future__ import annotations
+
 import logging
 import math
 from typing import List, Dict, Tuple, Optional
@@ -234,16 +236,19 @@ class PyVRPSolver:
             if self.location_config and center_priority_enabled
             else 1.0
         )
-        center_penalty = 50000
-        
+        center_bus_outside_penalty = (
+            getattr(self.location_config, "center_bus_outside_center_penalty", 50000)
+            if self.location_config
+            else 50000
+        )
+        center_penalties_by_type = {}
         if self.location_config and center_restrictions_enabled:
-            # Вземаме максималната глоба от конфигурацията
-            center_penalty = max(
-                self.location_config.external_bus_center_penalty,
-                self.location_config.internal_bus_center_penalty,
-                self.location_config.special_bus_center_penalty,
-                self.location_config.vratza_bus_center_penalty
-            )
+            center_penalties_by_type = {
+                ConfigVehicleType.INTERNAL_BUS.value: int(getattr(self.location_config, "internal_bus_center_penalty", 50000) or 0),
+                ConfigVehicleType.EXTERNAL_BUS.value: int(getattr(self.location_config, "external_bus_center_penalty", 50000) or 0),
+                ConfigVehicleType.SPECIAL_BUS.value: int(getattr(self.location_config, "special_bus_center_penalty", 50000) or 0),
+                ConfigVehicleType.VRATZA_BUS.value: int(getattr(self.location_config, "vratza_bus_center_penalty", 50000) or 0),
+            }
         
         vehicle_profiles = {}
         vehicle_service_times = {}
@@ -264,7 +269,8 @@ class PyVRPSolver:
         num_depots = len(depot_objects)
         logger.info(f"Adding edges with center zone logic...")
         logger.info(f"  - Center discount for CENTER_BUS: {center_discount}")
-        logger.info(f"  - Center penalty for other buses: {center_penalty}")
+        logger.info(f"  - Outside-center penalty for CENTER_BUS: {center_bus_outside_penalty}")
+        logger.info(f"  - Center penalties by bus type: {center_penalties_by_type}")
         
         # Настройки за градски трафик
         enable_traffic = False
@@ -344,12 +350,13 @@ class PyVRPSolver:
                         if is_dest_center_client and center_priority_enabled:
                             vehicle_distance = int(base_distance * center_discount)
                         elif center_priority_enabled:
-                            vehicle_distance = base_distance + int(center_penalty)
+                            vehicle_distance = base_distance + int(center_bus_outside_penalty)
                         else:
                             vehicle_distance = base_distance
                     else:
                         if is_dest_center_client and center_restrictions_enabled:
-                            vehicle_distance = base_distance + int(center_penalty)
+                            vehicle_penalty = center_penalties_by_type.get(v_config.vehicle_type.value, 50000)
+                            vehicle_distance = base_distance + int(vehicle_penalty)
                         else:
                             vehicle_distance = base_distance
 
@@ -397,6 +404,7 @@ class PyVRPSolver:
             capacity = int(v_config.capacity * 100)
             max_distance = int(v_config.max_distance_km * 1000) if v_config.max_distance_km else constants.MAX_VALUE
             max_time = int(v_config.max_time_hours * 3600)  # в секунди
+            fixed_cost = int(getattr(v_config, "fixed_cost", 0) or 0)
             
             # Max customers per route (ако не е зададено, използваме голямо число)
             max_customers = v_config.max_customers_per_route if v_config.max_customers_per_route else 1000
@@ -412,6 +420,7 @@ class PyVRPSolver:
                 end_depot=start_depot,
                 max_distance=max_distance,
                 shift_duration=max_time,
+                fixed_cost=fixed_cost,
                 profile=vehicle_profile,
                 name=f"{v_config.vehicle_type.value}"
             )
@@ -422,6 +431,7 @@ class PyVRPSolver:
             logger.info(f"  - Max customers: {max_customers}")
             logger.info(f"  - Max distance: {v_config.max_distance_km}km")
             logger.info(f"  - Max time: {v_config.max_time_hours}h")
+            logger.info(f"  - Fixed cost: {fixed_cost}")
             logger.info(f"  - Profile: {profile_name}")
             logger.info(f"  - Depot: {start_depot}")
 

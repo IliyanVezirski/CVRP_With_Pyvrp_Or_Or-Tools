@@ -8,6 +8,8 @@ import re
 import os
 import json
 import urllib.request
+import urllib.error
+import urllib.parse
 import ssl
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -28,6 +30,8 @@ class Customer:
     volume: float
     original_gps_data: str
     document: str = ""
+    plas_doc: str = ""
+    source_id_skld: str = ""
 
 
 @dataclass
@@ -144,6 +148,20 @@ class InputHandler:
         except Exception as e:
             logger.error(f"Грешка при четене на файла {file_path}: {e}")
             raise
+
+    def load_data_from_json_records(self, payload) -> InputData:
+        """Зарежда клиентски данни от JSON payload, подаден директно към API сървъра."""
+        records = self._extract_json_records(payload)
+        logger.info(f"Получени {len(records)} JSON записа от POST payload")
+        customers = self._process_json_records(records)
+        valid_customers = [c for c in customers if c.coordinates is not None]
+        depot_location = config.get_config().locations.depot_location
+
+        return InputData(
+            customers=valid_customers,
+            total_volume=0,
+            depot_location=depot_location
+        )
     
     @staticmethod
     def _next_business_date() -> str:
@@ -176,15 +194,30 @@ class InputHandler:
         else:
             target_date = self._next_business_date()
             logger.info(f"Автоматична дата (следващ работен ден): {target_date}")
-        separator = "&" if "?" in base_url else "?"
-        url = f"{base_url}{separator}date={target_date}"
-        
-        logger.info(f"Зареждам данни от HTTP JSON: {url}  (дата: {target_date})")
+        method = getattr(self.config, "json_http_method", "GET").upper()
+        date_field = getattr(self.config, "json_date_field", "date") or "date"
+        request_params = self._build_json_request_params(target_date, date_field)
+        if method == "POST":
+            url = base_url
+            post_payload = json.dumps(request_params).encode("utf-8")
+            logger.info(f"Зареждам данни от HTTP JSON с POST: {url}  ({request_params})")
+        else:
+            url = self._build_get_url(base_url, request_params)
+            post_payload = None
+            logger.info(f"Зареждам данни от HTTP JSON с GET: {url}")
         
         try:
             # Създаваме SSL контекст (позволява self-signed сертификати при нужда)
             ctx = ssl.create_default_context()
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            headers = {"Accept": "application/json"}
+            if post_payload is not None:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(
+                url,
+                data=post_payload,
+                headers=headers,
+                method=method,
+            )
             
             with urllib.request.urlopen(req, timeout=self.config.json_timeout_seconds, context=ctx) as response:
                 raw_bytes = response.read()
@@ -207,19 +240,7 @@ class InputHandler:
             
             data = json.loads(raw)
             
-            # Поддържаме както списък, така и обект с ключ съдържащ списъка
-            if isinstance(data, dict):
-                # Търсим първия ключ който съдържа списък
-                for key, val in data.items():
-                    if isinstance(val, list):
-                        data = val
-                        logger.info(f"Използвам JSON ключ '{key}' с {len(data)} записа")
-                        break
-                else:
-                    raise ValueError("JSON обектът не съдържа списък с данни")
-            
-            if not isinstance(data, list):
-                raise ValueError(f"Очакван е JSON списък, получен е {type(data).__name__}")
+            data = self._extract_json_records(data)
             
             logger.info(f"Получени {len(data)} записа от JSON")
             
@@ -241,7 +262,63 @@ class InputHandler:
         except json.JSONDecodeError as e:
             logger.error(f"Невалиден JSON отговор: {e}")
             raise
+
+    def _build_json_request_params(self, target_date: str, date_field: str) -> Dict[str, str]:
+        """Сглобява параметрите за HTTP JSON заявката."""
+        params: Dict[str, str] = {}
+
+        command = str(getattr(self.config, "json_command", "") or "").strip()
+        if command:
+            params["cmd"] = command
+
+        params[date_field] = target_date
+
+        sklad = str(getattr(self.config, "json_sklad", "") or "").strip()
+        if sklad:
+            params["Sklad"] = sklad
+
+        done_flag = str(getattr(self.config, "json_done_flag", "") or "").strip()
+        if done_flag:
+            params["DoneFlag"] = done_flag
+
+        extra_query = str(getattr(self.config, "json_extra_query", "") or "").strip().lstrip("?")
+        if extra_query:
+            for key, value in urllib.parse.parse_qsl(extra_query, keep_blank_values=True):
+                if key:
+                    params[key] = value
+
+        return params
+
+    def _build_get_url(self, base_url: str, params: Dict[str, str]) -> str:
+        """Добавя/обновява GET параметри към URL без да губи вече зададени параметри."""
+        parts = urllib.parse.urlsplit(base_url)
+        query_pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        merged = {key: value for key, value in query_pairs}
+        merged.update(params)
+        query = urllib.parse.urlencode(merged)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
     
+    def _extract_json_records(self, payload) -> list:
+        """Връща списък със записи от JSON payload."""
+        if isinstance(payload, dict):
+            for preferred_key in ("customers", "clients", "orders", "data", "items", "records"):
+                val = payload.get(preferred_key)
+                if isinstance(val, list):
+                    logger.info(f"Използвам JSON ключ '{preferred_key}' с {len(val)} записа")
+                    return val
+
+            for key, val in payload.items():
+                if isinstance(val, list):
+                    logger.info(f"Използвам JSON ключ '{key}' с {len(val)} записа")
+                    return val
+
+            raise ValueError("JSON обектът не съдържа списък с клиентски записи")
+
+        if isinstance(payload, list):
+            return payload
+
+        raise ValueError(f"Очакван е JSON списък или обект със списък, получен е {type(payload).__name__}")
+
     def _process_json_records(self, records: list) -> List[Customer]:
         """Обработва JSON записи и създава списък от клиенти"""
         customers = []
@@ -252,6 +329,8 @@ class InputHandler:
         name_field = self.config.json_client_name_field
         vol_field = self.config.json_volume_field
         doc_field = self.config.json_document_field
+        plas_doc_field = getattr(self.config, "json_plas_doc_field", "IdPlasDoc")
+        skld_field = getattr(self.config, "json_id_skld_field", "IdSkld")
         
         for idx, record in enumerate(records):
             try:
@@ -260,6 +339,8 @@ class InputHandler:
                 client_name = str(record.get(name_field, "")).strip()
                 volume = float(record.get(vol_field, 0))
                 document = str(record.get(doc_field, "")).strip()
+                plas_doc = str(record.get(plas_doc_field, "")).strip()
+                source_id_skld = str(record.get(skld_field, "")).strip()
                 
                 coordinates = parser.parse_gps_string(gps_data)
                 
@@ -269,7 +350,9 @@ class InputHandler:
                     coordinates=coordinates,
                     volume=volume,
                     original_gps_data=gps_data,
-                    document=document
+                    document=document,
+                    plas_doc=plas_doc,
+                    source_id_skld=source_id_skld
                 )
                 customers.append(customer)
                 
@@ -323,4 +406,4 @@ class InputHandler:
 def load_customer_data(file_path: Optional[str] = None) -> InputData:
     """Удобна функция за зареждане на клиентски данни"""
     handler = InputHandler()
-    return handler.load_data(file_path) 
+    return handler.load_data(file_path)
