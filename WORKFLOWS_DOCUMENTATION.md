@@ -309,6 +309,16 @@ cvrp_report_2026-04-28.xlsx
 
 GUI табът `Автоматично стартиране` използва Windows `schtasks`.
 
+Вече могат да се създават няколко schedule задачи. В GUI има поле `Име на задача`; всяко различно име създава отделна Windows Task Scheduler задача. Примерни имена:
+
+```text
+CVRP_Optimizer_Auto_1
+CVRP_Optimizer_Auto_2
+CVRP_Optimizer_Auto_Morning
+```
+
+Ако името е същото, задачата се обновява. Ако името е различно, старата задача остава и се добавя нова.
+
 В EXE режим Scheduler стартира `start_cvrp.bat`, ако го намери.
 
 В Python режим Scheduler стартира:

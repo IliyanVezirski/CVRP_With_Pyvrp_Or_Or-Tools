@@ -865,7 +865,7 @@ class ConfigGUI:
         self._add_field(f, r, "set_data.set_data_make_group_command", "makeGroup cmd:", getattr(set_data, "set_data_make_group_command", "makeGroup")); r += 1
         self._add_field(f, r, "set_data.set_data_timeout_seconds", "Таймаут (сек):", getattr(set_data, "set_data_timeout_seconds", 30)); r += 1
 
-    TASK_NAME = "CVRP_Optimizer_Auto"
+    TASK_PREFIX = "CVRP_Optimizer_Auto"
 
     def _add_scheduler_tab(self, nb):
         tab = ttk.Frame(nb)
@@ -877,6 +877,11 @@ class ConfigGUI:
 
         ttk.Label(f, text="Автоматично стартиране:", font=("", 10, "bold")).grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 8)); r += 1
+
+        ttk.Label(f, text="Име на задача:", anchor="w").grid(row=r, column=0, sticky="w", pady=3)
+        self._sched_task_name = tk.StringVar(value=f"{self.TASK_PREFIX}_1")
+        ttk.Entry(f, textvariable=self._sched_task_name, width=32).grid(row=r, column=1, sticky="w", pady=3)
+        r += 1
 
         ttk.Label(f, text="Час (ЧЧ:ММ):", anchor="w").grid(row=r, column=0, sticky="w", pady=3)
         self._sched_time = tk.StringVar(value="17:01")
@@ -910,7 +915,7 @@ class ConfigGUI:
         self._sched_status.grid(row=r, column=0, columnspan=2, sticky="we", pady=4)
         r += 1
 
-        ttk.Label(f, text="Използва Windows Task Scheduler (schtasks).",
+        ttk.Label(f, text="Използва Windows Task Scheduler (schtasks). За повече задачи използвай различни имена.",
                   foreground="gray", font=("", 8)).grid(row=r, column=0, columnspan=2, sticky="w")
 
         # Auto-check status on load
@@ -941,8 +946,34 @@ class ConfigGUI:
         self._sched_status.insert("1.0", text)
         self._sched_status.configure(state="disabled")
 
+    def _get_scheduler_task_name(self):
+        task_name = self._sched_task_name.get().strip()
+        return task_name or f"{self.TASK_PREFIX}_1"
+
+    def _list_scheduler_tasks(self):
+        import csv
+        import io
+        import subprocess
+
+        result = subprocess.run(
+            ["schtasks", "/Query", "/FO", "CSV"],
+            capture_output=True, text=True, creationflags=0x08000000
+        )
+        if result.returncode != 0:
+            return []
+
+        tasks = []
+        for row in csv.DictReader(io.StringIO(result.stdout)):
+            task_name = row.get("TaskName", "")
+            if self.TASK_PREFIX.lower() in task_name.lower():
+                next_run = row.get("Next Run Time", "")
+                status = row.get("Status", "")
+                tasks.append((task_name, next_run, status))
+        return tasks
+
     def _create_scheduled_task(self):
         import subprocess
+        task_name = self._get_scheduler_task_name()
         time_str = self._sched_time.get().strip()
         if not time_str or ":" not in time_str:
             messagebox.showwarning("Грешка", "Въведете час във формат ЧЧ:ММ")
@@ -956,15 +987,9 @@ class ConfigGUI:
         days_str = ",".join(selected)
         prog, workdir = self._get_program_command()
 
-        # Remove existing task first (ignore errors)
-        subprocess.run(
-            ["schtasks", "/Delete", "/TN", self.TASK_NAME, "/F"],
-            capture_output=True, creationflags=0x08000000
-        )
-
         cmd = [
             "schtasks", "/Create",
-            "/TN", self.TASK_NAME,
+            "/TN", task_name,
             "/TR", prog,
             "/SC", "WEEKLY",
             "/D", days_str,
@@ -974,12 +999,13 @@ class ConfigGUI:
 
         result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
         if result.returncode == 0:
-            self._set_status(f"Задачата е създадена.\n"
-                             f"Име: {self.TASK_NAME}\n"
+            self._set_status(f"Задачата е създадена/обновена.\n"
+                             f"Име: {task_name}\n"
                              f"Час: {time_str}\n"
                              f"Дни: {days_str}\n"
-                             f"Команда: {prog}")
-            messagebox.showinfo("Готово", f"Задачата '{self.TASK_NAME}' е създадена.")
+                             f"Команда: {prog}\n\n"
+                             f"Важно: друга задача се презаписва само ако използва същото име.")
+            messagebox.showinfo("Готово", f"Задачата '{task_name}' е създадена/обновена.")
         else:
             err = result.stderr.strip() or result.stdout.strip()
             self._set_status(f"Грешка при създаване:\n{err}")
@@ -987,27 +1013,32 @@ class ConfigGUI:
 
     def _remove_scheduled_task(self):
         import subprocess
+        task_name = self._get_scheduler_task_name()
         result = subprocess.run(
-            ["schtasks", "/Delete", "/TN", self.TASK_NAME, "/F"],
+            ["schtasks", "/Delete", "/TN", task_name, "/F"],
             capture_output=True, text=True, creationflags=0x08000000
         )
         if result.returncode == 0:
-            self._set_status("Задачата е премахната.")
-            messagebox.showinfo("Готово", f"Задачата '{self.TASK_NAME}' е премахната.")
+            self._set_status(f"Задачата '{task_name}' е премахната.")
+            messagebox.showinfo("Готово", f"Задачата '{task_name}' е премахната.")
         else:
             err = result.stderr.strip() or result.stdout.strip()
             self._set_status(f"Грешка при премахване:\n{err}")
 
     def _check_task_status(self):
         import subprocess
+        task_name = self._get_scheduler_task_name()
         result = subprocess.run(
-            ["schtasks", "/Query", "/TN", self.TASK_NAME, "/FO", "LIST", "/V"],
+            ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"],
             capture_output=True, text=True, creationflags=0x08000000
         )
+        task_lines = [f"- {name} | Следващо: {next_run} | Статус: {status}"
+                      for name, next_run, status in self._list_scheduler_tasks()]
+        all_tasks_text = "\n\nВсички CVRP задачи:\n" + ("\n".join(task_lines) if task_lines else "Няма намерени CVRP задачи.")
         if result.returncode == 0:
-            self._set_status(f"Задачата съществува:\n{result.stdout.strip()}")
+            self._set_status(f"Избраната задача съществува:\n{result.stdout.strip()}{all_tasks_text}")
         else:
-            self._set_status("Няма създадена задача за автоматично стартиране.")
+            self._set_status(f"Избраната задача '{task_name}' не съществува.{all_tasks_text}")
 
     # ── Save logic ───────────────────────────────────────────
 
