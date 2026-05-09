@@ -1101,9 +1101,12 @@ class OSRMClient:
                             full_durations[dest_idx][src_idx] = full_durations[src_idx][dest_idx]
 
     def _build_optimized_table_batches(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
-        """Оптимизиран batch Table API метод с до 30 координати на заявка"""
+        """Оптимизиран batch Table API метод."""
         n = len(locations)
-        batch_size = 30  # Намален размер за по-стабилни заявки
+        # Inter-batch requests concatenate two batches, so each single batch
+        # must be at most half of the OSRM Table API location limit.
+        max_locations = int(getattr(self.config, "max_locations_for_osrm", 50) or 50)
+        batch_size = max(2, min(25, max_locations // 2))
         
         logger.info(f"🚀 Започвам оптимизиран batch Table API: {n} локации с batch размер {batch_size}")
         
@@ -1190,7 +1193,7 @@ class OSRMClient:
         logger.info(f"✅ Оптимизиран batch Table API завършен:")
         logger.info(f"   🎯 Успешни batches: {successful_batches}/{total_batch_requests} ({success_rate:.1f}%)")
         logger.info(f"   ❌ Неуспешни batches: {failed_batches}")
-        logger.info(f"   🚀 Използвани 80-координатни Table API заявки")
+        logger.info(f"   🚀 Използвани Table API заявки с до {batch_size * 2} координати")
         
         matrix = DistanceMatrix(
             distances=full_distances,
@@ -1304,6 +1307,10 @@ def get_customer_distance_matrix(customers, depot_location: Tuple[float, float])
 def get_distance_matrix_from_central_cache(locations: List[Tuple[float, float]]) -> Optional[DistanceMatrix]:
     """Получава матрица с разстояния директно от централния кеш (ПОДОБРЕНО с submatrix extraction)"""
     try:
+        if not getattr(get_config().cache, "enable_cache", False):
+            logger.info("Централният OSRM кеш е изключен от конфигурацията.")
+            return None
+
         if getattr(get_config().routing, "enable_curbside_approach", False):
             logger.info("Централният OSRM кеш е пропуснат, защото curbside routing е включен.")
             return None

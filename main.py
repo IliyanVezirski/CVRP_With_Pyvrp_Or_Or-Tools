@@ -10,13 +10,23 @@ import time
 import os
 import io
 import copy
+import re
 from typing import Optional, List, Dict, Any, Tuple
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, current_process
 from dataclasses import asdict
 
 # Импортираме всички необходими модули
 from ortools.constraint_solver import routing_enums_pb2
-from config import get_config, MainConfig, CVRPConfig, LocationConfig, RoutingEngine
+from config import (
+    get_config,
+    MainConfig,
+    CVRPConfig,
+    LocationConfig,
+    RoutingEngine,
+    VehicleConfig,
+    VehicleType,
+    build_ordered_depots,
+)
 from input_handler import InputHandler, InputData
 from warehouse_manager import WarehouseManager, WarehouseAllocation
 from cvrp_solver import CVRPSolver, CVRPSolution
@@ -25,7 +35,89 @@ from output_handler import OutputHandler
 from osrm_client import OSRMClient, DistanceMatrix, get_distance_matrix_from_central_cache
 
 
-def setup_logging():
+def _split_sklad_ids(raw_value: Any) -> set[str]:
+    if raw_value is None:
+        return set()
+
+    return {
+        part.strip()
+        for part in re.split(r"[,;\s]+", str(raw_value))
+        if part.strip()
+    }
+
+
+def _same_coords(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> bool:
+    if not a or not b:
+        return False
+
+    try:
+        return abs(float(a[0]) - float(b[0])) < 0.0001 and abs(float(a[1]) - float(b[1])) < 0.0001
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def get_active_vehicle_configs(allocation: WarehouseAllocation, config: MainConfig):
+    """Returns vehicle configs that match the actually loaded depots/sklads."""
+    logger = logging.getLogger(__name__)
+    vehicles = copy.deepcopy(config.vehicles or [])
+
+    active_sklads = {
+        str(getattr(customer, "source_id_skld", "") or "").strip()
+        for customer in (allocation.vehicle_customers or [])
+        if str(getattr(customer, "source_id_skld", "") or "").strip()
+    }
+    requested_sklads = _split_sklad_ids(getattr(config.input, "json_sklad", ""))
+    effective_sklads = active_sklads or requested_sklads
+
+    vratza_sklads = _split_sklad_ids(getattr(config.set_data, "set_data_vratza_id_skld", "128")) or {"128"}
+    has_vratza_work = bool(effective_sklads & vratza_sklads)
+    vratza_depot = getattr(config.locations, "vratza_depot_location", None)
+
+    disabled_vehicle_types = []
+    for vehicle in vehicles:
+        vehicle_type_value = getattr(getattr(vehicle, "vehicle_type", None), "value", str(getattr(vehicle, "vehicle_type", "")))
+        is_vratza_vehicle = (
+            vehicle_type_value == "vratza_bus"
+            or _same_coords(getattr(vehicle, "start_location", None), vratza_depot)
+        )
+        if is_vratza_vehicle and not has_vratza_work:
+            vehicle.enabled = False
+            disabled_vehicle_types.append(vehicle_type_value)
+
+    if disabled_vehicle_types:
+        logger.info(
+            "Изключвам depot-specific vehicles без активни клиенти от съответния склад: "
+            f"{disabled_vehicle_types}. Active IdSkld={sorted(effective_sklads) or 'unknown'}"
+        )
+
+    return vehicles
+
+
+def vehicle_config_to_worker_dict(vehicle_config: VehicleConfig) -> Dict[str, Any]:
+    data = asdict(vehicle_config)
+    vehicle_type = data.get("vehicle_type")
+    data["vehicle_type"] = getattr(vehicle_type, "value", vehicle_type)
+    return data
+
+
+def vehicle_configs_from_worker_dicts(items: Optional[List[Dict[str, Any]]]) -> List[VehicleConfig]:
+    vehicle_configs = []
+    for item in items or []:
+        data = dict(item)
+        vehicle_type = data.get("vehicle_type")
+        if not isinstance(vehicle_type, VehicleType):
+            data["vehicle_type"] = VehicleType(vehicle_type)
+
+        for key in ("start_location", "tsp_depot_location"):
+            if isinstance(data.get(key), list):
+                data[key] = tuple(data[key])
+
+        vehicle_configs.append(VehicleConfig(**data))
+
+    return vehicle_configs
+
+
+def setup_logging(worker_id: Optional[int] = None):
     """Настройва основното логиране за главния процес."""
     config = get_config()
     log_config = config.logging
@@ -33,7 +125,10 @@ def setup_logging():
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    formatter = logging.Formatter(log_config.log_format)
+    log_format = log_config.log_format
+    if worker_id is not None:
+        log_format = f"%(asctime)s - worker-{worker_id} - %(name)s - %(levelname)s - %(message)s"
+    formatter = logging.Formatter(log_format)
     
     logger = logging.getLogger()
     try:
@@ -94,9 +189,57 @@ def prepare_data(
         return None, None
 
 
+def move_customers_without_coordinates_to_unserved(
+    allocation: WarehouseAllocation,
+) -> WarehouseAllocation:
+    """Moves customers without GPS out of solver input so matrix indices stay aligned."""
+    logger = logging.getLogger(__name__)
+    vehicle_customers = list(allocation.vehicle_customers or [])
+    missing_coordinates = [customer for customer in vehicle_customers if not customer.coordinates]
+
+    if not missing_coordinates:
+        return allocation
+
+    valid_customers = [customer for customer in vehicle_customers if customer.coordinates]
+    existing_warehouse_ids = {id(customer) for customer in allocation.warehouse_customers or []}
+    moved_to_warehouse = [
+        customer for customer in missing_coordinates
+        if id(customer) not in existing_warehouse_ids
+    ]
+
+    allocation.vehicle_customers = valid_customers
+    allocation.warehouse_customers = list(allocation.warehouse_customers or []) + moved_to_warehouse
+    allocation.total_vehicle_volume = sum(float(getattr(customer, "volume", 0) or 0) for customer in valid_customers)
+    allocation.warehouse_volume = sum(float(getattr(customer, "volume", 0) or 0) for customer in allocation.warehouse_customers)
+    allocation.capacity_utilization = (
+        allocation.total_vehicle_volume / allocation.total_vehicle_capacity
+        if allocation.total_vehicle_capacity > 0
+        else 0
+    )
+
+    valid_customer_ids = {id(customer) for customer in valid_customers}
+    allocation.center_zone_customers = [
+        customer for customer in (allocation.center_zone_customers or [])
+        if id(customer) in valid_customer_ids
+    ]
+
+    preview = ", ".join(
+        str(getattr(customer, "id", "") or getattr(customer, "name", ""))
+        for customer in missing_coordinates[:10]
+    )
+    logger.warning(
+        "Преместени са %d клиента без GPS към необслужени/склад, за да не се разместят matrix indices: %s",
+        len(missing_coordinates),
+        preview,
+    )
+
+    return allocation
+
+
 def get_distance_matrix(
     allocation: WarehouseAllocation, 
-    location_config: LocationConfig
+    location_config: LocationConfig,
+    vehicle_configs=None,
 ) -> Optional[DistanceMatrix]:
     """
     Изчислява или зарежда от кеша матрицата с разстояния САМО ВЕДНЪЖ.
@@ -108,20 +251,19 @@ def get_distance_matrix(
     logger.info("СТЪПКА 1.5: ИЗЧИСЛЯВАНЕ НА МАТРИЦА С РАЗСТОЯНИЯ")
     logger.info("="*60)
 
-    customers = allocation.vehicle_customers
+    customers = list(allocation.vehicle_customers or [])
     if not customers:
         logger.warning("Няма клиенти за solver-а, пропускам изчисляването на матрица.")
         return None
+    if any(not customer.coordinates for customer in customers):
+        logger.error("Има клиенти без GPS в solver списъка. Матрицата няма да се изчислява.")
+        return None
         
-    enabled_vehicles = config.vehicles or []
-    unique_depots = {location_config.depot_location}
-    for vehicle_config in enabled_vehicles:
-        if vehicle_config.enabled and vehicle_config.start_location:
-            unique_depots.add(vehicle_config.start_location)
-            
-    sorted_depots = sorted(list(unique_depots), key=lambda x: (x[0], x[1]))
+    enabled_vehicles = vehicle_configs if vehicle_configs is not None else (config.vehicles or [])
+    sorted_depots = build_ordered_depots(location_config.depot_location, enabled_vehicles)
 
-    all_locations = sorted_depots + [c.coordinates for c in customers if c.coordinates]
+    all_locations = sorted_depots + [c.coordinates for c in customers]
+    logger.info(f"Ред на депата в матрицата: {sorted_depots}")
     
     logger.info(f"Общо локации за матрица: {len(all_locations)} ({len(sorted_depots)} депа, {len(customers)} клиента)")
     
@@ -194,6 +336,12 @@ def generate_solver_configs(base_cvrp_config: CVRPConfig, num_workers: int) -> L
     local_search_metaheuristics = base_cvrp_config.parallel_local_search_metaheuristics
 
     # Взимаме стратегиите последователно от списъка
+    explicit_pyvrp_seed = getattr(base_cvrp_config, "pyvrp_seed", None)
+    pyvrp_seed_base = (
+        int(explicit_pyvrp_seed)
+        if explicit_pyvrp_seed is not None
+        else int(getattr(base_cvrp_config, "pyvrp_seed_base", 42) or 42)
+    )
     for i in range(num_workers):
         # Избираме стратегия от списъка (циклично ако няма достатъчно)
         strategy_index = i % len(first_solution_strategies)
@@ -205,29 +353,41 @@ def generate_solver_configs(base_cvrp_config: CVRPConfig, num_workers: int) -> L
         new_config = copy.deepcopy(base_cvrp_config)
         new_config.first_solution_strategy = strategy
         new_config.local_search_metaheuristic = metaheuristic
+        new_config.pyvrp_seed = pyvrp_seed_base + i
         
         configs.append(new_config)
 
     logger.info(f"Създадени {len(configs)} конфигурации за тестване.")
     logger.info(f"Използвани стратегии: {[c.first_solution_strategy for c in configs]}")
     logger.info(f"Използвани метаевристики: {[c.local_search_metaheuristic for c in configs]}")
+    if base_cvrp_config.solver_type == "pyvrp":
+        logger.info(f"Използвани PyVRP seed-ове: {[getattr(c, 'pyvrp_seed', None) for c in configs]}")
     
     return configs
 
 
-def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, DistanceMatrix, int]) -> Optional[CVRPSolution]:
+def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, DistanceMatrix, list, int]) -> Optional[CVRPSolution]:
     """
     "Работникът" - функцията, която се изпълнява паралелно.
     """
-    warehouse_allocation, cvrp_config_dict, location_config_dict, distance_matrix, worker_id = worker_args
+    warehouse_allocation, cvrp_config_dict, location_config_dict, distance_matrix, vehicle_config_dicts, worker_id = worker_args
+    if current_process().name != "MainProcess":
+        setup_logging(worker_id=worker_id)
+
+    logger = logging.getLogger(__name__)
     cvrp_config = CVRPConfig(**cvrp_config_dict)
     location_config = LocationConfig(**location_config_dict)
+    vehicle_configs = vehicle_configs_from_worker_dicts(vehicle_config_dicts)
+    if cvrp_config.solver_type == "pyvrp" and getattr(cvrp_config, "pyvrp_seed", None) is None:
+        cvrp_config.pyvrp_seed = int(getattr(cvrp_config, "pyvrp_seed_base", 42) or 42)
 
     # Добавяме лог за дебъгване
-    print(f"[Работник {worker_id}]: solver_type = {cvrp_config.solver_type}, use_simple_solver = {cvrp_config.use_simple_solver}")
+    logger.info(f"[Работник {worker_id}]: solver_type = {cvrp_config.solver_type}, use_simple_solver = {cvrp_config.use_simple_solver}")
+    if cvrp_config.solver_type == "pyvrp":
+        logger.info(f"[Работник {worker_id}]: PyVRP seed = {cvrp_config.pyvrp_seed}")
 
-    print(f"[Работник {worker_id}]: СТАРТ. Стратегия: {cvrp_config.first_solution_strategy}, "
-          f"Метаевристика: {cvrp_config.local_search_metaheuristic}")
+    logger.info(f"[Работник {worker_id}]: СТАРТ. Стратегия: {cvrp_config.first_solution_strategy}, "
+                f"Метаевристика: {cvrp_config.local_search_metaheuristic}")
 
     # Избираме подходящия солвър
     if cvrp_config.solver_type == "pyvrp":
@@ -236,20 +396,21 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
             depot_location=location_config.depot_location,
             distance_matrix=distance_matrix,
             config=cvrp_config,
-            location_config=location_config
+            location_config=location_config,
+            vehicle_configs=vehicle_configs,
         )
     else:  # or_tools
-        solver = CVRPSolver(cvrp_config, location_config)
+        solver = CVRPSolver(cvrp_config, location_config, vehicle_configs)
         solution = solver.solve(warehouse_allocation, location_config.depot_location, distance_matrix)
 
     if solution and solution.routes:
         # Изчисляваме общия обем за това решение
         total_volume = sum(r.total_volume for r in solution.routes)
-        print(f"[Работник {worker_id}]: ЗАВЪРШЕН. Обслужен обем: {total_volume:.2f}, "
-              f"Маршрути: {len(solution.routes)}, Пропуснати: {len(solution.dropped_customers)}")
+        logger.info(f"[Работник {worker_id}]: ЗАВЪРШЕН. Обслужен обем: {total_volume:.2f}, "
+                    f"Маршрути: {len(solution.routes)}, Пропуснати: {len(solution.dropped_customers)}")
         return solution
 
-    print(f"[Работник {worker_id}]: ЗАВЪРШЕН. Не е намерено валидно решение.")
+    logger.info(f"[Работник {worker_id}]: ЗАВЪРШЕН. Не е намерено валидно решение.")
     return None
 
 
@@ -268,13 +429,16 @@ def process_results(
     logger.info("СТЪПКА 3: ОБРАБОТКА НА РЕЗУЛТАТИТЕ")
     logger.info("="*60)
     
-    output_handler = OutputHandler()
-    
     logger.info("Генериране на изходни файлове...")
-    # Предаваме входното депо за съвместимост (ще се използват индивидуалните депа от маршрутите)
-    output_files = output_handler.generate_all_outputs(
-                solution, warehouse_allocation, input_data.depot_location
-            )
+    output_files = {}
+    try:
+        output_handler = OutputHandler()
+        # Предаваме входното депо за съвместимост (ще се използват индивидуалните депа от маршрутите)
+        output_files = output_handler.generate_all_outputs(
+                    solution, warehouse_allocation, input_data.depot_location
+                )
+    except Exception as exc:
+        logger.error(f"Генерирането на изходни файлове завърши с грешка, продължавам към резюмето: {exc}", exc_info=True)
             
     _print_summary(input_data, warehouse_allocation, solution, output_files, execution_time)
     
@@ -393,12 +557,18 @@ def run_optimization(
     input_data, warehouse_allocation = prepare_data(input_file, input_data_override)
     if not input_data or not warehouse_allocation:
         raise RuntimeError("Не са намерени валидни клиенти във входните данни.")
+    warehouse_allocation = move_customers_without_coordinates_to_unserved(warehouse_allocation)
+    active_vehicle_configs = get_active_vehicle_configs(warehouse_allocation, config)
 
     # --- Стъпка 1.5: Изчисляване на матрица с разстояния ---
-    distance_matrix = get_distance_matrix(warehouse_allocation, config.locations)
+    distance_matrix = get_distance_matrix(warehouse_allocation, config.locations, active_vehicle_configs)
     if not distance_matrix:
         logger.error("Не може да се изчисли матрица с разстояния. Прекратявам работа.")
         raise RuntimeError("Не може да се изчисли матрица с разстояния.")
+    active_vehicle_worker_dicts = [
+        vehicle_config_to_worker_dict(vehicle_config)
+        for vehicle_config in active_vehicle_configs
+    ]
 
     logger.info("="*60)
     logger.info("СТЪПКА 2: РЕШАВАНЕ НА CVRP ПРОБЛЕМА")
@@ -427,6 +597,7 @@ def run_optimization(
                 asdict(cvrp_config),
                 asdict(config.locations),
                 distance_matrix, # Подаваме готовата матрица
+                active_vehicle_worker_dicts,
                 i + 1
             )
             worker_args.append(args)
@@ -456,22 +627,15 @@ def run_optimization(
             asdict(config.cvrp), 
             asdict(config.locations),
             distance_matrix,
+            active_vehicle_worker_dicts,
             1
         ))
 
     if best_solution:
         execution_time = time.time() - start_time
-        # Получаваме депата за передаване към process_results
-        enabled_vehicles = get_config().vehicles or []
-        unique_depots = {config.locations.depot_location}
-        for vehicle_config in enabled_vehicles:
-            if vehicle_config.enabled and vehicle_config.start_location:
-                unique_depots.add(vehicle_config.start_location)
-        
-        # Гарантираме, че главното депо е винаги първо в списъка
-        sorted_depots = [config.locations.depot_location]  # Главното депо винаги първо
-        other_depots = sorted([d for d in unique_depots if d != config.locations.depot_location], key=lambda x: (x[0], x[1]))
-        sorted_depots.extend(other_depots)
+        # Получаваме депата за предаване към process_results в същия ред като матрицата.
+        enabled_vehicles = active_vehicle_configs
+        sorted_depots = build_ordered_depots(config.locations.depot_location, enabled_vehicles)
         
         output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots)
         set_data_result = None

@@ -3286,21 +3286,38 @@ class OutputHandler:
 
         # 1. Интерактивна карта (обща)
         if getattr(self.config, "enable_interactive_map", True):
-            map_gen = InteractiveMapGenerator(self.config)
-            route_map = map_gen.create_map(solution, warehouse_allocation, depot_location)
-            map_file = map_gen.save_map(route_map)
-            output_files['map'] = map_file
+            try:
+                map_gen = InteractiveMapGenerator(self.config)
+            except Exception as e:
+                logger.error(f"Грешка при инициализиране на генератора за карти: {e}", exc_info=True)
+                map_gen = None
 
-            # 1.1. Отделни HTML карти за всеки маршрут
-            routes_dir = self.config.routes_output_dir
-            os.makedirs(routes_dir, exist_ok=True)
-            for idx, route in enumerate(solution.routes):
-                route_number = idx + 1
-                single_map = map_gen.create_single_route_map(route, route_number, depot_location)
-                route_file = os.path.join(routes_dir, f"route_{route_number}.html")
-                saved_route_file = map_gen.save_map(single_map, route_file)
-                output_files[f'route_map_{route_number}'] = saved_route_file
-            logger.info(f"Генерирани {len(solution.routes)} отделни HTML карти в {routes_dir}")
+            if map_gen:
+                try:
+                    route_map = map_gen.create_map(solution, warehouse_allocation, depot_location)
+                    map_file = map_gen.save_map(route_map)
+                    output_files['map'] = map_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на общата интерактивна карта: {e}", exc_info=True)
+
+                # 1.1. Отделни HTML карти за всеки маршрут
+                routes_dir = self.config.routes_output_dir
+                generated_route_maps = 0
+                try:
+                    os.makedirs(routes_dir, exist_ok=True)
+                    for idx, route in enumerate(solution.routes):
+                        route_number = idx + 1
+                        try:
+                            single_map = map_gen.create_single_route_map(route, route_number, depot_location)
+                            route_file = os.path.join(routes_dir, f"route_{route_number}.html")
+                            saved_route_file = map_gen.save_map(single_map, route_file)
+                            output_files[f'route_map_{route_number}'] = saved_route_file
+                            generated_route_maps += 1
+                        except Exception as e:
+                            logger.error(f"Грешка при генериране на HTML карта за маршрут {route_number}: {e}", exc_info=True)
+                    logger.info(f"Генерирани {generated_route_maps}/{len(solution.routes)} отделни HTML карти в {routes_dir}")
+                except Exception as e:
+                    logger.error(f"Грешка при подготовка на директорията за route карти: {e}", exc_info=True)
         
         else:
             logger.info("Генерирането на карти е изключено от настройките.")
@@ -3311,18 +3328,24 @@ class OutputHandler:
         # 3. Експорт в един общ Excel файл с отделни sheets
         if getattr(self.config, "enable_excel_output", True):
             if solution.routes or all_unserviced_customers:
-                excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
-                if excel_file:
-                    output_files['excel_report'] = excel_file
+                try:
+                    excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
+                    if excel_file:
+                        output_files['excel_report'] = excel_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на Excel отчет: {e}", exc_info=True)
         else:
             logger.info("Генерирането на Excel отчет е изключено от настройките.")
         
         # 4. CSV файл с маршрутите
         if getattr(self.config, "enable_csv_output", True):
             if solution.routes:
-                csv_file = self.excel_exporter.export_routes_csv(solution)
-                if csv_file:
-                    output_files['csv_routes'] = csv_file
+                try:
+                    csv_file = self.excel_exporter.export_routes_csv(solution)
+                    if csv_file:
+                        output_files['csv_routes'] = csv_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на CSV маршрути: {e}", exc_info=True)
         else:
             logger.info("Генерирането на CSV е изключено от настройките.")
         
@@ -3333,7 +3356,7 @@ class OutputHandler:
                 chart_files = chart_gen.generate_all_charts(solution, all_unserviced_customers)
                 output_files.update(chart_files)
             except Exception as e:
-                logger.error(f"Грешка при генериране на графики: {e}")
+                logger.error(f"Грешка при генериране на графики: {e}", exc_info=True)
         else:
             logger.info("Генерирането на графики е изключено от настройките.")
         

@@ -28,6 +28,9 @@ from config import (
     LocationConfig,
     is_location_in_center_zone,
     calculate_customer_drop_penalties,
+    build_ordered_depots,
+    get_traffic_multiplier,
+    get_traffic_zones,
 )
 from input_handler import Customer
 from osrm_client import DistanceMatrix
@@ -212,47 +215,43 @@ class ORToolsSolver:
             logger.info("🕐 Създаване на vehicle-specific time callbacks...")
             vehicle_service_times = data['vehicle_service_times']
             
-            # === ГРАДСКИ ТРАФИК: Предварително определяме кои локации са в градската зона ===
-            enable_city_traffic = False
-            city_traffic_multiplier = 1.0
-            city_center = None
-            city_radius = 0
-            
-            if self.location_config:
-                enable_city_traffic = getattr(self.location_config, 'enable_city_traffic_adjustment', False)
-                city_traffic_multiplier = getattr(self.location_config, 'city_traffic_duration_multiplier', 1.0)
-                city_center = getattr(self.location_config, 'city_center_coords', None)
-                city_radius = getattr(self.location_config, 'city_traffic_radius_km', 12.0)
-            
-            # Определяме кои локации са в градската зона
-            locations_in_city = []
+            # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
+            traffic_zones = get_traffic_zones(self.location_config)
+            location_coords = []
             num_locations = len(self.distance_matrix.distances)
             for loc_idx in range(num_locations):
                 if loc_idx < len(self.unique_depots):
-                    # Депо
-                    lat, lon = self.unique_depots[loc_idx]
+                    coords = self.unique_depots[loc_idx]
                 else:
-                    # Клиент
                     client_idx = loc_idx - len(self.unique_depots)
                     if client_idx < len(self.customers):
-                        lat, lon = self.customers[client_idx].coordinates or (0, 0)
+                        coords = self.customers[client_idx].coordinates or (0, 0)
                     else:
-                        lat, lon = 0, 0
-                
-                # Проверяваме дали е в градската зона
-                in_city = False
-                if enable_city_traffic and city_center:
-                    dist_to_city_center = calculate_distance_km((lat, lon), city_center)
-                    in_city = dist_to_city_center <= city_radius
-                locations_in_city.append(in_city)
-            
-            if enable_city_traffic and city_center:
-                city_locations_count = sum(locations_in_city)
-                logger.info(f"🚗 Градски трафик АКТИВИРАН за OR-Tools:")
-                logger.info(f"  - Център: {city_center}")
-                logger.info(f"  - Радиус: {city_radius} км")
-                logger.info(f"  - Множител: {city_traffic_multiplier} (+{(city_traffic_multiplier-1)*100:.0f}%)")
-                logger.info(f"  - Локации в градска зона: {city_locations_count}/{num_locations}")
+                        coords = (0, 0)
+                location_coords.append(coords)
+
+            if traffic_zones:
+                logger.info(f"🚗 Градски трафик АКТИВИРАН за OR-Tools: {len(traffic_zones)} зони")
+                for zone in traffic_zones:
+                    logger.info(
+                        "  - %s: center=%s radius=%skm multiplier=%s",
+                        zone.name,
+                        zone.center_coords,
+                        zone.radius_km,
+                        zone.duration_multiplier,
+                    )
+
+            traffic_multipliers = [[1.0] * num_locations for _ in range(num_locations)]
+            if traffic_zones:
+                for from_node in range(num_locations):
+                    for to_node in range(num_locations):
+                        if from_node == to_node:
+                            continue
+                        traffic_multipliers[from_node][to_node] = get_traffic_multiplier(
+                            self.location_config,
+                            location_coords[from_node],
+                            location_coords[to_node],
+                        )
             
             def make_vehicle_time_callback(vehicle_id, service_time_seconds):
                 def vehicle_time_callback(from_index, to_index):
@@ -270,9 +269,10 @@ class ORToolsSolver:
 
                         travel_time = self.distance_matrix.durations[from_node][to_node]
 
-                        if enable_city_traffic and from_node < len(locations_in_city) and to_node < len(locations_in_city):
-                            if locations_in_city[from_node] and locations_in_city[to_node]:
-                                travel_time = travel_time * city_traffic_multiplier
+                        if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
+                            traffic_multiplier = traffic_multipliers[from_node][to_node]
+                            if traffic_multiplier > 1.0:
+                                travel_time = travel_time * traffic_multiplier
 
                         if from_node >= len(self.unique_depots):
                             travel_time += service_time_seconds
@@ -781,36 +781,19 @@ class ORToolsSolver:
         # Service time в секунди за този тип бус
         service_time_seconds = vehicle_config.service_time_minutes * 60
         
-        # === ГРАДСКИ ТРАФИК: Настройки и определяне кои локации са в града ===
-        enable_city_traffic = False
-        city_traffic_multiplier = 1.0
-        city_center = None
-        city_radius = 0
-        
-        if self.location_config:
-            enable_city_traffic = getattr(self.location_config, 'enable_city_traffic_adjustment', False)
-            city_traffic_multiplier = getattr(self.location_config, 'city_traffic_duration_multiplier', 1.0)
-            city_center = getattr(self.location_config, 'city_center_coords', None)
-            city_radius = getattr(self.location_config, 'city_traffic_radius_km', 12.0)
-        
-        # Предварително определяме кои локации са в градската зона
+        # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
         num_locations = len(self.distance_matrix.distances)
-        locations_in_city = []
+        location_coords = []
         for loc_idx in range(num_locations):
             if loc_idx < len(self.unique_depots):
-                lat, lon = self.unique_depots[loc_idx]
+                coords = self.unique_depots[loc_idx]
             else:
                 client_idx = loc_idx - len(self.unique_depots)
                 if client_idx < len(self.customers):
-                    lat, lon = self.customers[client_idx].coordinates or (0, 0)
+                    coords = self.customers[client_idx].coordinates or (0, 0)
                 else:
-                    lat, lon = 0, 0
-            
-            in_city = False
-            if enable_city_traffic and city_center:
-                dist_to_city_center = calculate_distance_km((lat, lon), city_center)
-                in_city = dist_to_city_center <= city_radius
-            locations_in_city.append(in_city)
+                    coords = (0, 0)
+            location_coords.append(coords)
         
         # От депо до първия клиент
         current_node = depot_index
@@ -824,9 +807,14 @@ class ORToolsSolver:
             
             # Travel time от текущия node до клиента с трафик корекция
             travel_time = self.distance_matrix.durations[current_node][customer_index]
-            if enable_city_traffic and current_node < len(locations_in_city) and customer_index < len(locations_in_city):
-                if locations_in_city[current_node] and locations_in_city[customer_index]:
-                    travel_time = travel_time * city_traffic_multiplier
+            if current_node < len(location_coords) and customer_index < len(location_coords):
+                traffic_multiplier = get_traffic_multiplier(
+                    self.location_config,
+                    location_coords[current_node],
+                    location_coords[customer_index],
+                )
+                if traffic_multiplier > 1.0:
+                    travel_time = travel_time * traffic_multiplier
             total_time += travel_time
             
             # Service time за клиента (само за клиенти, не за депо)
@@ -836,9 +824,14 @@ class ORToolsSolver:
         
         # От последния клиент обратно в депото с трафик корекция
         travel_time_back = self.distance_matrix.durations[current_node][depot_index]
-        if enable_city_traffic and current_node < len(locations_in_city) and depot_index < len(locations_in_city):
-            if locations_in_city[current_node] and locations_in_city[depot_index]:
-                travel_time_back = travel_time_back * city_traffic_multiplier
+        if current_node < len(location_coords) and depot_index < len(location_coords):
+            traffic_multiplier = get_traffic_multiplier(
+                self.location_config,
+                location_coords[current_node],
+                location_coords[depot_index],
+            )
+            if traffic_multiplier > 1.0:
+                travel_time_back = travel_time_back * traffic_multiplier
         total_time += travel_time_back
         
         logger.debug(f"🕐 {vehicle_config.vehicle_type.value} accurate time: "
@@ -1853,26 +1846,25 @@ class ORToolsSolver:
 class CVRPSolver:
     """Главен клас за решаване на CVRP - опростена версия."""
     
-    def __init__(self, config: Optional[CVRPConfig] = None, location_config: Optional[LocationConfig] = None):
+    def __init__(
+        self,
+        config: Optional[CVRPConfig] = None,
+        location_config: Optional[LocationConfig] = None,
+        vehicle_configs: Optional[List[VehicleConfig]] = None,
+    ):
         self.config = config or get_config().cvrp
         self.location_config = location_config or get_config().locations
+        self.vehicle_configs = vehicle_configs
     
     def solve(self, 
               allocation: WarehouseAllocation, 
               depot_location: Tuple[float, float],
               distance_matrix: DistanceMatrix) -> CVRPSolution:
         
-        enabled_vehicles = get_config().vehicles or []
+        enabled_vehicles = self.vehicle_configs if self.vehicle_configs is not None else (get_config().vehicles or [])
         
-        unique_depots = {depot_location}
-        for vehicle_config in enabled_vehicles:
-            if vehicle_config.enabled and vehicle_config.start_location:
-                unique_depots.add(vehicle_config.start_location)
-        
-        # Гарантираме, че главното депо е винаги първо в списъка
-        sorted_depots = [depot_location]  # Главното депо винаги първо
-        other_depots = sorted([d for d in unique_depots if d != depot_location], key=lambda x: (x[0], x[1]))
-        sorted_depots.extend(other_depots)
+        sorted_depots = build_ordered_depots(depot_location, enabled_vehicles)
+        logger.info(f"Ред на депата в OR-Tools solver: {sorted_depots}")
         
         # Директно използваме OR-Tools
         solver = ORToolsSolver(
@@ -1896,7 +1888,8 @@ class CVRPSolver:
 # Удобна функция
 def solve_cvrp(allocation: WarehouseAllocation, 
                depot_location: Tuple[float, float], 
-               distance_matrix: DistanceMatrix) -> CVRPSolution:
+               distance_matrix: DistanceMatrix,
+               vehicle_configs: Optional[List[VehicleConfig]] = None) -> CVRPSolution:
     """Удобна функция за решаване на CVRP"""
-    solver = CVRPSolver()
+    solver = CVRPSolver(vehicle_configs=vehicle_configs)
     return solver.solve(allocation, depot_location, distance_matrix) 
