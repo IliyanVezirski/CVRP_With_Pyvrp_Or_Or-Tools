@@ -24,6 +24,10 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime
 import json
 import logging
+import os
+import socket
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -212,13 +216,105 @@ def _normalise_endpoint(endpoint: str) -> str:
     return endpoint if endpoint.startswith("/") else f"/{endpoint}"
 
 
+def _detect_machine_ipv4() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            address = sock.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            address = info[4][0]
+            if address and not address.startswith("127.") and not address.startswith("169.254."):
+                return address
+    except OSError:
+        pass
+
+    return "127.0.0.1"
+
+
+def _display_host_for_api(host: str) -> str:
+    host = str(host or "").strip()
+    if host in {"", "0.0.0.0", "::"}:
+        return _detect_machine_ipv4()
+    return host
+
+
 def _build_public_base_url(api_config, host: str, port: int) -> str:
     configured_url = (getattr(api_config, "api_public_url", "") or "").strip().rstrip("/")
     if configured_url:
         return configured_url
 
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    display_host = _display_host_for_api(host)
     return f"http://{display_host}:{port}"
+
+
+def _api_logs_dir() -> str:
+    logs_dir = os.path.join(os.getcwd(), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    return logs_dir
+
+
+def _configure_api_logging() -> None:
+    logs_dir = _api_logs_dir()
+    log_file = os.path.join(logs_dir, "cvrp_api_server.log")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    existing_files = {
+        os.path.normcase(getattr(handler, "baseFilename", ""))
+        for handler in root_logger.handlers
+        if getattr(handler, "baseFilename", "")
+    }
+    if os.path.normcase(log_file) not in existing_files:
+        handler = logging.FileHandler(log_file, "a", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        root_logger.addHandler(handler)
+
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+
+def _persist_run_status(status: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        status_payload = deepcopy(status) if status is not None else _run_status_snapshot()
+        status_file = os.path.join(_api_logs_dir(), "api_run_status.json")
+        tmp_file = f"{status_file}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as fh:
+            json.dump(status_payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, status_file)
+    except Exception as exc:
+        logger.warning("Could not persist API run status: %s", exc)
+
+
+def _child_python_executable() -> str:
+    executable = sys.executable
+    if os.path.basename(executable).lower() == "pythonw.exe":
+        python_exe = os.path.join(os.path.dirname(executable), "python.exe")
+        if os.path.exists(python_exe):
+            return python_exe
+    return executable
+
+
+def _configured_run_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+
+    main_py = os.path.join(os.getcwd(), "main.py")
+    return [_child_python_executable(), main_py]
+
+
+def _run_status_result_for_process(exit_code: Optional[int], command: list[str]) -> Dict[str, Any]:
+    return {
+        "execution_mode": "subprocess",
+        "exit_code": exit_code,
+        "command": command,
+    }
 
 
 def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoint: str, health_endpoint: str) -> Dict[str, Any]:
@@ -1008,6 +1104,8 @@ def _default_run_worker(run_id: str, config_override: Optional[MainConfig], call
                     "result": result_summary,
                 }
             )
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
         notification = _post_completion_callback(
             callback_url,
             {
@@ -1020,6 +1118,8 @@ def _default_run_worker(run_id: str, config_override: Optional[MainConfig], call
         )
         with _RUN_LOCK:
             _RUN_STATUS["notification"] = notification
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
         logger.info("API trigger run %s completed", run_id)
     except Exception as exc:
         logger.exception("API trigger run %s failed", run_id)
@@ -1034,6 +1134,8 @@ def _default_run_worker(run_id: str, config_override: Optional[MainConfig], call
                     "result": None,
                 }
             )
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
         notification = _post_completion_callback(
             callback_url,
             {
@@ -1046,6 +1148,106 @@ def _default_run_worker(run_id: str, config_override: Optional[MainConfig], call
         )
         with _RUN_LOCK:
             _RUN_STATUS["notification"] = notification
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
+
+
+def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
+    command = _configured_run_command()
+    stdout_path = os.path.join(_api_logs_dir(), f"api_run_{run_id}.log")
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env.pop("_MEIPASS2", None)
+
+    process = None
+    try:
+        logger.info("API trigger run %s starting subprocess: %s", run_id, command)
+        with open(stdout_path, "a", encoding="utf-8", errors="replace") as stdout_log:
+            stdout_log.write(f"\n===== API run {run_id} started {_now_iso()} =====\n")
+            stdout_log.write("Command: " + " ".join(command) + "\n")
+            stdout_log.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=os.getcwd(),
+                env=env,
+                stdout=stdout_log,
+                stderr=subprocess.STDOUT,
+            )
+            with _RUN_LOCK:
+                _RUN_STATUS.update(
+                    {
+                        "process_id": process.pid,
+                        "execution_mode": "subprocess",
+                        "process_log": stdout_path,
+                    }
+                )
+                status_snapshot = deepcopy(_RUN_STATUS)
+            _persist_run_status(status_snapshot)
+            exit_code = process.wait()
+            stdout_log.write(f"===== API run {run_id} finished {_now_iso()} exit_code={exit_code} =====\n")
+
+        finished_at = _now_iso()
+        success = exit_code == 0
+        result_summary = _run_status_result_for_process(exit_code, command)
+        with _RUN_LOCK:
+            _RUN_STATUS.update(
+                {
+                    "running": False,
+                    "status": "completed" if success else "failed",
+                    "finished_at": finished_at,
+                    "error": None if success else f"CVRP process exited with code {exit_code}",
+                    "result": result_summary if success else None,
+                }
+            )
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
+
+        notification = _post_completion_callback(
+            callback_url,
+            {
+                "status": "completed" if success else "failed",
+                "success": success,
+                "run_id": run_id,
+                "finished_at": finished_at,
+                "exit_code": exit_code,
+                "process_log": stdout_path,
+            },
+        )
+        with _RUN_LOCK:
+            _RUN_STATUS["notification"] = notification
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
+        logger.info("API trigger run %s subprocess finished with code %s", run_id, exit_code)
+    except Exception as exc:
+        logger.exception("API trigger run %s subprocess failed", run_id)
+        finished_at = _now_iso()
+        with _RUN_LOCK:
+            _RUN_STATUS.update(
+                {
+                    "running": False,
+                    "status": "failed",
+                    "finished_at": finished_at,
+                    "error": str(exc),
+                    "result": None,
+                }
+            )
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
+        notification = _post_completion_callback(
+            callback_url,
+            {
+                "status": "failed",
+                "success": False,
+                "run_id": run_id,
+                "finished_at": finished_at,
+                "error": str(exc),
+                "process_log": stdout_path,
+            },
+        )
+        with _RUN_LOCK:
+            _RUN_STATUS["notification"] = notification
+            status_snapshot = deepcopy(_RUN_STATUS)
+        _persist_run_status(status_snapshot)
 
 
 def _start_default_run(
@@ -1053,6 +1255,7 @@ def _start_default_run(
     applied_settings: Optional[list[str]] = None,
     ignored_settings: Optional[list[str]] = None,
     callback_url: str = "",
+    use_subprocess: bool = False,
 ) -> tuple[bool, Dict[str, Any]]:
     with _RUN_LOCK:
         if _RUN_STATUS.get("running"):
@@ -1072,13 +1275,16 @@ def _start_default_run(
                 "ignored_settings": ignored_settings or [],
                 "callback_url": callback_url or None,
                 "notification": None,
+                "execution_mode": "subprocess" if use_subprocess else "in_process",
             }
         )
+        status_snapshot = deepcopy(_RUN_STATUS)
+    _persist_run_status(status_snapshot)
 
     thread = threading.Thread(
-        target=_default_run_worker,
-        args=(run_id, config_override, callback_url),
-        daemon=True,
+        target=_default_run_subprocess_worker if use_subprocess else _default_run_worker,
+        args=(run_id, callback_url) if use_subprocess else (run_id, config_override, callback_url),
+        daemon=False,
         name=f"cvrp-run-{run_id}",
     )
     thread.start()
@@ -1287,7 +1493,14 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
             return
 
         callback_url = _request_callback_url(payload, query)
-        started, status = _start_default_run(config_override, applied_settings, ignored_settings, callback_url)
+        use_subprocess = config_override is None and not applied_settings and not ignored_settings
+        started, status = _start_default_run(
+            config_override,
+            applied_settings,
+            ignored_settings,
+            callback_url,
+            use_subprocess=use_subprocess,
+        )
         if started:
             self._send_json(202, {
                 "status": "started",
@@ -1334,10 +1547,7 @@ def run_server(host: str | None = None, port: int | None = None):
     host = host or getattr(api_config, "api_host", "0.0.0.0")
     port = port or int(getattr(api_config, "api_port", 8088))
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
+    _configure_api_logging()
 
     server = ThreadingHTTPServer((host, port), CVRPApiHandler)
     public_url = _build_public_base_url(api_config, host, port)

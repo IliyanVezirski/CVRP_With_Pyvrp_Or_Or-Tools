@@ -240,9 +240,11 @@ def main_exe():
         
     except KeyboardInterrupt:
         print("\n⚠️ Програмата е прекъсната от потребителя.")
+        sys.exit(130)
     except Exception as e:
         print(f"\n❌ Грешка при изпълнение: {e}")
         logging.error(f"EXE грешка: {e}", exc_info=True)
+        sys.exit(1)
 
 
 def server_exe():
@@ -262,12 +264,9 @@ def server_exe():
         host = args.host or getattr(api_config, "api_host", "0.0.0.0")
         port = args.port or int(getattr(api_config, "api_port", 8088))
         endpoint = getattr(api_config, "api_endpoint", "/solve")
-        public_url = (getattr(api_config, "api_public_url", "") or "").strip().rstrip("/")
-        if not public_url:
-            display_host = "127.0.0.1" if host == "0.0.0.0" else host
-            public_url = f"http://{display_host}:{port}"
+        from cvrp_api_server import _build_public_base_url, run_server
 
-        from cvrp_api_server import run_server
+        public_url = _build_public_base_url(api_config, host, port)
 
         print(f"🌐 CVRP API сървър: http://{host}:{port}")
         print(f"🔗 URL за извикване: {public_url}{endpoint}")
@@ -278,6 +277,7 @@ def server_exe():
     except Exception as e:
         print(f"\n❌ Грешка при стартиране на API сървър: {e}")
         logging.error(f"EXE API server грешка: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

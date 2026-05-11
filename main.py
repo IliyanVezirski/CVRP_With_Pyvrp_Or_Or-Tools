@@ -708,7 +708,8 @@ def main():
 
 if __name__ == "__main__":
     # Fix encoding for Windows console (support UTF-8 output)
-    if sys.stdout.encoding != 'utf-8':
+    stdout_encoding = getattr(sys.stdout, "encoding", None)
+    if sys.stdout is not None and stdout_encoding and stdout_encoding.lower() != 'utf-8':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     
     try:
