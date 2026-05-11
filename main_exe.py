@@ -240,9 +240,11 @@ def main_exe():
         
     except KeyboardInterrupt:
         print("\n⚠️ Програмата е прекъсната от потребителя.")
+        sys.exit(130)
     except Exception as e:
         print(f"\n❌ Грешка при изпълнение: {e}")
         logging.error(f"EXE грешка: {e}", exc_info=True)
+        sys.exit(1)
 
 
 def server_exe():
@@ -275,6 +277,7 @@ def server_exe():
     except Exception as e:
         print(f"\n❌ Грешка при стартиране на API сървър: {e}")
         logging.error(f"EXE API server грешка: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
