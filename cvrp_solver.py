@@ -28,6 +28,9 @@ from config import (
     LocationConfig,
     is_location_in_center_zone,
     calculate_customer_drop_penalties,
+    build_ordered_depots,
+    get_traffic_multiplier,
+    get_traffic_zones,
 )
 from input_handler import Customer
 from osrm_client import DistanceMatrix
@@ -64,7 +67,8 @@ class Route:
         vehicle_type: Типът превозно средство (например INTERNAL_BUS, CENTER_BUS и др.).
         vehicle_id: Индекс на конкретния автобус от този тип (0..N-1 за типа).
         customers: Списък от клиенти в реда на обслужване.
-        depot_location: GPS координати на депото, от което започва/завършва маршрутът.
+        depot_location: GPS координати на стартовото депо.
+        end_location: GPS координати на крайната точка. Ако е None, използва се depot_location.
         total_distance_km: Общо изминато разстояние по маршрута в километри.
         total_time_minutes: Общо време за маршрута (вкл. обслужване) в минути.
         total_volume: Общ обем на заявките по маршрута.
@@ -74,6 +78,8 @@ class Route:
     vehicle_id: int
     customers: List[Customer]
     depot_location: Tuple[float, float]
+    end_location: Optional[Tuple[float, float]] = None
+    vehicle_name: str = ""
     total_distance_km: float = 0.0
     total_time_minutes: float = 0.0
     total_volume: float = 0.0
@@ -212,47 +218,43 @@ class ORToolsSolver:
             logger.info("🕐 Създаване на vehicle-specific time callbacks...")
             vehicle_service_times = data['vehicle_service_times']
             
-            # === ГРАДСКИ ТРАФИК: Предварително определяме кои локации са в градската зона ===
-            enable_city_traffic = False
-            city_traffic_multiplier = 1.0
-            city_center = None
-            city_radius = 0
-            
-            if self.location_config:
-                enable_city_traffic = getattr(self.location_config, 'enable_city_traffic_adjustment', False)
-                city_traffic_multiplier = getattr(self.location_config, 'city_traffic_duration_multiplier', 1.0)
-                city_center = getattr(self.location_config, 'city_center_coords', None)
-                city_radius = getattr(self.location_config, 'city_traffic_radius_km', 12.0)
-            
-            # Определяме кои локации са в градската зона
-            locations_in_city = []
+            # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
+            traffic_zones = get_traffic_zones(self.location_config)
+            location_coords = []
             num_locations = len(self.distance_matrix.distances)
             for loc_idx in range(num_locations):
                 if loc_idx < len(self.unique_depots):
-                    # Депо
-                    lat, lon = self.unique_depots[loc_idx]
+                    coords = self.unique_depots[loc_idx]
                 else:
-                    # Клиент
                     client_idx = loc_idx - len(self.unique_depots)
                     if client_idx < len(self.customers):
-                        lat, lon = self.customers[client_idx].coordinates or (0, 0)
+                        coords = self.customers[client_idx].coordinates or (0, 0)
                     else:
-                        lat, lon = 0, 0
-                
-                # Проверяваме дали е в градската зона
-                in_city = False
-                if enable_city_traffic and city_center:
-                    dist_to_city_center = calculate_distance_km((lat, lon), city_center)
-                    in_city = dist_to_city_center <= city_radius
-                locations_in_city.append(in_city)
-            
-            if enable_city_traffic and city_center:
-                city_locations_count = sum(locations_in_city)
-                logger.info(f"🚗 Градски трафик АКТИВИРАН за OR-Tools:")
-                logger.info(f"  - Център: {city_center}")
-                logger.info(f"  - Радиус: {city_radius} км")
-                logger.info(f"  - Множител: {city_traffic_multiplier} (+{(city_traffic_multiplier-1)*100:.0f}%)")
-                logger.info(f"  - Локации в градска зона: {city_locations_count}/{num_locations}")
+                        coords = (0, 0)
+                location_coords.append(coords)
+
+            if traffic_zones:
+                logger.info(f"🚗 Градски трафик АКТИВИРАН за OR-Tools: {len(traffic_zones)} зони")
+                for zone in traffic_zones:
+                    logger.info(
+                        "  - %s: center=%s radius=%skm multiplier=%s",
+                        zone.name,
+                        zone.center_coords,
+                        zone.radius_km,
+                        zone.duration_multiplier,
+                    )
+
+            traffic_multipliers = [[1.0] * num_locations for _ in range(num_locations)]
+            if traffic_zones:
+                for from_node in range(num_locations):
+                    for to_node in range(num_locations):
+                        if from_node == to_node:
+                            continue
+                        traffic_multipliers[from_node][to_node] = get_traffic_multiplier(
+                            self.location_config,
+                            location_coords[from_node],
+                            location_coords[to_node],
+                        )
             
             def make_vehicle_time_callback(vehicle_id, service_time_seconds):
                 def vehicle_time_callback(from_index, to_index):
@@ -270,9 +272,10 @@ class ORToolsSolver:
 
                         travel_time = self.distance_matrix.durations[from_node][to_node]
 
-                        if enable_city_traffic and from_node < len(locations_in_city) and to_node < len(locations_in_city):
-                            if locations_in_city[from_node] and locations_in_city[to_node]:
-                                travel_time = travel_time * city_traffic_multiplier
+                        if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
+                            traffic_multiplier = traffic_multipliers[from_node][to_node]
+                            if traffic_multiplier > 1.0:
+                                travel_time = travel_time * traffic_multiplier
 
                         if from_node >= len(self.unique_depots):
                             travel_time += service_time_seconds
@@ -304,8 +307,35 @@ class ORToolsSolver:
                 logger.info(f"  - vehicle {vehicle_id}: service time {service_time_seconds / 60:.1f} мин/клиент")
 
             routing.AddDimensionWithVehicleTransitAndCapacity(
-                time_callback_indices, 0, data['vehicle_max_times'], False, "Time"
+                time_callback_indices,
+                data.get('time_slack_max', 0),
+                data['vehicle_max_times'],
+                False,
+                "Time",
             )
+            time_dimension = routing.GetDimensionOrDie("Time")
+
+            if data.get('time_windows_enabled'):
+                logger.info("🕒 Прилагам работно време на клиенти към OR-Tools Time dimension")
+                for vehicle_id, start_time_seconds in enumerate(data.get('vehicle_start_times', [])):
+                    start_index = routing.Start(vehicle_id)
+                    time_dimension.CumulVar(start_index).SetRange(
+                        int(start_time_seconds),
+                        int(start_time_seconds),
+                    )
+
+                applied_windows = 0
+                for node_idx, window in enumerate(data.get('time_windows', [])):
+                    if not window or node_idx in data['depot_indices']:
+                        continue
+                    index = manager.NodeToIndex(node_idx)
+                    if index < 0:
+                        continue
+                    start_s, end_s = window
+                    time_dimension.CumulVar(index).SetRange(int(start_s), int(end_s))
+                    applied_windows += 1
+
+                logger.info(f"✅ Работно време приложено за {applied_windows} клиента")
 
             logger.info("✅ Vehicle-specific Time callbacks настроени успешно")
 
@@ -580,7 +610,9 @@ class ORToolsSolver:
             
             # Добавяме LNS time limit за по-добър контрол на търсенето
             if hasattr(self.config, 'lns_time_limit_seconds'):
-                search_parameters.lns_time_limit.seconds = self.config.lns_time_limit_seconds
+                lns_limit = max(0.0, float(self.config.lns_time_limit_seconds or 0))
+                search_parameters.lns_time_limit.seconds = int(lns_limit)
+                search_parameters.lns_time_limit.nanos = int((lns_limit - int(lns_limit)) * 1_000_000_000)
             
             # Добавяме LNS neighborhood параметри за по-добър контрол
             if hasattr(self.config, 'lns_num_nodes'):
@@ -613,6 +645,12 @@ class ORToolsSolver:
         data = {}
         data['distance_matrix'] = self.distance_matrix.distances
         data['demands'] = [0] * len(self.unique_depots) + [int(c.volume * 100) for c in self.customers]
+        data['time_windows_enabled'] = self._time_windows_enabled()
+        data['time_slack_max'] = 24 * 3600 if data['time_windows_enabled'] else 0
+        data['time_windows'] = [None] * len(self.unique_depots) + [
+            self._customer_time_window_seconds(customer)
+            for customer in self.customers
+        ]
         
         # Създаваме vehicle-specific service times
         # За депата service time е 0
@@ -652,6 +690,7 @@ class ORToolsSolver:
         vehicle_max_distances = []
         vehicle_max_stops = []
         vehicle_max_times = []
+        vehicle_start_times = []
         vehicle_starts = []
         vehicle_ends = []
         vehicle_fixed_costs = []
@@ -671,9 +710,14 @@ class ORToolsSolver:
         for v_config in self.vehicle_configs:
             if v_config.enabled:
                 depot_index = self._get_depot_index_for_vehicle(v_config)
+                end_depot_index = self._get_end_depot_index_for_vehicle(v_config, depot_index)
                 depot_location = self.unique_depots[depot_index]
+                end_depot_location = self.unique_depots[end_depot_index]
                 
-                logger.info(f"    {v_config.vehicle_type.value}: депо {depot_index} ({depot_location})")
+                logger.info(
+                    f"    {v_config.vehicle_type.value}: старт депо {depot_index} ({depot_location}), "
+                    f"край {end_depot_index} ({end_depot_location})"
+                )
                 
                 for i in range(v_config.count):
                     # Записваме ID-тата на CENTER_BUS превозните средства
@@ -701,17 +745,24 @@ class ORToolsSolver:
                     vehicle_max_stops.append(max_stops)
 
                     # 4. Време (Time) - стриктно
-                    vehicle_max_times.append(int(v_config.max_time_hours * 3600))
+                    max_time_seconds = int(v_config.max_time_hours * 3600)
+                    start_time_seconds = self._vehicle_start_seconds(v_config)
+                    vehicle_start_times.append(start_time_seconds)
+                    if data['time_windows_enabled']:
+                        vehicle_max_times.append(start_time_seconds + max_time_seconds)
+                    else:
+                        vehicle_max_times.append(max_time_seconds)
                     vehicle_fixed_costs.append(int(getattr(v_config, "fixed_cost", 0) or 0))
                     
                     vehicle_starts.append(depot_index)
-                    vehicle_ends.append(depot_index)
+                    vehicle_ends.append(end_depot_index)
                     vehicle_id += 1
         
         data['vehicle_capacities'] = vehicle_capacities
         data['vehicle_max_distances'] = vehicle_max_distances
         data['vehicle_max_stops'] = vehicle_max_stops
         data['vehicle_max_times'] = vehicle_max_times
+        data['vehicle_start_times'] = vehicle_start_times
         data['vehicle_starts'] = vehicle_starts
         data['vehicle_ends'] = vehicle_ends
         data['vehicle_fixed_costs'] = vehicle_fixed_costs
@@ -726,6 +777,9 @@ class ORToolsSolver:
         logger.info(f"  - Макс. разстояния (м): {data['vehicle_max_distances']}")
         logger.info(f"  - Макс. спирки: {data['vehicle_max_stops']}")
         logger.info(f"  - Макс. времена (сек): {data['vehicle_max_times']}")
+        if data['time_windows_enabled']:
+            logger.info(f"  - Стартови времена (сек): {data['vehicle_start_times']}")
+            logger.info("  - Работно време на клиенти: АКТИВНО")
         logger.info(f"  - Fixed costs: {data['vehicle_fixed_costs']}")
         logger.info(f"  - CENTER_BUS превозни средства: {center_bus_vehicle_ids}")
         logger.info(f"  - EXTERNAL_BUS превозни средства: {external_bus_vehicle_ids}")
@@ -736,6 +790,17 @@ class ORToolsSolver:
         logger.info("--- DATA MODEL СЪЗДАДЕН ---")
         return data
 
+    def _get_depot_index_for_location(self, location: Optional[Tuple[float, float]], fallback_index: int = 0) -> int:
+        if location:
+            for index, depot in enumerate(self.unique_depots):
+                if (
+                    abs(float(depot[0]) - float(location[0])) < 0.000001
+                    and abs(float(depot[1]) - float(location[1])) < 0.000001
+                ):
+                    return index
+            logger.warning(f"⚠️ Депо {location} не е намерено в матрицата, използвам индекс {fallback_index}")
+        return fallback_index
+
     def _get_depot_index_for_vehicle(self, vehicle_config: VehicleConfig) -> int:
         """
         Намира индекса на депото в `unique_depots` за даденото превозно средство.
@@ -745,19 +810,27 @@ class ORToolsSolver:
         Returns:
             Индекс на депо (int).
         """
-        if vehicle_config.start_location and vehicle_config.start_location in self.unique_depots:
-            return self.unique_depots.index(vehicle_config.start_location)
-        # Връщаме основното депо по подразбиране
-        return 0
+        return self._get_depot_index_for_location(vehicle_config.start_location, 0)
 
-    def _calculate_accurate_route_time(self, customers: List[Customer], depot_location: Tuple[float, float], vehicle_config: VehicleConfig) -> float:
+    def _get_end_depot_index_for_vehicle(self, vehicle_config: VehicleConfig, start_index: Optional[int] = None) -> int:
+        fallback_index = self._get_depot_index_for_vehicle(vehicle_config) if start_index is None else start_index
+        return self._get_depot_index_for_location(getattr(vehicle_config, "end_location", None), fallback_index)
+
+    def _calculate_accurate_route_time(
+        self,
+        customers: List[Customer],
+        depot_location: Tuple[float, float],
+        vehicle_config: VehicleConfig,
+        end_location: Optional[Tuple[float, float]] = None,
+    ) -> float:
         """
         Изчислява точното време за маршрут с vehicle-specific service time.
 
         Args:
             customers: Списък с клиенти в маршрута.
-            depot_location: Локация на депото.
+            depot_location: Локация на стартовото депо.
             vehicle_config: Конфигурация на превозното средство.
+            end_location: Крайна точка. Ако е None, използва стартовото депо.
 
         Returns:
             Общо време в секунди.
@@ -767,50 +840,26 @@ class ORToolsSolver:
         
         total_time = 0.0
         
-        # Намираме индекса на депото в матрицата
-        depot_index = None
-        for i, depot in enumerate(self.unique_depots):
-            if depot == depot_location:
-                depot_index = i
-                break
-        
-        if depot_index is None:
-            logger.warning(f"⚠️ Депо {depot_location} не е намерено, използвам главното депо")
-            depot_index = 0
+        depot_index = self._get_depot_index_for_location(depot_location, 0)
+        end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
         
         # Service time в секунди за този тип бус
         service_time_seconds = vehicle_config.service_time_minutes * 60
+        current_clock_seconds = self._vehicle_start_seconds(vehicle_config)
         
-        # === ГРАДСКИ ТРАФИК: Настройки и определяне кои локации са в града ===
-        enable_city_traffic = False
-        city_traffic_multiplier = 1.0
-        city_center = None
-        city_radius = 0
-        
-        if self.location_config:
-            enable_city_traffic = getattr(self.location_config, 'enable_city_traffic_adjustment', False)
-            city_traffic_multiplier = getattr(self.location_config, 'city_traffic_duration_multiplier', 1.0)
-            city_center = getattr(self.location_config, 'city_center_coords', None)
-            city_radius = getattr(self.location_config, 'city_traffic_radius_km', 12.0)
-        
-        # Предварително определяме кои локации са в градската зона
+        # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
         num_locations = len(self.distance_matrix.distances)
-        locations_in_city = []
+        location_coords = []
         for loc_idx in range(num_locations):
             if loc_idx < len(self.unique_depots):
-                lat, lon = self.unique_depots[loc_idx]
+                coords = self.unique_depots[loc_idx]
             else:
                 client_idx = loc_idx - len(self.unique_depots)
                 if client_idx < len(self.customers):
-                    lat, lon = self.customers[client_idx].coordinates or (0, 0)
+                    coords = self.customers[client_idx].coordinates or (0, 0)
                 else:
-                    lat, lon = 0, 0
-            
-            in_city = False
-            if enable_city_traffic and city_center:
-                dist_to_city_center = calculate_distance_km((lat, lon), city_center)
-                in_city = dist_to_city_center <= city_radius
-            locations_in_city.append(in_city)
+                    coords = (0, 0)
+            location_coords.append(coords)
         
         # От депо до първия клиент
         current_node = depot_index
@@ -824,21 +873,48 @@ class ORToolsSolver:
             
             # Travel time от текущия node до клиента с трафик корекция
             travel_time = self.distance_matrix.durations[current_node][customer_index]
-            if enable_city_traffic and current_node < len(locations_in_city) and customer_index < len(locations_in_city):
-                if locations_in_city[current_node] and locations_in_city[customer_index]:
-                    travel_time = travel_time * city_traffic_multiplier
+            if current_node < len(location_coords) and customer_index < len(location_coords):
+                traffic_multiplier = get_traffic_multiplier(
+                    self.location_config,
+                    location_coords[current_node],
+                    location_coords[customer_index],
+                )
+            if traffic_multiplier > 1.0:
+                travel_time = travel_time * traffic_multiplier
             total_time += travel_time
+            current_clock_seconds += travel_time
+
+            window = self._customer_time_window_seconds(customer)
+            if window:
+                window_start, window_end = window
+                if current_clock_seconds < window_start:
+                    wait_seconds = window_start - current_clock_seconds
+                    total_time += wait_seconds
+                    current_clock_seconds += wait_seconds
+                elif current_clock_seconds > window_end:
+                    logger.debug(
+                        "Клиент %s е след работното време при преизчисление: %.1f мин > %.1f мин",
+                        customer.id,
+                        current_clock_seconds / 60,
+                        window_end / 60,
+                    )
             
             # Service time за клиента (само за клиенти, не за депо)
             total_time += service_time_seconds
+            current_clock_seconds += service_time_seconds
             
             current_node = customer_index
         
-        # От последния клиент обратно в депото с трафик корекция
-        travel_time_back = self.distance_matrix.durations[current_node][depot_index]
-        if enable_city_traffic and current_node < len(locations_in_city) and depot_index < len(locations_in_city):
-            if locations_in_city[current_node] and locations_in_city[depot_index]:
-                travel_time_back = travel_time_back * city_traffic_multiplier
+        # От последния клиент до крайната точка с трафик корекция.
+        travel_time_back = self.distance_matrix.durations[current_node][end_depot_index]
+        if current_node < len(location_coords) and end_depot_index < len(location_coords):
+            traffic_multiplier = get_traffic_multiplier(
+                self.location_config,
+                location_coords[current_node],
+                location_coords[end_depot_index],
+            )
+            if traffic_multiplier > 1.0:
+                travel_time_back = travel_time_back * traffic_multiplier
         total_time += travel_time_back
         
         logger.debug(f"🕐 {vehicle_config.vehicle_type.value} accurate time: "
@@ -885,6 +961,11 @@ class ORToolsSolver:
                 continue
 
             depot_location = self.unique_depots[start_node]
+            end_node = manager.IndexToNode(routing.End(vehicle_id))
+            if end_node < num_depots:
+                end_location = self.unique_depots[end_node]
+            else:
+                end_location = depot_location
             
             logger.info(f"Extracting route for vehicle {vehicle_id}")
 
@@ -923,10 +1004,12 @@ class ORToolsSolver:
                 # Това гарантира 100% консистентност между оптимизация и отчет.
                 route_end_index = routing.End(vehicle_id)
                 ortools_time_seconds = solution.Value(time_dimension.CumulVar(route_end_index))
+                if data.get('time_windows_enabled'):
+                    ortools_time_seconds -= int(data.get('vehicle_start_times', [0] * routing.vehicles())[vehicle_id])
 
                 # НОВА ФУНКЦИОНАЛНОСТ: Изчисляваме точното време с vehicle-specific service time
                 accurate_time_seconds = self._calculate_accurate_route_time(
-                    route_customers, depot_location, vehicle_config
+                    route_customers, depot_location, vehicle_config, end_location
                 )
                 
                 # Логваме разликата за дебъг
@@ -942,6 +1025,11 @@ class ORToolsSolver:
                     vehicle_id=vehicle_id,
                     customers=route_customers,
                     depot_location=depot_location,
+                    end_location=end_location,
+                    vehicle_name=self._get_vehicle_display_name(
+                        vehicle_config,
+                        self._get_vehicle_occurrence_for_id(vehicle_id),
+                    ),
                     total_distance_km=route_distance / 1000,
                     total_time_minutes=accurate_time_seconds / 60,  # Използваме точното време!
                     total_volume=sum(c.volume for c in route_customers),
@@ -982,7 +1070,9 @@ class ORToolsSolver:
         logger.info(f"  - Извличане на маршрути отне: {time.time() - start_time:.2f} сек.")
         
         # НОВА ФУНКЦИОНАЛНОСТ: Финален реконфигурация на маршрутите от депото
-        if self.config.enable_final_depot_reconfiguration:
+        if self._time_windows_enabled():
+            logger.info("⏭️ Пропускане на финална TSP реконфигурация: активни са работни времена на клиенти")
+        elif self.config.enable_final_depot_reconfiguration:
             logger.info("🔄 Прилагане на финална реконфигурация на маршрутите от депото...")
             routes = self._reconfigure_routes_from_depot(routes)
         else:
@@ -1052,6 +1142,53 @@ class ORToolsSolver:
                 return vehicle_config
         
         raise ValueError("Няма включени превозни средства")
+
+    def _get_vehicle_occurrence_for_id(self, vehicle_id: int) -> int:
+        current_id = 0
+        for vehicle_config in self.vehicle_configs:
+            if not vehicle_config.enabled:
+                continue
+            if current_id <= vehicle_id < current_id + vehicle_config.count:
+                return vehicle_id - current_id + 1
+            current_id += vehicle_config.count
+        return 1
+
+    def _get_vehicle_display_name(self, vehicle_config: Optional[VehicleConfig], occurrence: int = 1) -> str:
+        if not vehicle_config:
+            return ""
+        name = str(getattr(vehicle_config, "name", "") or "").strip()
+        if name and int(getattr(vehicle_config, "count", 1) or 1) > 1:
+            return f"{name} {max(1, occurrence)}"
+        return name
+
+    def _time_windows_enabled(self) -> bool:
+        return bool(getattr(self.config, "enable_customer_time_windows", False))
+
+    def _vehicle_start_seconds(self, vehicle_config: Optional[VehicleConfig]) -> int:
+        if vehicle_config and hasattr(vehicle_config, "start_time_minutes"):
+            minutes = int(getattr(vehicle_config, "start_time_minutes", 0) or 0)
+        else:
+            minutes = int(getattr(self.config, "global_start_time_minutes", 480) or 480)
+        return max(0, minutes) * 60
+
+    def _customer_time_window_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        if not self._time_windows_enabled():
+            return None
+
+        start_minutes = getattr(customer, "time_window_start_minutes", None)
+        end_minutes = getattr(customer, "time_window_end_minutes", None)
+
+        if start_minutes is None:
+            start_minutes = 0
+        if end_minutes is None:
+            end_minutes = 1439
+
+        start_minutes = max(0, int(start_minutes))
+        end_minutes = max(0, int(end_minutes))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+
+        return start_minutes * 60, end_minutes * 60
     
     def _create_empty_solution(self) -> CVRPSolution:
         """Създава празно решение в случай на грешка."""
@@ -1075,23 +1212,22 @@ class ORToolsSolver:
             # Намираме vehicle_config за този маршрут
             vehicle_config = self._get_vehicle_config_for_id(route.vehicle_id)
             
-            # Определяме TSP депото за този тип превозно средство
-            tsp_depot = vehicle_config.tsp_depot_location
-            if not tsp_depot:
-                # Ако няма TSP депо, използваме start_location
-                tsp_depot = vehicle_config.start_location
-            if not tsp_depot:
-                # Ако няма и start_location, използваме главното депо
-                tsp_depot = self.unique_depots[0]
+            # Определяме стартова и крайна точка за финалното преизчисление.
+            tsp_depot = route.depot_location or vehicle_config.tsp_depot_location or vehicle_config.start_location or self.unique_depots[0]
+            end_depot = getattr(route, "end_location", None) or getattr(vehicle_config, "end_location", None) or tsp_depot
             
-            logger.info(f"🏢 TSP депо за {vehicle_config.vehicle_type.value}: {tsp_depot}")
-                
-            # НОВА ЛОГИКА: Преизчисляваме оптималния ред на клиентите от TSP депото
-            optimized_customers = self._optimize_route_from_depot(route.customers, tsp_depot, vehicle_config)
+            logger.info(f"🏢 TSP старт за {vehicle_config.vehicle_type.value}: {tsp_depot}; край: {end_depot}")
+
+            if end_depot != tsp_depot:
+                logger.info("⏭️ Пропускане на TSP пренареждане: маршрутът има различна крайна точка")
+                optimized_customers = list(route.customers)
+            else:
+                # Преизчисляваме оптималния ред на клиентите от TSP депото.
+                optimized_customers = self._optimize_route_from_depot(route.customers, tsp_depot, vehicle_config)
             
             # Изчисляваме новите разстояния и времена от TSP депото
             new_distance_km, new_time_minutes = self._calculate_route_from_depot(
-                optimized_customers, tsp_depot, vehicle_config
+                optimized_customers, tsp_depot, vehicle_config, end_depot
             )
             
             # Създаваме нов маршрут с TSP депото като стартова точка и оптимизиран ред
@@ -1100,6 +1236,8 @@ class ORToolsSolver:
                 vehicle_id=route.vehicle_id,
                 customers=optimized_customers,  # ОПТИМИЗИРАН ред на клиентите
                 depot_location=tsp_depot,  # TSP депото за този тип автобус
+                end_location=end_depot,
+                vehicle_name=getattr(route, "vehicle_name", ""),
                 total_distance_km=new_distance_km,
                 total_time_minutes=new_time_minutes,
                 total_volume=sum(c.volume for c in optimized_customers),
@@ -1265,14 +1403,21 @@ class ORToolsSolver:
         logger.info(f"🔄 Greedy оптимизиран ред на клиентите от депото: {[c.name for c in optimized_customers]}")
         return optimized_customers
     
-    def _calculate_route_from_depot(self, customers: List[Customer], depot_location: Tuple[float, float], vehicle_config: VehicleConfig = None) -> Tuple[float, float]:
+    def _calculate_route_from_depot(
+        self,
+        customers: List[Customer],
+        depot_location: Tuple[float, float],
+        vehicle_config: VehicleConfig = None,
+        end_location: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[float, float]:
         """
         Изчислява разстояние и време за маршрут, започващ от депото.
         
         Args:
             customers: Списък с клиенти
-            depot_location: Локация на депото
+            depot_location: Локация на стартовото депо
             vehicle_config: Конфигурация на превозното средство (за точен service time)
+            end_location: Крайна точка. Ако е None, използва стартовото депо.
         """
         if not customers:
             return 0.0, 0.0
@@ -1280,16 +1425,8 @@ class ORToolsSolver:
         total_distance = 0.0
         total_time = 0.0
         
-        # Намираме индекса на депото в матрицата
-        depot_index = None
-        for i, depot in enumerate(self.unique_depots):
-            if depot == depot_location:
-                depot_index = i
-                break
-        
-        if depot_index is None:
-            logger.warning(f"⚠️ Депо {depot_location} не е намерено, използвам главното депо")
-            depot_index = 0
+        depot_index = self._get_depot_index_for_location(depot_location, 0)
+        end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
         
         # Service time - използваме vehicle-specific ако е зададен
         if vehicle_config:
@@ -1316,9 +1453,9 @@ class ORToolsSolver:
             
             current_node = customer_index
         
-        # От последния клиент обратно в депото
-        distance = self.distance_matrix.distances[current_node][depot_index]
-        duration = self.distance_matrix.durations[current_node][depot_index]
+        # От последния клиент до крайната точка
+        distance = self.distance_matrix.distances[current_node][end_depot_index]
+        duration = self.distance_matrix.durations[current_node][end_depot_index]
         
         total_distance += distance
         total_time += duration
@@ -1774,10 +1911,12 @@ class ORToolsSolver:
                 if vehicle_config:
                     vehicle_type = vehicle_config.vehicle_type
                     depot_location = vehicle_config.start_location or self.unique_depots[0]
+                    end_location = getattr(vehicle_config, "end_location", None) or depot_location
                 else:
                     from config import VehicleType
                     vehicle_type = VehicleType.INTERNAL_BUS
                     depot_location = self.unique_depots[0]
+                    end_location = depot_location
                 
                 total_volume = sum(c.volume for c in route_customers)
                 
@@ -1786,6 +1925,11 @@ class ORToolsSolver:
                     vehicle_id=vehicle_id,
                     customers=route_customers,
                     depot_location=depot_location,
+                    end_location=end_location,
+                    vehicle_name=self._get_vehicle_display_name(
+                        vehicle_config,
+                        self._get_vehicle_occurrence_for_id(vehicle_id),
+                    ),
                     total_distance_km=route_distance_km,
                     total_time_minutes=route_time_minutes,
                     total_volume=total_volume,
@@ -1853,26 +1997,25 @@ class ORToolsSolver:
 class CVRPSolver:
     """Главен клас за решаване на CVRP - опростена версия."""
     
-    def __init__(self, config: Optional[CVRPConfig] = None, location_config: Optional[LocationConfig] = None):
+    def __init__(
+        self,
+        config: Optional[CVRPConfig] = None,
+        location_config: Optional[LocationConfig] = None,
+        vehicle_configs: Optional[List[VehicleConfig]] = None,
+    ):
         self.config = config or get_config().cvrp
         self.location_config = location_config or get_config().locations
+        self.vehicle_configs = vehicle_configs
     
     def solve(self, 
               allocation: WarehouseAllocation, 
               depot_location: Tuple[float, float],
               distance_matrix: DistanceMatrix) -> CVRPSolution:
         
-        enabled_vehicles = get_config().vehicles or []
+        enabled_vehicles = self.vehicle_configs if self.vehicle_configs is not None else (get_config().vehicles or [])
         
-        unique_depots = {depot_location}
-        for vehicle_config in enabled_vehicles:
-            if vehicle_config.enabled and vehicle_config.start_location:
-                unique_depots.add(vehicle_config.start_location)
-        
-        # Гарантираме, че главното депо е винаги първо в списъка
-        sorted_depots = [depot_location]  # Главното депо винаги първо
-        other_depots = sorted([d for d in unique_depots if d != depot_location], key=lambda x: (x[0], x[1]))
-        sorted_depots.extend(other_depots)
+        sorted_depots = build_ordered_depots(depot_location, enabled_vehicles)
+        logger.info(f"Ред на депата в OR-Tools solver: {sorted_depots}")
         
         # Директно използваме OR-Tools
         solver = ORToolsSolver(
@@ -1896,7 +2039,8 @@ class CVRPSolver:
 # Удобна функция
 def solve_cvrp(allocation: WarehouseAllocation, 
                depot_location: Tuple[float, float], 
-               distance_matrix: DistanceMatrix) -> CVRPSolution:
+               distance_matrix: DistanceMatrix,
+               vehicle_configs: Optional[List[VehicleConfig]] = None) -> CVRPSolution:
     """Удобна функция за решаване на CVRP"""
-    solver = CVRPSolver()
+    solver = CVRPSolver(vehicle_configs=vehicle_configs)
     return solver.solve(allocation, depot_location, distance_matrix) 

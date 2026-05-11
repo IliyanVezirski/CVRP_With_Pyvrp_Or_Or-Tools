@@ -45,6 +45,13 @@ def _format_bukva(template: str, context: Dict[str, Any]) -> str:
         return str(context.get("bus_number", "")) + str(context.get("route_number", "")) + str(context.get("stop_number", ""))
 
 
+def _resolve_unserved_done_flag(set_data: Any) -> str:
+    unserved_done_flag = str(getattr(set_data, "set_data_unserved_done_flag", "") or "").strip()
+    if unserved_done_flag:
+        return unserved_done_flag
+    return str(getattr(set_data, "set_data_done_flag", "") or "")
+
+
 def _coords_match(left: Any, right: Any, tolerance: float = 0.0001) -> bool:
     if not left or not right:
         return False
@@ -114,6 +121,7 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
         route_number = route_index + 1
         bus_number = _format_bus_number(output, route_index)
         vehicle_type = getattr(route.vehicle_type, "value", str(route.vehicle_type))
+        vehicle_name = str(getattr(route, "vehicle_name", "") or "").strip()
         id_skld = resolve_route_id_skld(route, config)
 
         for stop_index, customer in enumerate(route.customers):
@@ -124,6 +132,7 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
                 "route_number": route_number,
                 "stop_number": stop_number,
                 "vehicle_type": vehicle_type,
+                "vehicle_name": vehicle_name,
                 "customer_id": customer.id,
                 "customer_document": customer.document,
                 "id_plas_doc": id_plas_doc,
@@ -174,6 +183,7 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
         stop_number = idx + 1
         id_plas_doc = str(getattr(customer, "plas_doc", "") or getattr(customer, "document", "") or getattr(customer, "id", "") or "")
         id_skld = str(getattr(customer, "source_id_skld", "") or getattr(set_data, "set_data_id_skld", "") or "")
+        done_flag = _resolve_unserved_done_flag(set_data)
         context = {
             "bus_number": "",
             "route_number": 0,
@@ -184,7 +194,7 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
             "id_plas_doc": id_plas_doc,
             "id_skld": id_skld,
             "id_grafik": getattr(set_data, "set_data_unserved_id_grafik", ""),
-            "done_flag": getattr(set_data, "set_data_done_flag", ""),
+            "done_flag": done_flag,
             "volume": getattr(customer, "volume", ""),
         }
         id_grafik_template = str(getattr(set_data, "set_data_unserved_id_grafik_template", "") or "").strip()
@@ -198,7 +208,7 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
             {
                 "cmd": str(getattr(set_data, "set_data_command", "setData") or "setData"),
                 "IdPlasDoc": id_plas_doc,
-                "DoneFlag": str(getattr(set_data, "set_data_done_flag", "") or ""),
+                "DoneFlag": done_flag,
                 "IdSkld": id_skld,
                 "Bukva": _format_bukva(getattr(set_data, "set_data_unserved_bukva_template", ""), context),
                 "IdGrafik": id_grafik,

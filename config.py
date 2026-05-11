@@ -24,6 +24,43 @@ def _abs_path(relative_path: str) -> str:
     return os.path.join(PROJECT_ROOT, relative_path)
 
 
+def build_ordered_depots(
+    main_depot: Tuple[float, float],
+    vehicle_configs: Optional[List[Any]] = None,
+) -> List[Tuple[float, float]]:
+    """Връща единния ред на депата за матрици и solver-и."""
+    def _normalise_coords(coords: Any) -> Optional[Tuple[float, float]]:
+        try:
+            if not coords or len(coords) != 2:
+                return None
+            return (float(coords[0]), float(coords[1]))
+        except (TypeError, ValueError):
+            return None
+
+    def _coord_key(coords: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(coords[0], 6), round(coords[1], 6))
+
+    main_depot = _normalise_coords(main_depot)
+    if main_depot is None:
+        return []
+
+    depots = [main_depot]
+    seen = {_coord_key(main_depot)}
+    extra_depots = []
+
+    for vehicle_config in vehicle_configs or []:
+        if not getattr(vehicle_config, "enabled", False):
+            continue
+        for attr_name in ("start_location", "end_location"):
+            location = _normalise_coords(getattr(vehicle_config, attr_name, None))
+            if location and _coord_key(location) not in seen:
+                extra_depots.append(location)
+                seen.add(_coord_key(location))
+
+    depots.extend(sorted(extra_depots, key=lambda coords: (coords[0], coords[1])))
+    return depots
+
+
 class RoutingEngine(Enum):
     """Избор на routing engine за изчисляване на матрици."""
     OSRM = "osrm"          # Open Source Routing Machine - бърз, но без traffic
@@ -47,15 +84,27 @@ class VehicleConfig:
     vehicle_type: VehicleType  # Тип на превозното средство (от VehicleType enum)
     capacity: int              # Максимален капацитет/обем (в стекове, грамове или друга единица)
     count: int                 # Брой налични превозни средства от този тип
+    name: str = ""             # Име на буса за отчети и карти. При count > 1 се показва като "Име 1", "Име 2"...
     fixed_cost: int = 40000    # Цена/глоба за използване на един бус. По-висока стойност намалява броя използвани бусове.
     max_distance_km: Optional[int] = None  # Максимален пробег в километри за един маршрут. None означава без лимит.
     max_time_hours: int = 8    # Максимално време за работа по един маршрут в часове (включва пътуване и обслужване).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
     enabled: bool = True       # Дали този тип превозно средство е активно и може да се използва от solver-а.
     start_location: Optional[Tuple[float, float]] = None  # Персонална начална точка (депо) за този тип. Ако е None, използва се главното депо.
+    end_location: Optional[Tuple[float, float]] = None  # Персонална крайна точка за този тип. Ако е None, маршрутът завършва в стартовото депо.
     max_customers_per_route: Optional[int] = None # Максимален брой клиенти, които могат да бъдат обслужени в един маршрут. None = без ограничение.
     start_time_minutes: int = 480  # Стартово време в минути от 00:00 (8:00 = 480 минути)
     tsp_depot_location: Optional[Tuple[float, float]] = None  # Депо за TSP оптимизация. Ако е None, използва start_location или главното депо.
+
+
+@dataclass
+class TrafficZoneConfig:
+    """Допълнителна зона, в която времето за движение се умножава."""
+    name: str
+    center_coords: Tuple[float, float]
+    radius_km: float
+    duration_multiplier: float
+    enabled: bool = True
 
 
 @dataclass
@@ -125,6 +174,7 @@ class LocationConfig:
     city_traffic_radius_km: float = 10.0  # Радиус на градската зона с трафик (км)
     city_traffic_duration_multiplier: float = 1.55 # Множител за време в града (1.35 = +35% заради трафик)
     enable_city_traffic_adjustment: bool = True  # Дали да се прилага корекция за градски трафик
+    traffic_zones: List[TrafficZoneConfig] = field(default_factory=lambda: [])
 
 
 def _distance_km(coord1: Optional[Tuple[float, float]], coord2: Tuple[float, float]) -> float:
@@ -171,6 +221,67 @@ def is_location_in_center_zone(coords: Optional[Tuple[float, float]], location_c
         return is_point_in_polygon(coords, polygon)
 
     return _distance_km(coords, location_config.center_location) <= location_config.center_zone_radius_km
+
+
+def get_traffic_zones(location_config: Optional[LocationConfig]) -> List[TrafficZoneConfig]:
+    """Връща всички активни трафик зони, включително старите single-zone настройки."""
+    if not location_config or not getattr(location_config, "enable_city_traffic_adjustment", False):
+        return []
+
+    zones = []
+    legacy_center = getattr(location_config, "city_center_coords", None)
+    legacy_radius = getattr(location_config, "city_traffic_radius_km", 0) or 0
+    legacy_multiplier = getattr(location_config, "city_traffic_duration_multiplier", 1.0) or 1.0
+    if legacy_center and legacy_radius > 0 and legacy_multiplier > 1.0:
+        zones.append(
+            TrafficZoneConfig(
+                name="Основна зона",
+                center_coords=legacy_center,
+                radius_km=float(legacy_radius),
+                duration_multiplier=float(legacy_multiplier),
+                enabled=True,
+            )
+        )
+
+    for zone in getattr(location_config, "traffic_zones", []) or []:
+        if isinstance(zone, dict):
+            zone = TrafficZoneConfig(
+                name=str(zone.get("name", "Traffic zone")),
+                center_coords=tuple(zone.get("center_coords", legacy_center or (0.0, 0.0))),
+                radius_km=float(zone.get("radius_km", 0) or 0),
+                duration_multiplier=float(zone.get("duration_multiplier", 1.0) or 1.0),
+                enabled=bool(zone.get("enabled", True)),
+            )
+        if (
+            getattr(zone, "enabled", True)
+            and getattr(zone, "center_coords", None)
+            and getattr(zone, "radius_km", 0) > 0
+            and getattr(zone, "duration_multiplier", 1.0) > 1.0
+        ):
+            zones.append(zone)
+
+    return zones
+
+
+def get_traffic_multiplier(
+    location_config: Optional[LocationConfig],
+    from_coords: Optional[Tuple[float, float]],
+    to_coords: Optional[Tuple[float, float]],
+) -> float:
+    """Връща най-силния multiplier, ако и двете точки попадат в една трафик зона."""
+    if not from_coords or not to_coords:
+        return 1.0
+
+    multiplier = 1.0
+    for zone in get_traffic_zones(location_config):
+        center = getattr(zone, "center_coords", None)
+        radius = float(getattr(zone, "radius_km", 0) or 0)
+        if not center or radius <= 0:
+            continue
+        if _distance_km(from_coords, center) <= radius and _distance_km(to_coords, center) <= radius:
+            multiplier = max(multiplier, float(getattr(zone, "duration_multiplier", 1.0) or 1.0))
+
+    return multiplier
 
 
 def describe_center_zone(location_config: LocationConfig) -> str:
@@ -267,7 +378,7 @@ class RoutingConfig:
     """Конфигурация за избор на routing engine."""
     engine: RoutingEngine = RoutingEngine.OSRM # Кой routing engine да се използва: OSRM или VALHALLA
     # Ако е VALHALLA и enable_time_dependent е True, ще се използва time-dependent routing
-    enable_time_dependent: bool = True  # Дали да се използва time-dependent routing (само за Valhalla)
+    enable_time_dependent: bool = False  # Дали да се използва time-dependent routing (само за Valhalla)
     departure_time: str = "08:00"  # Час на тръгване (HH:MM) за time-dependent routing
     enable_curbside_approach: bool = False  # Ако е True, маршрутите се строят така, че клиентът да е от правилната страна на улицата.
     valhalla_preferred_side: str = "same"  # same = клиентът да е от страната на движение; either = без ограничение.
@@ -287,7 +398,7 @@ class ValhallaConfig:
     # Time-dependent routing настройки
     date_time_type: int = 1  # 0=current, 1=depart_at, 2=arrive_by
     
-    # Truck-specific настройки (ако costing="truck")
+    # Truck-specific настройки (ако costing="auto")
     truck_height: float = 3.5  # Височина в метри
     truck_width: float = 2.5   # Ширина в метри
     truck_weight: float = 10.0  # Тегло в тонове
@@ -323,7 +434,7 @@ class InputConfig:
     json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
     json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
     json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
-    json_sklad: str = "106"  # Стойност за Sklad параметъра.
+    json_sklad: str = "106,128"  # Стойност за Sklad параметъра.
     json_done_flag: str = "1974"  # Стойност за DoneFlag параметъра.
     json_extra_query: str = ""  # Допълнителни GET параметри във формат key=value&key2=value2.
     json_date_field: str = "Date"  # Име на полето/параметъра за датата при HTTP JSON заявка.
@@ -334,13 +445,19 @@ class InputConfig:
     json_document_field: str = "IdDoc"  # Име на JSON полето с номер на документа.
     json_plas_doc_field: str = "IdPlasDoc"  # Име на JSON полето за IdPlasDoc, което се връща към setData.
     json_id_skld_field: str = "IdSkld"  # Име на JSON полето с оригиналния склад на заявката.
-    json_override_date: str = ""  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
+    json_time_window_field: str = "WorkTime"  # Име на JSON полето с работно време във формат "08:00 - 16:00".
+    json_time_window_start_field: str = "WorkFrom"  # Име на JSON полето за начало на работното време на клиента.
+    json_time_window_end_field: str = "WorkTo"  # Име на JSON полето за край на работното време на клиента.
+    json_override_date: str = "11/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
     gps_column: str = "GPS"         # Име на колоната с GPS координатите на клиентите.
     client_id_column: str = "IdCust"      # Име на колоната с ID на клиента.
     client_name_column: str = "Клиент" # Име на колоната с името на клиента.
     volume_column: str = "Брой стекове"           # Име на колоната с обема/теглото на заявката.
     document_column: str = "Документ"  # Име на колоната с номер на документа/поръчката.
+    time_window_column: str = "Работно време"  # Excel колона с работно време във формат "08:00 - 16:00".
+    time_window_start_column: str = "Работи от"  # Excel колона за начало на работното време на клиента.
+    time_window_end_column: str = "Работи до"  # Excel колона за край на работното време на клиента.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
 
@@ -365,18 +482,18 @@ class CVRPConfig:
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 20
+    time_limit_seconds: int = 180
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
 
     first_solution_strategy: str = "PARALLEL_CHEAPEST_INSERTION"
     # Описание: Стратегия за намиране на първоначално решение. SAVINGS е по-бърза от AUTOMATIC.
     # Стойности: "AUTOMATIC", "PATH_CHEAPEST_ARC", "SAVINGS", "SWEEP", и др.
 
-    local_search_metaheuristic: str = "AUTOMATIC"
+    local_search_metaheuristic: str = "GUIDED_LOCAL_SEARCH"
     # Описание: SIMULATED_ANNEALING е по-добра за избягване на локални оптимуми.
     # Стойности: "AUTOMATIC", "GUIDED_LOCAL_SEARCH", "SIMULATED_ANNEALING", "TABU_SEARCH".
     
-    lns_time_limit_seconds: float = 15
+    lns_time_limit_seconds: float = 15.0
     # Описание: Много кратък микро-лимит принуждава solver-а да се движи бързо.
     # Употреба: 0.1 секунди е достатъчно за една стъпка, но не позволява зависване.
     
@@ -434,9 +551,39 @@ class CVRPConfig:
     global_start_time_minutes: int = 480
     # Описание: Глобално стартово време в минути от 00:00 (8:00 = 480 минути).
     # Използва се ако не е зададено стартово време за конкретен тип превозно средство.
+
+    enable_customer_time_windows: bool = False
+    # Описание: Дали solver-ите да спазват работно време на клиентите.
+
+    customer_time_window_default_start_minutes: int = 0
+    # Описание: Default начало на прозореца, когато клиентът няма работно време (0 = 00:00).
+
+    customer_time_window_default_end_minutes: int = 1439
+    # Описание: Default край на прозореца, когато клиентът няма работно време (1439 = 23:59).
     
     num_workers: int = -1
     # Описание: Брой паралелни процеси. -1 означава да се използват всички ядра без едно.
+
+    pyvrp_seed_base: int = 1
+    # Описание: Seed за PyVRP, когато pyvrp_seed е None. В паралелен режим worker-ите използват pyvrp_seed_base, pyvrp_seed_base+1...
+    pyvrp_seed: Optional[int] = None
+    # Описание: Ако е зададен, single mode използва точно този seed. В паралелен режим worker-ите използват pyvrp_seed, pyvrp_seed+1...
+
+    pyvrp_num_neighbours: int = 120
+    # Описание: Размер на granular neighbourhood-а на PyVRP. По-голяма стойност = по-бавно, но по-добър шанс за качество при две депа.
+    pyvrp_ils_no_improvement: int = 350000
+    # Описание: Брой ILS итерации без подобрение преди restart. По-високо = по-търпеливо търсене.
+    pyvrp_ils_history_length: int = 650
+    # Описание: Late-acceptance history length за ILS.
+    pyvrp_exhaustive_on_best: bool = True
+    # Описание: По-скъпо локално търсене при ново най-добро решение.
+    pyvrp_use_extended_operators: bool = True
+    # Описание: Добавя по-тежки PyVRP move operators (Exchange30/31/32/33, SwapStar, SwapRoutes).
+    pyvrp_min_perturbations: int = 1
+    pyvrp_max_perturbations: int = 50
+    # Описание: Сила на perturbation при restart-и. По-високо помага да излезе от лош локален оптимум.
+    pyvrp_display_progress: bool = True
+    # Описание: Ако е True, PyVRP печата собствен progress output през solve().
 
     parallel_first_solution_strategies: List[str] = field(default_factory=lambda: [
         "PARALLEL_CHEAPEST_INSERTION",
@@ -456,7 +603,7 @@ class CVRPConfig:
         "GUIDED_LOCAL_SEARCH",
         "SIMULATED_ANNEALING",
         "GUIDED_LOCAL_SEARCH",
-        "GUIDED_LOCAL_SEARCH"
+        "TABU_SEARCH"
     ])
     # Описание: Списък с "Local Search" метаевристики, които да се състезават в паралелен режим.
 
@@ -541,14 +688,16 @@ class APIConfig:
     api_host: str = "0.0.0.0"  # 0.0.0.0 = приема заявки от други компютри в мрежата.
     api_port: int = 8088
     api_public_url: str = ""  # URL за извикване от друга програма, напр. http://10.10.100.134:8088 или https://domain.com/cvrp
+    api_key: str = ""  # Ако е попълнено, /run и /solve изискват X-CVRP-API-Key или Authorization: Bearer.
     api_endpoint: str = "/solve"
+    trigger_endpoint: str = "/run"  # Стартира оптимизацията с текущата конфигурация, без POST payload с клиенти.
     health_endpoint: str = "/health"
 
 
 @dataclass
 class SetDataConfig:
     """Настройки за връщане на готовите маршрути към Bizant чрез cmd=setData."""
-    enable_set_data_upload: bool = True  # Включва изпращане на резултата към setData след успешно решение.
+    enable_set_data_upload: bool = False  # Включва изпращане на резултата към setData след успешно решение.
     set_data_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за setData endpoint.
     set_data_http_method: str = "GET"  # HTTP метод за setData: GET или POST.
     set_data_command: str = "setData"  # cmd параметър.
@@ -560,7 +709,8 @@ class SetDataConfig:
     set_data_id_grafik_template: str = "{bus_number}"  # Шаблон за IdGrafik. По подразбиране е номерът на буса от Excel.
     set_data_bukva_template: str = "БХ{route_number}-{stop_number}"  # Шаблон за Bukva, напр. БХ1-1.
     enable_unserved_set_data_upload: bool = True  # Дали да се изпращат и необслужените клиенти към setData.
-    set_data_unserved_id_grafik: str = ""  # IdGrafik за необслужени клиенти, ако няма шаблон.
+    set_data_unserved_done_flag: str = "0"  # DoneFlag за необслужени. Празно = използва set_data_done_flag.
+    set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
     set_data_unserved_bukva_template: str = "HOF-{id_plas_doc}"  # Шаблон за Bukva на необслужени клиенти.
     enable_make_group: bool = False  # Дали след успешни setData заявки да се изпрати cmd=makeGroup по склад.
@@ -605,83 +755,86 @@ class MainConfig:
         depot_vratza = self.locations.vratza_depot_location
 
         return [
-            # 1. Вътрешни бусове - 4 бр, 360 ст.
-            # Ограниченията за разстояние и брой клиенти са премахнати, за да се разчита
-            # само на твърдите, реални лимити - ВРЕМЕ и ОБЕМ.
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
                 capacity=385,
                 count=6,
-                fixed_cost=40000,
-                max_distance_km=None, # Премахнато
-                max_time_hours=8,
-                service_time_minutes=9,
-                enabled=True,
-                max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),  # Тръгва от центъра
-                start_time_minutes=480,  # 8:00
-                tsp_depot_location=(42.695785029219415, 23.23165887245312)  # TSP оптимизация от главното депо
-            ),
-            # 2. Център бус - 1 бр.
-            VehicleConfig(
-                vehicle_type=VehicleType.CENTER_BUS,
-                capacity=320,
-                count=1,
-                fixed_cost=40000,
-                max_distance_km=None, # Премахнато
+                name="Маршрут",
+                fixed_cost=0,
+                max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=8,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),  # Тръгва от център депото
-                start_time_minutes=510,  # 8:30
-                tsp_depot_location=(42.695785029219415, 23.23165887245312)  # TSP оптимизация от център депото
+                start_location=(42.695785029219415, 23.23165887245312),
+                start_time_minutes=480,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312),
+                end_location=None,
             ),
-            # 3. Външни бусове - 3 бр, 360 ст.
+            VehicleConfig(
+                vehicle_type=VehicleType.CENTER_BUS,
+                capacity=320,
+                count=1,
+                name="Център",
+                fixed_cost=0,
+                max_distance_km=None,
+                max_time_hours=8,
+                service_time_minutes=8,
+                enabled=True,
+                max_customers_per_route=None,
+                start_location=(42.695785029219415, 23.23165887245312),
+                start_time_minutes=510,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312),
+                end_location=None,
+            ),
             VehicleConfig(
                 vehicle_type=VehicleType.EXTERNAL_BUS,
                 capacity=320,
                 count=1,
-                fixed_cost=45000,
-                max_distance_km=None, # Премахнато
-                max_time_hours=8,   
-                service_time_minutes=9, # КОРИГИРАНО
+                name="Доп. бус",
+                fixed_cost=0,
+                max_distance_km=None,
+                max_time_hours=8,
+                service_time_minutes=8,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),  # Тръгва от главното депо
-                start_time_minutes=450,  # 7:30
-                tsp_depot_location=(42.695785029219415, 23.23165887245312)  # TSP оптимизация от главното депо
+                start_location=(42.695785029219415, 23.23165887245312),
+                start_time_minutes=450,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312),
+                end_location=None,
             ),
-            # 4. Специални бусове - 
             VehicleConfig(
                 vehicle_type=VehicleType.SPECIAL_BUS,
                 capacity=300,
                 count=2,
+                name="",
                 fixed_cost=40000,
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=6,
-                enabled=False,  # Изключени по подразбиране
+                enabled=False,
                 max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),  # Тръгва от главното депо
-                start_time_minutes=480,  # 8:00
-                tsp_depot_location=(42.695785029219415, 23.23165887245312)  # TSP оптимизация от главното депо
+                start_location=(42.695785029219415, 23.23165887245312),
+                start_time_minutes=480,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312),
+                end_location=None,
             ),
-            # 5. Враца бусове
             VehicleConfig(
                 vehicle_type=VehicleType.VRATZA_BUS,
                 capacity=385,
                 count=3,
-                fixed_cost=40000,
+                name="Враца",
+                fixed_cost=0,
                 max_distance_km=None,
-                max_time_hours=8,   
-                service_time_minutes=7,
-                enabled=False,  # ТЕСТ: Временно активиран
-                max_customers_per_route=40,
-                start_location=(43.221042895146915, 23.5344026186417),  # Тръгва от депото във Враца
-                start_time_minutes=480,  # 8:00
-                tsp_depot_location=(43.221042895146915, 23.5344026186417)  # TSP оптимизация от Враца депо
-            )
+                max_time_hours=8,
+                service_time_minutes=8,
+                enabled=True,
+                max_customers_per_route=None,
+                start_location=(43.221042895146915, 23.5344026186417),
+                start_time_minutes=480,
+                tsp_depot_location=(43.221042895146915, 23.5344026186417),
+                end_location=None,
+            ),
         ]
 
 

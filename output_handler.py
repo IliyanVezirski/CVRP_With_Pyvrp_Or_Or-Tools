@@ -14,6 +14,7 @@ from typing import List, Dict, Tuple, Optional
 import os
 import logging
 from datetime import datetime
+from urllib.parse import urlencode
 from config import get_config, OutputConfig, RoutingEngine, is_location_in_center_zone
 from cvrp_solver import CVRPSolution, Route
 from warehouse_manager import WarehouseAllocation
@@ -62,6 +63,15 @@ def _append_run_date_to_filename(file_path: str, run_date: Optional[str] = None)
         return file_path
     return os.path.join(directory, f"{stem}_{date_stamp}{extension}")
 
+
+def _safe_filename_stem(value: str, fallback: str) -> str:
+    """Return a Windows-safe filename stem while keeping readable vehicle names."""
+    text = str(value or fallback).strip()
+    invalid_chars = '<>:"/\\|?*'
+    cleaned = "".join(" " if char in invalid_chars or ord(char) < 32 else char for char in text)
+    cleaned = " ".join(cleaned.split()).strip(" .")
+    return cleaned or fallback
+
 # Настройки за различните типове превозни средства
 VEHICLE_SETTINGS = {
     'internal_bus': {
@@ -89,6 +99,46 @@ VEHICLE_SETTINGS = {
         'name': 'Враца автобус'
     }
 }
+
+
+def _fallback_vehicle_name(vehicle_type, default: str = "Неизвестен") -> str:
+    vehicle_type_value = getattr(vehicle_type, "value", str(vehicle_type))
+    name = VEHICLE_SETTINGS.get(vehicle_type_value, {}).get("name", default)
+    return str(name).replace("автобус", "бус").replace("Автобус", "Бус")
+
+
+def _vehicle_type_value(vehicle_type) -> str:
+    return str(getattr(vehicle_type, "value", vehicle_type))
+
+
+def _route_vehicle_name(route: Route, default: str = "Неизвестен") -> str:
+    custom_name = str(getattr(route, "vehicle_name", "") or "").strip()
+    if custom_name:
+        return custom_name
+    return _fallback_vehicle_name(route.vehicle_type, default)
+
+
+def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_file_names) -> str:
+    vehicle_name = _route_vehicle_name(route, f"route_{route_number}")
+    base_name = _safe_filename_stem(vehicle_name, f"route_{route_number}")
+    safe_date = _safe_filename_stem(date_stamp, datetime.now().strftime("%Y-%m-%d"))
+    stem = f"{base_name}_{safe_date}"
+    file_name = f"{stem}.html"
+    lookup_name = file_name.lower()
+
+    if lookup_name not in used_file_names:
+        used_file_names.add(lookup_name)
+        return file_name
+
+    suffix = 2
+    while True:
+        file_name = f"{stem}_{suffix}.html"
+        lookup_name = file_name.lower()
+        if lookup_name not in used_file_names:
+            used_file_names.add(lookup_name)
+            return file_name
+        suffix += 1
+
 
 # Цветове за всеки отделен автобус
 BUS_COLORS = [
@@ -202,6 +252,72 @@ class SingleRouteCustomerPanel(MacroElement):
         self._name = "SingleRouteCustomerPanel"
         self.panel_html = json.dumps(panel_html, ensure_ascii=False)
         self.clients = json.dumps(clients, ensure_ascii=False)
+        self.css = json.dumps(css, ensure_ascii=False)
+
+
+class SingleRouteGoogleSegmentsPanel(MacroElement):
+    """Leaflet control with Google Maps links split into route parts."""
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            const map = {{ this._parent.get_name() }};
+            const panelHtml = {{ this.panel_html|safe }};
+            const css = {{ this.css|safe }};
+
+            if (!document.getElementById("google-route-segments-style")) {
+                const style = document.createElement("style");
+                style.id = "google-route-segments-style";
+                style.textContent = css;
+                document.head.appendChild(style);
+            }
+
+            const panel = L.control({ position: "bottomright" });
+            panel.onAdd = function() {
+                const container = L.DomUtil.create("div", "google-route-control");
+                container.innerHTML = `
+                    <button type="button" class="google-route-toggle">Google Maps</button>
+                    <div class="google-route-panel google-route-panel-hidden">${panelHtml}</div>
+                `;
+                L.DomEvent.disableClickPropagation(container);
+                L.DomEvent.disableScrollPropagation(container);
+                return container;
+            };
+            panel.addTo(map);
+
+            function setPanelOpen(isOpen) {
+                const panelEl = document.querySelector(".google-route-panel");
+                const buttonEl = document.querySelector(".google-route-toggle");
+                if (!panelEl || !buttonEl) return;
+                panelEl.classList.toggle("google-route-panel-hidden", !isOpen);
+                buttonEl.classList.toggle("google-route-toggle-hidden", isOpen);
+            }
+
+            setTimeout(function() {
+                const toggle = document.querySelector(".google-route-toggle");
+                const closeButton = document.querySelector(".google-route-close");
+                if (toggle) {
+                    toggle.addEventListener("click", function() {
+                        setPanelOpen(true);
+                    });
+                }
+                if (closeButton) {
+                    closeButton.addEventListener("click", function(event) {
+                        event.preventDefault();
+                        setPanelOpen(false);
+                    });
+                }
+            }, 0);
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, panel_html: str, css: str):
+        super().__init__()
+        self._name = "SingleRouteGoogleSegmentsPanel"
+        self.panel_html = json.dumps(panel_html, ensure_ascii=False)
         self.css = json.dumps(css, ensure_ascii=False)
 
 
@@ -516,12 +632,13 @@ class InteractiveMapGenerator:
         self,
         route: Route,
     ) -> Tuple[List[Tuple[float, float]], bool, str]:
-        route_depot = route.depot_location
+        route_depot = self._route_start_location(route)
+        route_end = self._route_end_location(route)
         waypoints = [route_depot]
         for customer in route.customers:
             if customer.coordinates:
                 waypoints.append(customer.coordinates)
-        waypoints.append(route_depot)
+        waypoints.append(route_end)
 
         if not route.customers:
             return waypoints, False, "Няма клиенти"
@@ -541,7 +658,28 @@ class InteractiveMapGenerator:
         except Exception as e:
             logger.warning(f"Грешка при геометрия за Google карта: {e}")
 
+            return waypoints, True, f"{engine_name} fallback"
+
         return waypoints, True, f"{engine_name} fallback"
+
+    def _route_start_location(
+        self,
+        route: Route,
+        fallback: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        return getattr(route, "depot_location", None) or fallback
+
+    def _route_end_location(
+        self,
+        route: Route,
+        fallback: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        return getattr(route, "end_location", None) or getattr(route, "depot_location", None) or fallback
+
+    def _format_coords_for_report(self, coords: Optional[Tuple[float, float]]) -> str:
+        if not coords:
+            return ""
+        return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
 
     def _build_google_routes(self, routes: List[Route], start_number: int = 1) -> List[Dict[str, object]]:
         google_routes = []
@@ -553,6 +691,7 @@ class InteractiveMapGenerator:
                 "prefix": "fa",
                 "name": "Неизвестен",
             })
+            vehicle_name = _route_vehicle_name(route)
             bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
             geometry, dashed, geometry_label = self._get_route_visual_geometry(route)
 
@@ -564,7 +703,7 @@ class InteractiveMapGenerator:
                 navigation_url = self._navigation_url(customer.coordinates)
                 street_view_url = self._street_view_url(customer.coordinates)
                 popup_html = self._html_popup(
-                    f"Автобус {route_number} - {vehicle_settings['name']}",
+                    f"Автобус {route_number} - {vehicle_name}",
                     [
                         f"<b>Клиент:</b> {html.escape(str(customer.name))}",
                         f"<b>ID:</b> {html.escape(str(customer.id))}",
@@ -588,7 +727,7 @@ class InteractiveMapGenerator:
                 })
 
             popup_html = self._html_popup(
-                f"Автобус {route_number} - {vehicle_settings['name']}",
+                f"Автобус {route_number} - {vehicle_name}",
                 [
                     f"<b>{geometry_label}:</b> {'прави линии' if dashed else 'реална геометрия'}",
                     f"<b>Клиенти:</b> {len(route.customers)}",
@@ -601,9 +740,9 @@ class InteractiveMapGenerator:
             )
             google_routes.append({
                 "id": f"route-{route_number}",
-                "name": f"Автобус {route_number} ({len(route.customers)} клиента)",
+                "name": f"{vehicle_name} ({len(route.customers)} клиента)",
                 "color": bus_color,
-                "vehicleName": vehicle_settings["name"],
+                "vehicleName": vehicle_name,
                 "markers": markers,
                 "path": [self._json_coords(point) for point in geometry],
                 "dashed": dashed,
@@ -611,6 +750,8 @@ class InteractiveMapGenerator:
                 "distanceKm": route.total_distance_km,
                 "timeMin": route.total_time_minutes,
                 "volume": route.total_volume,
+                "googleSegments": self._build_google_route_segments(route),
+                "googleMissingCoords": len(route.customers) - len(markers),
             })
         return google_routes
 
@@ -620,7 +761,12 @@ class InteractiveMapGenerator:
             return "Център депо"
         if depot == locations.vratza_depot_location:
             return "Депо Враца"
-        return "Главно депо"
+        if depot == locations.depot_location:
+            return "Главно депо"
+        for name, coords in (getattr(locations, "depot_locations", {}) or {}).items():
+            if coords == depot:
+                return str(name)
+        return "Крайна точка"
 
     def _build_google_html(
         self,
@@ -725,6 +871,35 @@ class InteractiveMapGenerator:
       font-size: 12px; color: #1f2933;
     }}
     .client-route-stat b {{ font-size: 12px; }}
+    .google-segments {{
+      margin: 8px 0 10px; padding: 8px; background: #f8fafc;
+      border: 1px solid #e1e6ee; border-radius: 6px;
+    }}
+    .google-segments-title {{
+      font-size: 13px; font-weight: 700; color: #202124; margin-bottom: 5px;
+    }}
+    .google-segments-note {{
+      font-size: 12px; color: #44546a; line-height: 1.35; margin-bottom: 6px;
+    }}
+    .google-segment-row {{
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px;
+      align-items: center; border-top: 1px solid #e8edf3; padding: 7px 0;
+    }}
+    .google-segment-label {{ font-size: 12px; font-weight: 700; color: #202124; }}
+    .google-segment-description {{ font-size: 11px; color: #4b5563; margin-top: 2px; }}
+    .google-segment-stops {{ font-size: 11px; color: #697386; margin-top: 2px; overflow-wrap: anywhere; }}
+    .google-segment-open {{
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 28px; padding: 5px 8px; border-radius: 4px;
+      background: #1a73e8; color: #fff; text-decoration: none;
+      font-size: 11px; font-weight: 700; white-space: nowrap;
+    }}
+    .google-segment-return .google-segment-open {{ background: #188038; }}
+    .google-segments-warning {{
+      margin-top: 6px; padding: 6px; border-radius: 5px;
+      background: #fff8e1; border: 1px solid #f6d36f; color: #654b00;
+      font-size: 11px; line-height: 1.35;
+    }}
     .route-row {{ display: flex; align-items: center; gap: 6px; margin: 4px 0; }}
     .swatch {{ width: 14px; height: 14px; display: inline-block; border-radius: 2px; }}
     .client-actions {{ display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }}
@@ -758,11 +933,11 @@ class InteractiveMapGenerator:
     let infoWindow;
 
     function initMap() {{
-      const map = new google.maps.Map(document.getElementById("map"), {{
+        const map = new google.maps.Map(document.getElementById("map"), {{
         center: MAP_DATA.center,
         zoom: MAP_DATA.zoom,
         mapTypeControl: true,
-        streetViewControl: true,
+        streetViewControl: false,
         fullscreenControl: true
       }});
       infoWindow = new google.maps.InfoWindow();
@@ -948,13 +1123,56 @@ class InteractiveMapGenerator:
         : number.toFixed(1);
     }}
 
+    function escapeHtml(value) {{
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }}[char]));
+    }}
+
+    function renderGoogleSegments(route) {{
+      const segments = route.googleSegments || [];
+      if (!segments.length) return "";
+      const splitNote = segments.length > 1
+        ? "Маршрутът е разделен на части, за да се спази лимитът на Google Maps за спирки."
+        : "Маршрутът е готов като един Google Maps линк.";
+      const rows = segments.map((segment) => {{
+        const rowClass = segment.isReturn ? "google-segment-row google-segment-return" : "google-segment-row";
+        return `
+          <div class="${{rowClass}}">
+            <div>
+              <div class="google-segment-label">${{escapeHtml(segment.label)}}</div>
+              <div class="google-segment-description">${{escapeHtml(segment.description)}}</div>
+              <div class="google-segment-stops">${{escapeHtml(segment.stopsText)}}</div>
+            </div>
+            <a class="google-segment-open" href="${{escapeHtml(segment.url)}}" target="_blank" rel="noopener">Отвори</a>
+          </div>
+        `;
+      }}).join("");
+      const missing = Number(route.googleMissingCoords || 0);
+      const warning = missing > 0
+        ? `<div class="google-segments-warning">${{missing}} клиент(а) без GPS не са включени в Google Maps линковете.</div>`
+        : "";
+      return `
+        <div class="google-segments">
+          <div class="google-segments-title">Google Maps на части</div>
+          <div class="google-segments-note">${{splitNote}}</div>
+          ${{rows}}
+          ${{warning}}
+        </div>
+      `;
+    }}
+
     function renderCustomerPanel(container, routeObjects, map) {{
       const route = MAP_DATA.routes[0];
       const objects = routeObjects[route.id];
       const routeTimeText = formatRouteDuration(route.timeMin);
       container.classList.add("collapsed");
       container.innerHTML = `
-        <button type="button" class="client-toggle">Клиенти</button>
+        <button type="button" class="client-toggle">Клиенти / Google Maps</button>
         <div class="client-panel hidden">
           <div class="client-panel-header">
             <b>Клиенти - маршрут ${{MAP_DATA.singleRouteNumber}}</b>
@@ -966,6 +1184,7 @@ class InteractiveMapGenerator:
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
           </div>
+          ${{renderGoogleSegments(route)}}
           <div class="client-list"></div>
         </div>
       `;
@@ -1039,6 +1258,9 @@ class InteractiveMapGenerator:
         for route in solution.routes:
             if hasattr(route, 'depot_location') and route.depot_location:
                 unique_depots.add(route.depot_location)
+            route_end = getattr(route, "end_location", None)
+            if route_end:
+                unique_depots.add(route_end)
 
         if self._use_google_maps():
             return self._build_google_html(
@@ -1071,16 +1293,8 @@ class InteractiveMapGenerator:
     
     def _add_depot_markers(self, route_map: folium.Map, depot_locations: List[Tuple[float, float]]):
         """Добавя маркери за всички депа"""
-        from config import get_config
-        locations = get_config().locations
-        
         for i, depot in enumerate(depot_locations):
-            # Определяме кое депо е това
-            depot_name = "Главно депо"
-            if depot == locations.center_location:
-                depot_name = "Център депо"
-            elif depot == locations.vratza_depot_location:
-                depot_name = "Депо Враца"
+            depot_name = self._depot_name(depot)
             
             # Добавяме специален маркер за всяко депо
             folium.Marker(
@@ -1404,13 +1618,14 @@ class InteractiveMapGenerator:
                 'prefix': 'fa',
                 'name': 'Неизвестен'
             })
+            vehicle_name = _route_vehicle_name(route)
             
             # Всеки автобус получава уникален цвят
             bus_color = BUS_COLORS[route_idx % len(BUS_COLORS)]
             bus_id = f"bus_{route_idx + 1}"
             
             # Създаваме FeatureGroup за този автобус
-            bus_layer = folium.FeatureGroup(name=f"🚌 Автобус {route_idx + 1} ({len(route.customers)} клиента)")
+            bus_layer = folium.FeatureGroup(name=f"🚌 {vehicle_name} ({len(route.customers)} клиента)")
             bus_layers[bus_id] = bus_layer
             
             # Добавяне на клиентските маркери с номерация
@@ -1442,7 +1657,7 @@ class InteractiveMapGenerator:
                     popup_text = f"""
                     <div style="font-family: Arial, sans-serif;">
                         <h4 style="margin: 0; color: {bus_color};">
-                            Автобус {route_idx + 1} - {vehicle_settings['name']}
+                            Автобус {route_idx + 1} - {vehicle_name}
                         </h4>
                         <hr style="margin: 5px 0;">
                         <b>Клиент:</b> {customer.name}<br>
@@ -1473,15 +1688,16 @@ class InteractiveMapGenerator:
                 engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 logger.info(f"🛣️ Получавам {engine_name} маршрут за Автобус {route_idx + 1} с {len(route.customers)} клиента")
                 
-                # Използваме depot_location от самия маршрут
-                route_depot = route.depot_location
+                # Използваме старт/край от самия маршрут.
+                route_depot = self._route_start_location(route)
+                route_end = self._route_end_location(route, route_depot)
                 
                 # Подготвяме всички waypoints
                 waypoints = [route_depot]
                 for customer in route.customers:
                     if customer.coordinates:
                         waypoints.append(customer.coordinates)
-                waypoints.append(route_depot)  # Връщане в депото
+                waypoints.append(route_end)
                 
                 # Определяме името на routing engine
                 engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
@@ -1495,7 +1711,7 @@ class InteractiveMapGenerator:
                         popup_text = f"""
                         <div style="font-family: Arial, sans-serif;">
                             <h4 style="margin: 0; color: {bus_color};">
-                                🚌 Автобус {route_idx + 1} - {vehicle_settings['name']}
+                                🚌 Автобус {route_idx + 1} - {vehicle_name}
                             </h4>
                             <hr style="margin: 5px 0;">
                             <b>{engine_name} маршрут:</b> ✅<br>
@@ -1523,7 +1739,7 @@ class InteractiveMapGenerator:
                         popup_text = f"""
                         <div style="font-family: Arial, sans-serif;">
                             <h4 style="margin: 0; color: {bus_color};">
-                                🚌 Автобус {route_idx + 1} - {vehicle_settings['name']}
+                                🚌 Автобус {route_idx + 1} - {vehicle_name}
                             </h4>
                             <hr style="margin: 5px 0;">
                             <b>{engine_name} маршрут:</b> ⚠️ (прави линии)<br>
@@ -1549,17 +1765,18 @@ class InteractiveMapGenerator:
                 except Exception as e:
                     logger.error(f"❌ Грешка при {engine_name} маршрут за Автобус {route_idx + 1}: {e}")
                     # Fallback към прави линии
-                    route_depot = route.depot_location
+                    route_depot = self._route_start_location(route)
+                    route_end = self._route_end_location(route, route_depot)
                     waypoints = [route_depot]
                     for customer in route.customers:
                         if customer.coordinates:
                             waypoints.append(customer.coordinates)
-                    waypoints.append(route_depot)
+                    waypoints.append(route_end)
                     
                     popup_text = f"""
                     <div style="font-family: Arial, sans-serif;">
                         <h4 style="margin: 0; color: {bus_color};">
-                            🚌 Автобус {route_idx + 1} - {vehicle_settings['name']}
+                            🚌 Автобус {route_idx + 1} - {vehicle_name}
                         </h4>
                         <hr style="margin: 5px 0;">
                         <b>{engine_name} маршрут:</b> ❌ (fallback)<br>
@@ -1583,19 +1800,20 @@ class InteractiveMapGenerator:
             
             elif route.customers:
                 # Fallback към прави линии ако routing е изключен
-                route_depot = route.depot_location
+                route_depot = self._route_start_location(route)
+                route_end = self._route_end_location(route, route_depot)
                 waypoints = [route_depot]
                 for customer in route.customers:
                     if customer.coordinates:
                         waypoints.append(customer.coordinates)
-                waypoints.append(route_depot)
+                waypoints.append(route_end)
                 
                 polyline = folium.PolyLine(
                     waypoints,
                     color=bus_color,
                     weight=3,
                     opacity=0.8,
-                    popup=f"🚌 Автобус {route_idx + 1} - {vehicle_settings['name']}"
+                    popup=f"🚌 Автобус {route_idx + 1} - {vehicle_name}"
                 )
                 polyline.add_to(bus_layer)
                 self._add_direction_arrows(polyline, bus_layer, bus_color)
@@ -1685,6 +1903,118 @@ class InteractiveMapGenerator:
             "https://www.google.com/maps/dir/?api=1&destination="
             f"{coords[0]:.6f},{coords[1]:.6f}&travelmode=driving"
         )
+
+    def _maps_coords(self, coords: Tuple[float, float]) -> str:
+        return f"{float(coords[0]):.6f},{float(coords[1]):.6f}"
+
+    def _google_maps_route_url(
+        self,
+        origin: Tuple[float, float],
+        destination: Tuple[float, float],
+        waypoints: Optional[List[Tuple[float, float]]] = None,
+    ) -> str:
+        params = {
+            "api": "1",
+            "travelmode": "driving",
+            "origin": self._maps_coords(origin),
+            "destination": self._maps_coords(destination),
+        }
+        if waypoints:
+            params["waypoints"] = "|".join(self._maps_coords(point) for point in waypoints)
+        return "https://www.google.com/maps/dir/?" + urlencode(params, safe=",|")
+
+    def _route_customer_stops(self, route: Route) -> List[Dict[str, object]]:
+        stops = []
+        for customer_idx, customer in enumerate(route.customers, start=1):
+            if not customer.coordinates:
+                continue
+            try:
+                coords = (float(customer.coordinates[0]), float(customer.coordinates[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            customer_name = str(customer.name or customer.id or f"Клиент {customer_idx}")
+            stops.append({
+                "number": customer_idx,
+                "name": customer_name,
+                "coords": coords,
+            })
+        return stops
+
+    def _build_google_route_segments(
+        self,
+        route: Route,
+        depot_location: Optional[Tuple[float, float]] = None,
+    ) -> List[Dict[str, object]]:
+        stops = self._route_customer_stops(route)
+        route_depot = self._route_start_location(route, depot_location)
+        route_end = self._route_end_location(route, route_depot)
+        if not route_depot or not stops:
+            return []
+
+        depot = (float(route_depot[0]), float(route_depot[1]))
+        end_point = (float(route_end[0]), float(route_end[1])) if route_end else depot
+        end_label = "крайна точка" if end_point != depot else "депо"
+        max_waypoints = 8
+        max_clients_per_part = max_waypoints + 1
+        segments = []
+
+        def stop_range_text(part_stops: List[Dict[str, object]]) -> str:
+            start_number = int(part_stops[0]["number"])
+            end_number = int(part_stops[-1]["number"])
+            if start_number == end_number:
+                return f"клиент {start_number}"
+            return f"клиенти {start_number}-{end_number}"
+
+        def stops_summary(part_stops: List[Dict[str, object]]) -> str:
+            return ", ".join(f'{int(stop["number"])}. {stop["name"]}' for stop in part_stops)
+
+        if len(stops) <= max_waypoints:
+            segments.append({
+                "label": "Целият маршрут",
+                "description": f"Депо -> {stop_range_text(stops)} -> {end_label}",
+                "stopsText": stops_summary(stops),
+                "stopCount": len(stops),
+                "url": self._google_maps_route_url(
+                    depot,
+                    end_point,
+                    [stop["coords"] for stop in stops],
+                ),
+                "isReturn": False,
+            })
+            return segments
+
+        current_origin = depot
+        current_origin_label = "Депо"
+        previous_stop = None
+
+        for part_idx, start_idx in enumerate(range(0, len(stops), max_clients_per_part), start=1):
+            part_stops = stops[start_idx:start_idx + max_clients_per_part]
+            destination = part_stops[-1]["coords"]
+            waypoints = [stop["coords"] for stop in part_stops[:-1]]
+            range_text = stop_range_text(part_stops)
+            segments.append({
+                "label": f"Част {part_idx}: {range_text}",
+                "description": f"{current_origin_label} -> {range_text}",
+                "stopsText": stops_summary(part_stops),
+                "stopCount": len(part_stops),
+                "url": self._google_maps_route_url(current_origin, destination, waypoints),
+                "isReturn": False,
+            })
+            previous_stop = part_stops[-1]
+            current_origin = previous_stop["coords"]
+            current_origin_label = f'Клиент {int(previous_stop["number"])}'
+
+        if previous_stop:
+            segments.append({
+                "label": "Финал към крайна точка" if end_point != depot else "Връщане към депо",
+                "description": f'{current_origin_label} -> {end_label}',
+                "stopsText": f'{int(previous_stop["number"])}. {previous_stop["name"]}',
+                "stopCount": 0,
+                "url": self._google_maps_route_url(current_origin, end_point),
+                "isReturn": True,
+            })
+
+        return segments
 
     def _format_route_duration(self, minutes: float) -> str:
         total_minutes = max(0, int(round(minutes or 0)))
@@ -2235,6 +2565,187 @@ class InteractiveMapGenerator:
             }
         '''
         route_map.add_child(SingleRouteCustomerPanel(panel_html, panel_data, panel_css))
+
+    def _add_google_route_segments_control(
+        self,
+        route_map: folium.Map,
+        route: Route,
+        route_number: int,
+        bus_color: str,
+        depot_location: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        segments = self._build_google_route_segments(route, depot_location)
+        if not segments:
+            return
+
+        safe_color = html.escape(bus_color, quote=True)
+        missing_coords = len(route.customers) - len(self._route_customer_stops(route))
+        rows = []
+        for segment in segments:
+            row_class = "google-route-part google-route-return" if segment.get("isReturn") else "google-route-part"
+            label = html.escape(str(segment["label"]))
+            description = html.escape(str(segment["description"]))
+            stops_text = html.escape(str(segment.get("stopsText", "")))
+            url = html.escape(str(segment["url"]), quote=True)
+            rows.append(
+                f'''
+                <div class="{row_class}">
+                    <div class="google-route-part-main">
+                        <div class="google-route-part-title">{label}</div>
+                        <div class="google-route-part-description">{description}</div>
+                        <div class="google-route-part-stops">{stops_text}</div>
+                    </div>
+                    <a class="google-route-open" href="{url}" target="_blank" rel="noopener">Отвори</a>
+                </div>
+                '''
+            )
+
+        split_note = (
+            "Маршрутът е разделен на части, за да се спази лимитът на Google Maps за спирки."
+            if len(segments) > 1
+            else "Маршрутът е готов като един Google Maps линк."
+        )
+        missing_note = ""
+        if missing_coords > 0:
+            missing_note = (
+                f'<div class="google-route-note google-route-warning">'
+                f'{missing_coords} клиент(а) без GPS не са включени в Google Maps линковете.</div>'
+            )
+
+        panel_html = f'''
+            <div class="google-route-header">
+                <h4>Google Maps - маршрут {route_number}</h4>
+                <button type="button" class="google-route-close" title="Затвори">×</button>
+            </div>
+            <div class="google-route-note">{html.escape(split_note)}</div>
+            {''.join(rows)}
+            {missing_note}
+        '''
+        panel_css = f'''
+            .google-route-control {{
+                font-family: Arial, sans-serif;
+            }}
+            .google-route-toggle {{
+                border: 1px solid rgba(35, 35, 35, 0.35);
+                border-radius: 6px;
+                background: #1a73e8;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.22);
+                color: #ffffff;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 8px 11px;
+            }}
+            .google-route-toggle:hover {{
+                background: #1558b0;
+            }}
+            .google-route-toggle-hidden,
+            .google-route-panel-hidden {{
+                display: none;
+            }}
+            .google-route-panel {{
+                width: 360px;
+                max-height: calc(100vh - 110px);
+                overflow: auto;
+                background: #ffffff;
+                border: 1px solid rgba(35, 35, 35, 0.35);
+                border-radius: 6px;
+                box-shadow: 0 4px 18px rgba(0,0,0,0.22);
+                padding: 10px;
+                color: #222;
+            }}
+            .google-route-header {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin-bottom: 8px;
+            }}
+            .google-route-header h4 {{
+                margin: 0;
+                font-size: 15px;
+            }}
+            .google-route-close {{
+                width: 26px;
+                height: 26px;
+                border: 0;
+                border-radius: 4px;
+                background: #f1f3f4;
+                color: #333;
+                cursor: pointer;
+                font-size: 18px;
+                line-height: 1;
+                font-weight: 700;
+            }}
+            .google-route-close:hover {{
+                background: #e4e7eb;
+            }}
+            .google-route-note {{
+                margin: 0 0 8px;
+                padding: 8px;
+                border-radius: 6px;
+                background: #f8fafc;
+                border: 1px solid #e1e6ee;
+                color: #44546a;
+                font-size: 12px;
+                line-height: 1.35;
+            }}
+            .google-route-warning {{
+                margin-top: 8px;
+                background: #fff8e1;
+                border-color: #f6d36f;
+                color: #654b00;
+            }}
+            .google-route-part {{
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto;
+                gap: 10px;
+                align-items: center;
+                padding: 8px 0;
+                border-top: 1px solid #ececec;
+            }}
+            .google-route-part-title {{
+                font-size: 13px;
+                font-weight: 700;
+                color: #202124;
+            }}
+            .google-route-part-description {{
+                margin-top: 2px;
+                font-size: 12px;
+                color: #4b5563;
+            }}
+            .google-route-part-stops {{
+                margin-top: 3px;
+                font-size: 11px;
+                color: #697386;
+                overflow-wrap: anywhere;
+            }}
+            .google-route-open {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 30px;
+                padding: 6px 10px;
+                border-radius: 4px;
+                background: {safe_color};
+                color: #ffffff !important;
+                text-decoration: none;
+                font-size: 12px;
+                font-weight: 700;
+                white-space: nowrap;
+                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35);
+            }}
+            .google-route-return .google-route-open {{
+                background: #188038;
+            }}
+            @media (max-width: 700px) {{
+                .google-route-panel {{
+                    width: calc(100vw - 36px);
+                    max-height: 40vh;
+                }}
+            }}
+        '''
+        route_map.add_child(SingleRouteGoogleSegmentsPanel(panel_html, panel_css))
     
     def create_single_route_map(self, route: Route, route_number: int,
                                 depot_location: Tuple[float, float]) -> folium.Map:
@@ -2242,7 +2753,8 @@ class InteractiveMapGenerator:
         logger.info(f"Създавам карта за маршрут {route_number}")
 
         # Взимаме депото на маршрута
-        route_depot = route.depot_location or depot_location
+        route_depot = self._route_start_location(route, depot_location)
+        route_end = self._route_end_location(route, route_depot)
 
         # Център на картата - средна точка на клиентите или депото
         if route.customers:
@@ -2261,15 +2773,14 @@ class InteractiveMapGenerator:
                 f"Маршрут {route_number}",
                 center,
                 [route],
-                [route_depot],
+                list(dict.fromkeys([route_depot, route_end])),
                 single_route_number=route_number,
             )
 
         route_map = self._create_folium_map(center)
-        route_map.add_child(StreetViewPicker(self._street_view_picker_css()))
 
         # Добавяме маркер за депото
-        self._add_depot_markers(route_map, [route_depot])
+        self._add_depot_markers(route_map, list(dict.fromkeys([route_depot, route_end])))
 
         # Добавяме център зоната
         from config import get_config
@@ -2281,10 +2792,11 @@ class InteractiveMapGenerator:
         vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
             'color': 'gray', 'icon': 'circle', 'prefix': 'fa', 'name': 'Неизвестен'
         })
+        vehicle_name = _route_vehicle_name(route)
         bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
 
         bus_layer = folium.FeatureGroup(
-            name=f"\U0001f68c Автобус {route_number} ({len(route.customers)} клиента)")
+            name=f"\U0001f68c {vehicle_name} ({len(route.customers)} клиента)")
         marker_entries = []
 
         # Маркери за клиентите
@@ -2312,7 +2824,7 @@ class InteractiveMapGenerator:
                 popup_text = f"""
                 <div style="font-family: Arial, sans-serif;">
                     <h4 style="margin: 0; color: {bus_color};">
-                        Автобус {route_number} - {vehicle_settings['name']}
+                        Автобус {route_number} - {vehicle_name}
                     </h4>
                     <hr style="margin: 5px 0;">
                     <b>Клиент:</b> {customer.name}<br>
@@ -2353,7 +2865,7 @@ class InteractiveMapGenerator:
             for customer in route.customers:
                 if customer.coordinates:
                     waypoints.append(customer.coordinates)
-            waypoints.append(route_depot)
+            waypoints.append(route_end)
 
             if self.use_routing:
                 engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
@@ -2385,6 +2897,7 @@ class InteractiveMapGenerator:
 
         bus_layer.add_to(route_map)
         self._add_single_route_customer_control(route_map, route, route_number, bus_color, marker_entries)
+        self._add_google_route_segments_control(route_map, route, route_number, bus_color, route_depot)
 
         # Легенда с информация за маршрута
         legend_html = f'''
@@ -2394,7 +2907,7 @@ class InteractiveMapGenerator:
                     font-size:14px; padding: 10px; border-radius: 5px;
                     box-shadow: 0 0 15px rgba(0,0,0,0.2);">
         <h4 style="margin-top:0; margin-bottom:10px; text-align: center;">
-            \U0001f68c Маршрут {route_number} - {vehicle_settings['name']}
+            \U0001f68c Маршрут {route_number} - {vehicle_name}
         </h4>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4ca Клиенти: {len(route.customers)}</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4cf Разстояние: {route.total_distance_km:.1f} км</p>
@@ -2466,6 +2979,25 @@ class ExcelExporter:
 
     def _format_movement_direction(self, from_stop: str, to_stop: str) -> str:
         return f"{from_stop} -> {to_stop}"
+
+    def _route_start_location(
+        self,
+        route: Route,
+        fallback: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        return getattr(route, "depot_location", None) or fallback
+
+    def _route_end_location(
+        self,
+        route: Route,
+        fallback: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        return getattr(route, "end_location", None) or getattr(route, "depot_location", None) or fallback
+
+    def _format_coords_for_report(self, coords: Optional[Tuple[float, float]]) -> str:
+        if not coords:
+            return ""
+        return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
     
     def _create_routes_sheet(self, wb, solution: CVRPSolution):
         """Създава sheet с маршрутите"""
@@ -2475,10 +3007,11 @@ class ExcelExporter:
         headers = [
             'ID бус', 'Маршрут', 'Превозно средство', 'Ред в маршрута',
             'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Обем (ст.)', 'GPS координати',
-            'Разстояние до центъра (км)', 'Депо стартова точка',
+            'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
             'Време от предишен (ч)', 'Накоплено време (ч)',
-            'Стартово време (чч:мм)', 'Време с натрупване (ч)', 'Време с натрупване (чч:мм)'
+            'Стартово време (чч:мм)', 'Време с натрупване (ч)', 'Време с натрупване (чч:мм)',
+            'Работно време клиент', 'ETA пристигане', 'Чакане (мин)', 'TW статус'
         ]
         
         # Стилове за заглавния ред
@@ -2498,74 +3031,46 @@ class ExcelExporter:
         center_location = get_config().locations.center_location
         
         for i, route in enumerate(solution.routes):
-            vehicle_name = self._get_report_vehicle_name(route.vehicle_type)
-            
-            # Изчисляваме стартово време за този тип превозно средство
-            start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-            
-            # Взимаме service time за този тип превозно средство
-            vehicle_config = self._get_vehicle_config(route.vehicle_type)
-            service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
-            
-            # Изчисляваме разстоянията и времената между клиентите
-            cumulative_distance = 0
-            cumulative_time = 0
-            previous_customer_coords = route.depot_location  # Започваме от депото
-            previous_stop_name = "Депо"
-            
-            for j, customer in enumerate(route.customers):
+            vehicle_name = self._get_report_vehicle_name(route)
+            schedule_entries = self._build_route_schedule_entries(route)
+
+            for entry in schedule_entries:
+                customer = entry["customer"]
+                j = entry["index"]
                 # Изчисляваме разстоянието до центъра
                 distance_to_center = self._calculate_distance_to_center(customer.coordinates, center_location) if customer.coordinates else 0.0
-                
-                # Изчисляваме разстоянието от предишния клиент
-                distance_from_previous = self._calculate_distance_between_points(
-                    previous_customer_coords, customer.coordinates
-                ) if customer.coordinates else 0.0
-                cumulative_distance += distance_from_previous
-                
-                # Изчисляваме времето от предишния клиент (приблизително)
-                time_from_previous = self._calculate_time_between_points(
-                    previous_customer_coords, customer.coordinates
-                ) if customer.coordinates else 0.0
-                
-                # Добавяме service time за текущия клиент
-                total_time_for_this_step = time_from_previous + service_time_minutes
-                cumulative_time += total_time_for_this_step
-                
-                # Изчисляваме времето с натрупване (стартово време + натрупване)
-                total_time_with_start = start_time_minutes + cumulative_time
-                
-                # Проверяваме дали клиентът е в център зоната
-                is_in_center_zone = is_location_in_center_zone(customer.coordinates, get_config().locations)
                 
                 data = [
                     self._format_report_bus_number(i),  # Маршрут / номер бус
                     i + 1,  # Номер маршрут
                     vehicle_name,  # Превозно средство
-                    j + 1,  # Ред в маршрута
-                    self._format_movement_direction(previous_stop_name, customer.name),
+                    j,  # Ред в маршрута
+                    self._format_movement_direction(entry["previous_stop_name"], customer.name),
                     customer.id,  # ID клиент
                     customer.name,  # Име клиент
                     customer.document,  # Номер поръчка
                     customer.volume,  # Обем
                     customer.original_gps_data,  # GPS
                     round(distance_to_center, 2),  # Разстояние до центъра
-                    f"{route.depot_location[0]:.6f}, {route.depot_location[1]:.6f}",  # Депо
-                    round(distance_from_previous, 2),  # Разстояние от предишен
-                    round(cumulative_distance, 2),  # Накоплено разстояние
-                    self._minutes_to_hours(total_time_for_this_step),  # Време от предишен + service time
-                    self._minutes_to_hours(cumulative_time),  # Накоплено време
-                    self._format_time_hh_mm(start_time_minutes),  # Стартово време
-                    self._minutes_to_hours(total_time_with_start),  # Време с натрупване
-                    self._format_time_hh_mm(int(total_time_with_start))  # Време с натрупване (чч:мм)
+                    self._format_coords_for_report(self._route_start_location(route)),  # Депо
+                    self._format_coords_for_report(self._route_end_location(route)),  # Край
+                    round(entry["distance_from_previous"], 2),  # Разстояние от предишен
+                    round(entry["cumulative_distance"], 2),  # Накоплено разстояние
+                    self._minutes_to_hours(entry["total_time_for_step"]),  # Време от предишен + service + wait
+                    self._minutes_to_hours(entry["cumulative_time"]),  # Накоплено време
+                    self._format_time_hh_mm(entry["start_time_minutes"]),  # Стартово време
+                    self._minutes_to_hours(entry["total_time_with_start"]),  # Време с натрупване
+                    self._format_time_hh_mm(int(entry["total_time_with_start"])),  # Време с натрупване (чч:мм)
+                    entry["time_window_text"],
+                    self._format_time_hh_mm(int(entry["arrival_time_minutes"])),
+                    round(entry["wait_minutes"], 1),
+                    entry["time_window_status"],
                 ]
                 
                 for col, value in enumerate(data, 1):
                     ws.cell(row=row, column=col, value=value)
                 
                 row += 1
-                previous_customer_coords = customer.coordinates
-                previous_stop_name = customer.name
         
         # Автоматично разширяване на колоните
         for column in ws.columns:
@@ -2684,9 +3189,10 @@ class ExcelExporter:
         # Данни за стартови времена
         vehicle_types_seen = set()
         for route in solution.routes:
-            if route.vehicle_type.value not in vehicle_types_seen:
-                vehicle_types_seen.add(route.vehicle_type.value)
-                vehicle_name = self._get_report_vehicle_name(route.vehicle_type, route.vehicle_type.value)
+            vehicle_seen_key = (route.vehicle_type.value, str(getattr(route, "vehicle_name", "") or "").strip())
+            if vehicle_seen_key not in vehicle_types_seen:
+                vehicle_types_seen.add(vehicle_seen_key)
+                vehicle_name = self._get_report_vehicle_name(route, route.vehicle_type.value)
                 start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
                 
                 data = [
@@ -2699,24 +3205,24 @@ class ExcelExporter:
         
         # Статистики по тип бус
         row += 2
-        ws[f'A{row}'] = "СТАТИСТИКИ ПО ТИП БУС"
+        ws[f'A{row}'] = "СТАТИСТИКИ ПО БУС / ТИП"
         ws[f'A{row}'].font = title_font
         row += 1
         
         vehicle_stats = {}
         for route in solution.routes:
-            vehicle_type = route.vehicle_type.value
-            if vehicle_type not in vehicle_stats:
-                vehicle_stats[vehicle_type] = {
+            vehicle_name = self._get_report_vehicle_name(route, route.vehicle_type.value)
+            if vehicle_name not in vehicle_stats:
+                vehicle_stats[vehicle_name] = {
                     'count': 0, 'distance': 0, 'volume': 0, 'customers': 0
                 }
-            vehicle_stats[vehicle_type]['count'] += 1
-            vehicle_stats[vehicle_type]['distance'] += route.total_distance_km
-            vehicle_stats[vehicle_type]['volume'] += route.total_volume
-            vehicle_stats[vehicle_type]['customers'] += len(route.customers)
+            vehicle_stats[vehicle_name]['count'] += 1
+            vehicle_stats[vehicle_name]['distance'] += route.total_distance_km
+            vehicle_stats[vehicle_name]['volume'] += route.total_volume
+            vehicle_stats[vehicle_name]['customers'] += len(route.customers)
         
         # Заглавни редове за статистики
-        headers = ['Тип бус', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
+        headers = ['Бус / тип', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = header_font
@@ -2724,8 +3230,7 @@ class ExcelExporter:
         row += 1
         
         # Данни за статистики
-        for vehicle_type, stats in vehicle_stats.items():
-            vehicle_name = VEHICLE_SETTINGS.get(vehicle_type, {}).get('name', vehicle_type).replace("автобус", "бус").replace("Автобус", "Бус")
+        for vehicle_name, stats in vehicle_stats.items():
             data = [
                 vehicle_name,
                 stats['count'],
@@ -2757,7 +3262,7 @@ class ExcelExporter:
         headers = [
             'ID бус', 'Маршрут', 'Тип бус', 'Брой клиенти', 'Общ обем (ст.)',
             'Разстояние (км)', 'Време (ч)', 'Капацитет използване (%)',
-            'Средно разстояние до центъра (км)', 'Депо стартова точка', 'Стартово време (чч:мм)'
+            'Средно разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка', 'Стартово време (чч:мм)'
         ]
         
         # Стилове за заглавния ред
@@ -2777,7 +3282,7 @@ class ExcelExporter:
         row = 2
         
         for i, route in enumerate(solution.routes):
-            vehicle_name = self._get_report_vehicle_name(route.vehicle_type)
+            vehicle_name = self._get_report_vehicle_name(route)
             
             # Изчисляваме средното разстояние до центъра
             distances_to_center = []
@@ -2805,7 +3310,8 @@ class ExcelExporter:
                 self._minutes_to_hours(route.total_time_minutes),  # Време
                 round(capacity_usage, 1),  # Капацитет използване
                 round(avg_distance_to_center, 2),  # Средно разстояние до центъра
-                f"{route.depot_location[0]:.6f}, {route.depot_location[1]:.6f}",  # Депо
+                self._format_coords_for_report(self._route_start_location(route)),  # Депо
+                self._format_coords_for_report(self._route_end_location(route)),  # Край
                 self._format_time_hh_mm(start_time_minutes) # Стартово време (чч:мм)
             ]
             
@@ -2826,6 +3332,108 @@ class ExcelExporter:
                     pass
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
+
+    def _customer_time_windows_enabled(self) -> bool:
+        return bool(getattr(get_config().cvrp, "enable_customer_time_windows", False))
+
+    def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        if not self._customer_time_windows_enabled():
+            return None
+
+        start_minutes = getattr(customer, "time_window_start_minutes", None)
+        end_minutes = getattr(customer, "time_window_end_minutes", None)
+
+        if start_minutes is None:
+            start_minutes = 0
+        if end_minutes is None:
+            end_minutes = 1439
+
+        start_minutes = max(0, int(start_minutes))
+        end_minutes = max(0, int(end_minutes))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+
+        return start_minutes, end_minutes
+
+    def _format_customer_time_window(self, customer: Customer) -> str:
+        window = self._customer_time_window_minutes(customer)
+        if not window:
+            return ""
+        if (
+            getattr(customer, "time_window_start_minutes", None) is None
+            and getattr(customer, "time_window_end_minutes", None) is None
+        ):
+            return "Постоянно"
+        return f"{self._format_time_hh_mm(window[0])}-{self._format_time_hh_mm(window[1])}"
+
+    def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
+        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
+
+        entries = []
+        cumulative_distance = 0.0
+        cumulative_time = 0.0
+        previous_customer_coords = self._route_start_location(route)
+        previous_stop_name = "Депо"
+
+        for stop_index, customer in enumerate(route.customers, start=1):
+            distance_from_previous = (
+                self._calculate_distance_between_points(previous_customer_coords, customer.coordinates)
+                if customer.coordinates
+                else 0.0
+            )
+            cumulative_distance += distance_from_previous
+
+            travel_time = (
+                self._calculate_time_between_points(previous_customer_coords, customer.coordinates)
+                if customer.coordinates
+                else 0.0
+            )
+            raw_arrival = start_time_minutes + cumulative_time + travel_time
+            wait_minutes = 0.0
+            time_window_status = ""
+            window = self._customer_time_window_minutes(customer)
+
+            if window:
+                window_start, window_end = window
+                if raw_arrival < window_start:
+                    wait_minutes = window_start - raw_arrival
+                    time_window_status = "Изчакване"
+                arrival_after_wait = raw_arrival + wait_minutes
+                if arrival_after_wait > window_end:
+                    time_window_status = "След работно време"
+                elif not time_window_status:
+                    time_window_status = "OK"
+            else:
+                arrival_after_wait = raw_arrival
+
+            total_time_for_step = travel_time + wait_minutes + service_time_minutes
+            cumulative_time += total_time_for_step
+            total_time_with_start = start_time_minutes + cumulative_time
+
+            entries.append({
+                "customer": customer,
+                "index": stop_index,
+                "previous_stop_name": previous_stop_name,
+                "distance_from_previous": distance_from_previous,
+                "cumulative_distance": cumulative_distance,
+                "travel_time_minutes": travel_time,
+                "service_time_minutes": service_time_minutes,
+                "wait_minutes": wait_minutes,
+                "total_time_for_step": total_time_for_step,
+                "cumulative_time": cumulative_time,
+                "start_time_minutes": start_time_minutes,
+                "arrival_time_minutes": arrival_after_wait,
+                "total_time_with_start": total_time_with_start,
+                "time_window_text": self._format_customer_time_window(customer),
+                "time_window_status": time_window_status,
+            })
+
+            previous_customer_coords = customer.coordinates
+            previous_stop_name = customer.name
+
+        return entries
     
     def _calculate_distance_to_center(self, coordinates: Optional[Tuple[float, float]], center_location: Tuple[float, float]) -> float:
         """Изчислява разстоянието до центъра в км"""
@@ -2879,11 +3487,12 @@ class ExcelExporter:
         """Връща конфигурацията за даден тип превозно средство"""
         from config import get_config
         vehicle_configs = get_config().vehicles
+        vehicle_type_value = _vehicle_type_value(vehicle_type)
         
         if vehicle_configs:
-            for config in vehicle_configs:
-                if config.vehicle_type == vehicle_type:
-                    return config
+            for vehicle_config in vehicle_configs:
+                if _vehicle_type_value(vehicle_config.vehicle_type) == vehicle_type_value:
+                    return vehicle_config
         return None
     
     def _get_start_time_for_vehicle(self, vehicle_type) -> int:
@@ -2916,10 +3525,11 @@ class ExcelExporter:
         digits = max(1, digits)
         return f"{prefix}{route_index + 1:0{digits}d}"
 
-    def _get_report_vehicle_name(self, vehicle_type, default="Неизвестен") -> str:
+    def _get_report_vehicle_name(self, vehicle_or_route, default="Неизвестен") -> str:
         """Име на превозното средство за CVRP отчета."""
-        name = VEHICLE_SETTINGS.get(vehicle_type.value, {}).get('name', default)
-        return name.replace("автобус", "бус").replace("Автобус", "Бус")
+        if hasattr(vehicle_or_route, "vehicle_type"):
+            return _route_vehicle_name(vehicle_or_route, default)
+        return _fallback_vehicle_name(vehicle_or_route, default)
     
     def export_warehouse_orders(self, warehouse_customers: List[Customer]) -> str:
         """Експортира заявките в склада (за съвместимост)"""
@@ -2956,7 +3566,7 @@ class ExcelExporter:
         
         data = []
         for i, route in enumerate(solution.routes):
-            vehicle_name = VEHICLE_SETTINGS.get(route.vehicle_type.value, {}).get('name', 'Неизвестен')
+            vehicle_name = self._get_report_vehicle_name(route)
             previous_stop_name = "Депо"
             for j, customer in enumerate(route.customers):
                 data.append({
@@ -2989,10 +3599,11 @@ class ExcelExporter:
         headers = [
             'Маршрут', 'Превозно средство', 'Ред в маршрута',
             'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Обем (ст.)', 'GPS координати',
-            'Разстояние до центъра (км)', 'Депо стартова точка',
+            'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
             'Време от предишен (мин)', 'Накоплено време (мин)',
-            'Стартово време (мин)', 'Време с натрупване (мин)', 'Време с натрупване (чч:мм)'
+            'Стартово време (мин)', 'Време с натрупване (мин)', 'Време с натрупване (чч:мм)',
+            'Работно време клиент', 'ETA пристигане', 'Чакане (мин)', 'TW статус'
         ]
         
         center_location = get_config().locations.center_location
@@ -3002,51 +3613,40 @@ class ExcelExporter:
             writer.writerow(headers)
             
             for i, route in enumerate(solution.routes):
-                vehicle_name = VEHICLE_SETTINGS.get(route.vehicle_type.value, {}).get('name', 'Неизвестен')
-                start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-                vehicle_config = self._get_vehicle_config(route.vehicle_type)
-                service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
-                
-                cumulative_distance = 0
-                cumulative_time = 0
-                previous_customer_coords = route.depot_location
-                previous_stop_name = "Депо"
-                
-                for j, customer in enumerate(route.customers):
+                vehicle_name = self._get_report_vehicle_name(route)
+                schedule_entries = self._build_route_schedule_entries(route)
+
+                for entry in schedule_entries:
+                    customer = entry["customer"]
                     distance_to_center = self._calculate_distance_to_center(
                         customer.coordinates, center_location) if customer.coordinates else 0.0
-                    distance_from_previous = self._calculate_distance_between_points(
-                        previous_customer_coords, customer.coordinates) if customer.coordinates else 0.0
-                    cumulative_distance += distance_from_previous
-                    time_from_previous = self._calculate_time_between_points(
-                        previous_customer_coords, customer.coordinates) if customer.coordinates else 0.0
-                    total_time_for_this_step = time_from_previous + service_time_minutes
-                    cumulative_time += total_time_for_this_step
-                    total_time_with_start = start_time_minutes + cumulative_time
                     
                     row = [
                         i + 1,
                         vehicle_name,
-                        j + 1,
-                        self._format_movement_direction(previous_stop_name, customer.name),
+                        entry["index"],
+                        self._format_movement_direction(entry["previous_stop_name"], customer.name),
                         customer.id,
                         customer.name,
                         customer.document,
                         customer.volume,
                         customer.original_gps_data,
                         round(distance_to_center, 2),
-                        f"{route.depot_location[0]:.6f}, {route.depot_location[1]:.6f}",
-                        round(distance_from_previous, 2),
-                        round(cumulative_distance, 2),
-                        round(total_time_for_this_step, 1),
-                        round(cumulative_time, 1),
-                        start_time_minutes,
-                        round(total_time_with_start, 1),
-                        self._format_time_hh_mm(int(total_time_with_start))
+                        self._format_coords_for_report(self._route_start_location(route)),
+                        self._format_coords_for_report(self._route_end_location(route)),
+                        round(entry["distance_from_previous"], 2),
+                        round(entry["cumulative_distance"], 2),
+                        round(entry["total_time_for_step"], 1),
+                        round(entry["cumulative_time"], 1),
+                        entry["start_time_minutes"],
+                        round(entry["total_time_with_start"], 1),
+                        self._format_time_hh_mm(int(entry["total_time_with_start"])),
+                        entry["time_window_text"],
+                        self._format_time_hh_mm(int(entry["arrival_time_minutes"])),
+                        round(entry["wait_minutes"], 1),
+                        entry["time_window_status"],
                     ]
                     writer.writerow(row)
-                    previous_customer_coords = customer.coordinates
-                    previous_stop_name = customer.name
         
         logger.info(f"CSV маршрути експортирани в {file_path}")
         return file_path
@@ -3263,10 +3863,11 @@ class ChartGenerator:
     def _get_vehicle_config(self, vehicle_type):
         """Връща конфигурацията за даден тип превозно средство"""
         vehicle_configs = get_config().vehicles
+        vehicle_type_value = _vehicle_type_value(vehicle_type)
         if vehicle_configs:
-            for config in vehicle_configs:
-                if config.vehicle_type == vehicle_type:
-                    return config
+            for vehicle_config in vehicle_configs:
+                if _vehicle_type_value(vehicle_config.vehicle_type) == vehicle_type_value:
+                    return vehicle_config
         return None
 
 
@@ -3286,21 +3887,45 @@ class OutputHandler:
 
         # 1. Интерактивна карта (обща)
         if getattr(self.config, "enable_interactive_map", True):
-            map_gen = InteractiveMapGenerator(self.config)
-            route_map = map_gen.create_map(solution, warehouse_allocation, depot_location)
-            map_file = map_gen.save_map(route_map)
-            output_files['map'] = map_file
+            try:
+                map_gen = InteractiveMapGenerator(self.config)
+            except Exception as e:
+                logger.error(f"Грешка при инициализиране на генератора за карти: {e}", exc_info=True)
+                map_gen = None
 
-            # 1.1. Отделни HTML карти за всеки маршрут
-            routes_dir = self.config.routes_output_dir
-            os.makedirs(routes_dir, exist_ok=True)
-            for idx, route in enumerate(solution.routes):
-                route_number = idx + 1
-                single_map = map_gen.create_single_route_map(route, route_number, depot_location)
-                route_file = os.path.join(routes_dir, f"route_{route_number}.html")
-                saved_route_file = map_gen.save_map(single_map, route_file)
-                output_files[f'route_map_{route_number}'] = saved_route_file
-            logger.info(f"Генерирани {len(solution.routes)} отделни HTML карти в {routes_dir}")
+            if map_gen:
+                try:
+                    route_map = map_gen.create_map(solution, warehouse_allocation, depot_location)
+                    map_file = map_gen.save_map(route_map)
+                    output_files['map'] = map_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на общата интерактивна карта: {e}", exc_info=True)
+
+                # 1.1. Отделни HTML карти за всеки маршрут
+                routes_dir = self.config.routes_output_dir
+                generated_route_maps = 0
+                try:
+                    os.makedirs(routes_dir, exist_ok=True)
+                    used_route_file_names = set()
+                    for idx, route in enumerate(solution.routes):
+                        route_number = idx + 1
+                        try:
+                            single_map = map_gen.create_single_route_map(route, route_number, depot_location)
+                            route_filename = _route_map_file_name(
+                                route,
+                                route_number,
+                                map_gen.run_date,
+                                used_route_file_names,
+                            )
+                            route_file = os.path.join(routes_dir, route_filename)
+                            saved_route_file = map_gen.save_map(single_map, route_file)
+                            output_files[f'route_map_{route_number}'] = saved_route_file
+                            generated_route_maps += 1
+                        except Exception as e:
+                            logger.error(f"Грешка при генериране на HTML карта за маршрут {route_number}: {e}", exc_info=True)
+                    logger.info(f"Генерирани {generated_route_maps}/{len(solution.routes)} отделни HTML карти в {routes_dir}")
+                except Exception as e:
+                    logger.error(f"Грешка при подготовка на директорията за route карти: {e}", exc_info=True)
         
         else:
             logger.info("Генерирането на карти е изключено от настройките.")
@@ -3311,18 +3936,24 @@ class OutputHandler:
         # 3. Експорт в един общ Excel файл с отделни sheets
         if getattr(self.config, "enable_excel_output", True):
             if solution.routes or all_unserviced_customers:
-                excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
-                if excel_file:
-                    output_files['excel_report'] = excel_file
+                try:
+                    excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
+                    if excel_file:
+                        output_files['excel_report'] = excel_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на Excel отчет: {e}", exc_info=True)
         else:
             logger.info("Генерирането на Excel отчет е изключено от настройките.")
         
         # 4. CSV файл с маршрутите
         if getattr(self.config, "enable_csv_output", True):
             if solution.routes:
-                csv_file = self.excel_exporter.export_routes_csv(solution)
-                if csv_file:
-                    output_files['csv_routes'] = csv_file
+                try:
+                    csv_file = self.excel_exporter.export_routes_csv(solution)
+                    if csv_file:
+                        output_files['csv_routes'] = csv_file
+                except Exception as e:
+                    logger.error(f"Грешка при генериране на CSV маршрути: {e}", exc_info=True)
         else:
             logger.info("Генерирането на CSV е изключено от настройките.")
         
@@ -3333,7 +3964,7 @@ class OutputHandler:
                 chart_files = chart_gen.generate_all_charts(solution, all_unserviced_customers)
                 output_files.update(chart_files)
             except Exception as e:
-                logger.error(f"Грешка при генериране на графики: {e}")
+                logger.error(f"Грешка при генериране на графики: {e}", exc_info=True)
         else:
             logger.info("Генерирането на графики е изключено от настройките.")
         
