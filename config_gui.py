@@ -10,6 +10,7 @@ import sys
 import os
 import importlib
 import json
+import socket
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -327,8 +328,33 @@ class ConfigGUI:
 
         host = str(getattr(api, "api_host", "0.0.0.0") or "0.0.0.0").strip()
         port = str(getattr(api, "api_port", 8088) or 8088).strip()
-        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        display_host = self._api_display_host(host)
         return f"http://{display_host}:{port}"
+
+    def _api_display_host(self, host):
+        host = str(host or "").strip()
+        if host not in {"", "0.0.0.0", "::"}:
+            return host
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                address = sock.getsockname()[0]
+                if address and not address.startswith("127."):
+                    return address
+        except OSError:
+            pass
+
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                address = info[4][0]
+                if address and not address.startswith("127.") and not address.startswith("169.254."):
+                    return address
+        except OSError:
+            pass
+
+        return "127.0.0.1"
 
     def _api_path_preview(self, api, attr_name, default):
         path = str(getattr(api, attr_name, default) or default).strip()

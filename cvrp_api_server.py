@@ -24,6 +24,7 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime
 import json
 import logging
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -212,12 +213,41 @@ def _normalise_endpoint(endpoint: str) -> str:
     return endpoint if endpoint.startswith("/") else f"/{endpoint}"
 
 
+def _detect_machine_ipv4() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            address = sock.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            address = info[4][0]
+            if address and not address.startswith("127.") and not address.startswith("169.254."):
+                return address
+    except OSError:
+        pass
+
+    return "127.0.0.1"
+
+
+def _display_host_for_api(host: str) -> str:
+    host = str(host or "").strip()
+    if host in {"", "0.0.0.0", "::"}:
+        return _detect_machine_ipv4()
+    return host
+
+
 def _build_public_base_url(api_config, host: str, port: int) -> str:
     configured_url = (getattr(api_config, "api_public_url", "") or "").strip().rstrip("/")
     if configured_url:
         return configured_url
 
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    display_host = _display_host_for_api(host)
     return f"http://{display_host}:{port}"
 
 
