@@ -317,6 +317,19 @@ def _run_status_result_for_process(exit_code: Optional[int], command: list[str])
     }
 
 
+def _hidden_process_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoint: str, health_endpoint: str) -> Dict[str, Any]:
     return {
         "health": {
@@ -1172,6 +1185,7 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
                 env=env,
                 stdout=stdout_log,
                 stderr=subprocess.STDOUT,
+                **_hidden_process_kwargs(),
             )
             with _RUN_LOCK:
                 _RUN_STATUS.update(
