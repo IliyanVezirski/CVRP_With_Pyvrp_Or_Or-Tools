@@ -108,6 +108,35 @@ class PyVRPSolver:
         self.center_zone_customers = center_zone_customers or []
         self.location_config = location_config
 
+    def _time_windows_enabled(self) -> bool:
+        return bool(getattr(self.config, "enable_customer_time_windows", False))
+
+    def _vehicle_start_seconds(self, vehicle_config: Optional[VehicleConfig]) -> int:
+        if vehicle_config and hasattr(vehicle_config, "start_time_minutes"):
+            minutes = int(getattr(vehicle_config, "start_time_minutes", 0) or 0)
+        else:
+            minutes = int(getattr(self.config, "global_start_time_minutes", 480) or 480)
+        return max(0, minutes) * 60
+
+    def _customer_time_window_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        if not self._time_windows_enabled():
+            return None
+
+        start_minutes = getattr(customer, "time_window_start_minutes", None)
+        end_minutes = getattr(customer, "time_window_end_minutes", None)
+
+        if start_minutes is None:
+            start_minutes = 0
+        if end_minutes is None:
+            end_minutes = 1439
+
+        start_minutes = max(0, int(start_minutes))
+        end_minutes = max(0, int(end_minutes))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+
+        return start_minutes * 60, end_minutes * 60
+
     def solve(self) -> CVRPSolution:
         """
         Решава CVRP проблема използвайки PyVRP.
@@ -297,6 +326,13 @@ class PyVRPSolver:
             # Prize пропорционална на обема - по-големи клиенти са по-важни
             # Ако allow_dropping=False, клиентите са required=True
             client_prize = int(drop_penalties[idx]) if allow_dropping else 0
+            time_window = self._customer_time_window_seconds(customer)
+            time_window_kwargs = {}
+            if time_window:
+                time_window_kwargs = {
+                    "tw_early": int(time_window[0]),
+                    "tw_late": int(time_window[1]),
+                }
             
             # Model.add_client приема параметри директно
             # delivery има 2 измерения: [volume, 1 stop]
@@ -307,7 +343,8 @@ class PyVRPSolver:
                 service_duration=service_duration_s,
                 prize=client_prize,
                 required=not allow_dropping,  # Ако allow_dropping=True, клиентите НЕ са required
-                name=f"Client_{customer.id}"
+                name=f"Client_{customer.id}",
+                **time_window_kwargs,
             )
             client_objects.append(client)
             all_locations.append(client)
@@ -450,36 +487,43 @@ class PyVRPSolver:
             logger.info(f"  - Edges with traffic multiplier: {city_edges_count}")
 
         # 6. Добавяме типове превозни средства с правилния профил
+        def resolve_depot(location, default_depot, label):
+            if not location:
+                return default_depot
+            if location in depot_to_obj:
+                return depot_to_obj[location]
+            for depot_coords, depot_obj in depot_to_obj.items():
+                if (
+                    abs(float(depot_coords[0]) - float(location[0])) < 0.000001
+                    and abs(float(depot_coords[1]) - float(location[1])) < 0.000001
+                ):
+                    return depot_obj
+            logger.warning(f"⚠️ Depot {location} not found for {label}, using default depot")
+            return default_depot
+
         vehicle_id = 0
         for v_config in self.vehicle_configs:
             if not v_config.enabled:
                 continue
 
             # Определяме депо за този тип превозно средство
-            start_depot = None
-            if v_config.start_location:
-                # Търсим депото по координати
-                if v_config.start_location in depot_to_obj:
-                    start_depot = depot_to_obj[v_config.start_location]
-                else:
-                    # Може да има малки разлики във float стойностите
-                    # Търсим най-близкото депо
-                    for depot_coords, depot_obj in depot_to_obj.items():
-                        if (abs(depot_coords[0] - v_config.start_location[0]) < 0.0001 and 
-                            abs(depot_coords[1] - v_config.start_location[1]) < 0.0001):
-                            start_depot = depot_obj
-                            break
-            
-            if start_depot is None:
-                start_depot = depot_objects[0] if depot_objects else None
-                if v_config.start_location:
-                    logger.warning(f"⚠️ Depot {v_config.start_location} not found for {v_config.vehicle_type.value}, using default depot")
+            default_depot = depot_objects[0] if depot_objects else None
+            start_depot = resolve_depot(v_config.start_location, default_depot, v_config.vehicle_type.value)
+            end_depot = resolve_depot(getattr(v_config, "end_location", None), start_depot, v_config.vehicle_type.value)
 
             # Преобразуваме ограниченията
             capacity = int(v_config.capacity * 100)
             max_distance = int(v_config.max_distance_km * 1000) if v_config.max_distance_km else constants.MAX_VALUE
             max_time = int(v_config.max_time_hours * 3600)  # в секунди
             fixed_cost = int(getattr(v_config, "fixed_cost", 0) or 0)
+            vehicle_time_kwargs = {}
+            if self._time_windows_enabled():
+                vehicle_start = self._vehicle_start_seconds(v_config)
+                vehicle_time_kwargs = {
+                    "tw_early": vehicle_start,
+                    "tw_late": vehicle_start + max_time,
+                    "start_late": vehicle_start,
+                }
             
             # Max customers per route (ако не е зададено, използваме голямо число)
             max_customers = v_config.max_customers_per_route if v_config.max_customers_per_route else 1000
@@ -492,12 +536,13 @@ class PyVRPSolver:
                 num_available=v_config.count,
                 capacity=[capacity, max_customers],  # [volume_capacity, max_customers]
                 start_depot=start_depot,
-                end_depot=start_depot,
+                end_depot=end_depot,
                 max_distance=max_distance,
                 shift_duration=max_time,
                 fixed_cost=fixed_cost,
                 profile=vehicle_profile,
-                name=f"{v_config.vehicle_type.value}"
+                name=f"{v_config.vehicle_type.value}",
+                **vehicle_time_kwargs,
             )
             
             logger.info(f"Vehicle type: {v_config.vehicle_type.value}")
@@ -508,7 +553,8 @@ class PyVRPSolver:
             logger.info(f"  - Max time: {v_config.max_time_hours}h")
             logger.info(f"  - Fixed cost: {fixed_cost}")
             logger.info(f"  - Profile: {profile_name}")
-            logger.info(f"  - Depot: {start_depot}")
+            logger.info(f"  - Start depot: {start_depot}")
+            logger.info(f"  - End depot: {end_depot}")
 
             vehicle_id += 1
 
@@ -589,29 +635,42 @@ class PyVRPSolver:
                 try:
                     vt_index = route.vehicle_type()  # Връща индекс (int)
                     vt = vehicle_types_list[vt_index] if vt_index < len(vehicle_types_list) else None
-                    # vt.start_depot е индекс на депото в модела
+                    # vt.start_depot/end_depot са индексите на депата в модела.
                     depot_idx = vt.start_depot if vt else 0
+                    end_depot_idx = getattr(vt, "end_depot", depot_idx) if vt else depot_idx
                 except Exception as e:
                     logger.warning(f"Could not get depot from route: {e}")
                     depot_idx = 0
+                    end_depot_idx = 0
                 
                 if depot_idx < len(self.unique_depots):
                     depot_location = self.unique_depots[depot_idx]
                 else:
                     depot_location = self.unique_depots[0]
 
+                if end_depot_idx < len(self.unique_depots):
+                    end_location = self.unique_depots[end_depot_idx]
+                else:
+                    end_location = depot_location
+
                 # Opredelyame tipa prevozno sredstvo ot marshuta
-                vehicle_type = self._get_vehicle_type_from_route(route, vehicle_types_list)
-                vehicle_config = self._get_vehicle_config_for_type(vehicle_type)
+                vehicle_config = self._get_vehicle_config_for_type_index(vt_index)
+                if vehicle_config:
+                    vehicle_type = vehicle_config.vehicle_type
+                else:
+                    vehicle_type = self._get_vehicle_type_from_route(route, vehicle_types_list)
+                    vehicle_config = self._get_vehicle_config_for_type(vehicle_type)
                 vehicle_id = route_idx
+                vehicle_occurrence = 1
                 if isinstance(vt_index, int):
                     used_count = vehicle_type_usage.get(vt_index, 0)
+                    vehicle_occurrence = used_count + 1
                     vehicle_id = vehicle_type_offsets.get(vt_index, route_idx) + used_count
                     vehicle_type_usage[vt_index] = used_count + 1
 
                 # Izchislyavaem tochnoto vreme i razstoyanie
                 route_distance_m, route_time_s = self._calculate_route_metrics(
-                    route_customers, depot_location, vehicle_config
+                    route_customers, depot_location, vehicle_config, end_location
                 )
                 
                 total_distance_km += route_distance_m / 1000
@@ -623,6 +682,8 @@ class PyVRPSolver:
                     vehicle_id=vehicle_id,
                     customers=route_customers,
                     depot_location=depot_location,
+                    end_location=end_location,
+                    vehicle_name=self._get_vehicle_display_name(vehicle_config, vehicle_occurrence),
                     total_distance_km=route_distance_m / 1000,
                     total_time_minutes=route_time_s / 60,
                     total_volume=route_volume,
@@ -654,18 +715,31 @@ class PyVRPSolver:
 
         return solution
 
+    def _get_depot_index_for_location(self, location: Optional[Tuple[float, float]], fallback_index: int = 0) -> int:
+        if location:
+            for index, depot in enumerate(self.unique_depots):
+                if (
+                    abs(float(depot[0]) - float(location[0])) < 0.000001
+                    and abs(float(depot[1]) - float(location[1])) < 0.000001
+                ):
+                    return index
+            logger.warning(f"⚠️ Депо {location} не намерено в PyVRP матрицата, използвам индекс {fallback_index}")
+        return fallback_index
+
     def _calculate_route_metrics(
         self,
         customers: List[Customer],
         depot_location: Tuple[float, float],
         vehicle_config: Optional[VehicleConfig] = None,
+        end_location: Optional[Tuple[float, float]] = None,
     ) -> Tuple[float, float]:
         """
         Изчислява разстояние и време за маршрут.
 
         Args:
             customers: Списък с клиенти в маршрута
-            depot_location: GPS координати на депото
+            depot_location: GPS координати на стартовото депо
+            end_location: GPS координати на крайната точка. Ако е None, използва стартовото депо.
 
         Returns:
             Кортеж (разстояние_м, време_сек)
@@ -676,16 +750,8 @@ class PyVRPSolver:
         total_distance = 0.0
         total_time = 0.0
 
-        # Намираме индекса на депото в матрицата
-        depot_index = None
-        for i, depot in enumerate(self.unique_depots):
-            if depot == depot_location:
-                depot_index = i
-                break
-
-        if depot_index is None:
-            logger.warning(f"⚠️ Депо {depot_location} не намерено, използвам главното")
-            depot_index = 0
+        depot_index = self._get_depot_index_for_location(depot_location, 0)
+        end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
 
         # От депо до първия клиент
         current_node = depot_index
@@ -694,6 +760,7 @@ class PyVRPSolver:
             service_time_s = vehicle_config.service_time_minutes * 60
         else:
             service_time_s = 15 * 60
+        current_clock_s = self._vehicle_start_seconds(vehicle_config)
 
         # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
         num_locations = len(self.distance_matrix.distances)
@@ -731,18 +798,36 @@ class PyVRPSolver:
                 if traffic_multiplier > 1.0:
                     travel_time = travel_time * traffic_multiplier
             total_time += travel_time
+            current_clock_s += travel_time
+
+            time_window = self._customer_time_window_seconds(customer)
+            if time_window:
+                window_start, window_end = time_window
+                if current_clock_s < window_start:
+                    wait_time = window_start - current_clock_s
+                    total_time += wait_time
+                    current_clock_s += wait_time
+                elif current_clock_s > window_end:
+                    logger.debug(
+                        "Клиент %s е след работното време при PyVRP метрики: %.1f мин > %.1f мин",
+                        customer.id,
+                        current_clock_s / 60,
+                        window_end / 60,
+                    )
+
             total_time += service_time_s  # vehicle-specific service time
+            current_clock_s += service_time_s
 
             current_node = customer_matrix_idx
 
-        # От последния клиент обратно в депото
-        total_distance += self.distance_matrix.distances[current_node][depot_index]
-        travel_time_back = self.distance_matrix.durations[current_node][depot_index]
-        if current_node < len(location_coords) and depot_index < len(location_coords):
+        # От последния клиент до крайната точка
+        total_distance += self.distance_matrix.distances[current_node][end_depot_index]
+        travel_time_back = self.distance_matrix.durations[current_node][end_depot_index]
+        if current_node < len(location_coords) and end_depot_index < len(location_coords):
             traffic_multiplier = get_traffic_multiplier(
                 self.location_config,
                 location_coords[current_node],
-                location_coords[depot_index],
+                location_coords[end_depot_index],
             )
             if traffic_multiplier > 1.0:
                 travel_time_back = travel_time_back * traffic_multiplier
@@ -759,6 +844,22 @@ class PyVRPSolver:
             if v_config.enabled:
                 return v_config
         return None
+
+    def _get_vehicle_config_for_type_index(self, vehicle_type_index) -> Optional[VehicleConfig]:
+        if not isinstance(vehicle_type_index, int):
+            return None
+        enabled_vehicle_configs = [v_config for v_config in self.vehicle_configs if v_config.enabled]
+        if 0 <= vehicle_type_index < len(enabled_vehicle_configs):
+            return enabled_vehicle_configs[vehicle_type_index]
+        return None
+
+    def _get_vehicle_display_name(self, vehicle_config: Optional[VehicleConfig], occurrence: int = 1) -> str:
+        if not vehicle_config:
+            return ""
+        name = str(getattr(vehicle_config, "name", "") or "").strip()
+        if name and int(getattr(vehicle_config, "count", 1) or 1) > 1:
+            return f"{name} {max(1, occurrence)}"
+        return name
 
     def _get_vehicle_type_from_route(self, route, vehicle_types_list) -> str:
         """

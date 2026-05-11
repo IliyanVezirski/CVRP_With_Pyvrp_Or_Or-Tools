@@ -91,8 +91,42 @@ from PyInstaller.utils.hooks import (
     collect_dynamic_libs,
     collect_submodules,
 )
+from PyInstaller.utils.win32 import winutils as _pyi_winutils
 
 block_cipher = None
+
+_original_set_exe_build_timestamp = _pyi_winutils.set_exe_build_timestamp
+_original_update_exe_pe_checksum = _pyi_winutils.update_exe_pe_checksum
+
+
+def _safe_set_exe_build_timestamp(exe_path, timestamp):
+    try:
+        return _original_set_exe_build_timestamp(exe_path, timestamp)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 22 or getattr(exc, "winerror", None) == 87:
+            print(
+                "WARNING: skipping PyInstaller EXE timestamp update "
+                f"for {{exe_path!r}} because Windows rejected it: {{exc}}"
+            )
+            return None
+        raise
+
+
+def _safe_update_exe_pe_checksum(exe_path):
+    try:
+        return _original_update_exe_pe_checksum(exe_path)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 22 or getattr(exc, "winerror", None) == 87:
+            print(
+                "WARNING: skipping PyInstaller EXE PE checksum update "
+                f"for {{exe_path!r}} because Windows rejected it: {{exc}}"
+            )
+            return None
+        raise
+
+
+_pyi_winutils.set_exe_build_timestamp = _safe_set_exe_build_timestamp
+_pyi_winutils.update_exe_pe_checksum = _safe_update_exe_pe_checksum
 
 datas = []
 binaries = []
@@ -309,6 +343,8 @@ def build_exe() -> bool:
     """Run PyInstaller using the generated spec file."""
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("SOURCE_DATE_EPOCH", "1700000000")
 
     try:
         _run([

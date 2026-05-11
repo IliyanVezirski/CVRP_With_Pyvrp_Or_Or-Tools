@@ -235,18 +235,18 @@ Build-ът включва:
 
 - `CVRP_Optimizer.exe` за основното решаване;
 - Settings GUI за промяна на всички настройки;
-- API server модул за POST заявки към `/solve`;
+- API server модул за POST заявки към `/solve` и trigger заявки към `/run`;
 - `start_api_server.bat` за видим старт на API сървъра;
 - `start_api_server_hidden.bat` за скрит старт на API сървъра без отворен CMD прозорец;
 - настройки за PyVRP, OR-Tools fallback, OSRM/Valhalla, `setData` и `makeGroup`.
 
-API сървърът работи и в build режим. След като приеме една POST заявка, връща резултата и остава активен за следваща заявка.
+API сървърът работи и в build режим. След като приеме една POST заявка, връща резултата и остава активен за следваща заявка. `GET/POST /run` стартира програмата с текущата конфигурация без входен payload и връща веднага `202 started`.
 
 ## API настройки в EXE режима
 
 В Settings GUI могат да се сменят:
 
-- host, порт и endpoint на API сървъра;
+- host, порт, `/solve` endpoint и trigger endpoint на API сървъра;
 - дали сървърът да слуша само локално или от мрежата;
 - URL за Bizant GET/POST;
 - URL и метод за `setData`;
@@ -277,3 +277,36 @@ Excel отчетът показва:
 - отделна колона с номер на маршрут `1`, `2`, `3`, ...
 
 CSV структурата не е променяна.
+
+## Нови неща в build-а
+
+Build-ът включва и последните runtime възможности:
+
+- `CVRP_Optimizer.exe --server` стартира API сървъра.
+- `start_api_server.bat` стартира API сървъра във видим прозорец.
+- `start_api_server_hidden.bat` стартира API сървъра скрито.
+- `/run` може да стартира оптимизация с текущата конфигурация.
+- `/run` и `/solve` могат да приемат временни `settings`, без да променят постоянно `config.py`.
+- `return_result=true` връща пълния JSON резултат в отговора.
+- `callback_url`, `notify_url` или `webhook_url` изпращат POST известие след успешен или неуспешен background run.
+
+## PyInstaller бележки
+
+`build_exe.py` съдържа workaround за Windows/PyInstaller случаи, при които build-ът стига до края, но пада при:
+
+```text
+set_exe_build_timestamp
+update_exe_pe_checksum
+```
+
+Тези стъпки не променят бизнес логиката на програмата. Ако Windows или antivirus държи EXE файла заключен, първо затвори стартиран `CVRP_Optimizer.exe`, CMD прозорци и API сървъра, после пусни build-а отново.
+
+## setData за необслужени клиенти
+
+В build режима вече има отделен DoneFlag за необслужени клиенти:
+
+```python
+set_data_unserved_done_flag = ""
+```
+
+Празна стойност означава: използвай общия `set_data_done_flag`. Ако се зададе например `1975`, само необслужените клиенти ще се изпратят с `DoneFlag=1975`.

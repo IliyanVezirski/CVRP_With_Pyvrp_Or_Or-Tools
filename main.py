@@ -11,12 +11,15 @@ import os
 import io
 import copy
 import re
+import threading
+from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from multiprocessing import Pool, cpu_count, current_process
 from dataclasses import asdict
 
 # Импортираме всички необходими модули
 from ortools.constraint_solver import routing_enums_pb2
+import config as config_module
 from config import (
     get_config,
     MainConfig,
@@ -33,6 +36,24 @@ from cvrp_solver import CVRPSolver, CVRPSolution
 from pyvrp_solver import solve_cvrp_pyvrp
 from output_handler import OutputHandler
 from osrm_client import OSRMClient, DistanceMatrix, get_distance_matrix_from_central_cache
+
+_RUNTIME_CONFIG_LOCK = threading.RLock()
+
+
+@contextmanager
+def _temporary_runtime_config(config_override: Optional[MainConfig]):
+    """Temporarily makes a request-specific config visible to modules using get_config()."""
+    if config_override is None:
+        yield
+        return
+
+    with _RUNTIME_CONFIG_LOCK:
+        previous_config = config_module.config_manager.config
+        config_module.config_manager.config = config_override
+        try:
+            yield
+        finally:
+            config_module.config_manager.config = previous_config
 
 
 def _split_sklad_ids(raw_value: Any) -> set[str]:
@@ -108,7 +129,7 @@ def vehicle_configs_from_worker_dicts(items: Optional[List[Dict[str, Any]]]) -> 
         if not isinstance(vehicle_type, VehicleType):
             data["vehicle_type"] = VehicleType(vehicle_type)
 
-        for key in ("start_location", "tsp_depot_location"):
+        for key in ("start_location", "end_location", "tsp_depot_location"):
             if isinstance(data.get(key), list):
                 data[key] = tuple(data[key])
 
@@ -151,6 +172,7 @@ def setup_logging(worker_id: Optional[int] = None):
 def prepare_data(
     input_file: Optional[str],
     input_data_override: Optional[InputData] = None,
+    config_override: Optional[MainConfig] = None,
 ) -> Tuple[Optional[InputData], Optional[WarehouseAllocation]]:
     """
     Стъпка 1: Подготвя всички входни данни.
@@ -167,7 +189,7 @@ def prepare_data(
             input_data = input_data_override
             logger.info("Използвам клиентски данни, подадени директно към процеса.")
         else:
-            input_handler = InputHandler()
+            input_handler = InputHandler(main_config=config_override) if config_override is not None else InputHandler()
             input_data = input_handler.load_data(input_file)
 
         if not input_data or not input_data.customers:
@@ -468,7 +490,9 @@ def _print_summary(input_data, warehouse_allocation, solution, output_files, exe
     if solution.routes:
         logger.info("\nДЕТАЙЛИ ПО МАРШРУТИ:")
         for i, route in enumerate(solution.routes):
-            vehicle_name = route.vehicle_type.value.replace('_', ' ').title()
+            vehicle_name = str(getattr(route, "vehicle_name", "") or "").strip()
+            if not vehicle_name:
+                vehicle_name = route.vehicle_type.value.replace('_', ' ').title()
             logger.info(f"  Маршрут {i+1} ({vehicle_name}):")
             logger.info(f"    Клиенти: {len(route.customers)}, Обем: {route.total_volume:.2f} ст., "
                         f"Разстояние: {route.total_distance_km:.2f} км, Време: {route.total_time_minutes:.1f} мин")
@@ -507,6 +531,9 @@ def _solution_to_api_response(
         "routes": [
             {
                 "vehicle_type": route.vehicle_type.value,
+                "vehicle_name": str(getattr(route, "vehicle_name", "") or "").strip(),
+                "start_location": list(route.depot_location) if getattr(route, "depot_location", None) else None,
+                "end_location": list(getattr(route, "end_location", None) or route.depot_location) if getattr(route, "depot_location", None) else None,
                 "customers_count": len(route.customers),
                 "total_volume": route.total_volume,
                 "total_distance_km": round(route.total_distance_km, 2),
@@ -545,8 +572,17 @@ def _solution_to_api_response(
 def run_optimization(
     input_file: Optional[str] = None,
     input_data_override: Optional[InputData] = None,
+    config_override: Optional[MainConfig] = None,
 ) -> Dict[str, Any]:
     """Изпълнява цялата CVRP оптимизация и връща JSON-съвместимо резюме."""
+    if config_override is not None:
+        with _temporary_runtime_config(config_override):
+            return run_optimization(
+                input_file=input_file,
+                input_data_override=input_data_override,
+                config_override=None,
+            )
+
     start_time = time.time()
     
     setup_logging()
@@ -554,7 +590,7 @@ def run_optimization(
     
     config = get_config()
 
-    input_data, warehouse_allocation = prepare_data(input_file, input_data_override)
+    input_data, warehouse_allocation = prepare_data(input_file, input_data_override, config)
     if not input_data or not warehouse_allocation:
         raise RuntimeError("Не са намерени валидни клиенти във входните данни.")
     warehouse_allocation = move_customers_without_coordinates_to_unserved(warehouse_allocation)

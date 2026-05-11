@@ -420,14 +420,29 @@ http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&Don
 
 ```text
 POST http://IP:8088/solve
+GET  http://IP:8088/run
+POST http://IP:8088/run
 ```
 
-Адресът, портът и endpoint-ът се настройват в GUI. Сървърът може да слуша само локално или от мрежата според зададения host. За отдалечен достъп host трябва да е например `0.0.0.0`, а firewall/port forwarding трябва да позволяват връзката.
+`/solve` приема JSON клиенти и връща резултата след решаване. `/run` не очаква входни данни: само стартира оптимизацията с текущата конфигурация и връща веднага `202 started`. Ако вече има активен run, връща `409 already_running`.
+
+Trigger може да се извика и през `/solve` с query или JSON команда:
+
+```text
+cmd=run
+cmd=start
+cmd=trigger
+cmd=solve_config
+cmd=start_program
+```
+
+Адресът, портът и endpoint-ите се настройват в GUI. Сървърът може да слуша само локално или от мрежата според зададения host. За отдалечен достъп host трябва да е например `0.0.0.0`, а firewall/port forwarding трябва да позволяват връзката.
 
 Пример:
 
 ```cmd
 curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\"}]}"
+curl "http://10.10.100.134:8088/run"
 ```
 
 След една заявка API сървърът не спира. Той връща резултат и остава да чака следваща заявка.
@@ -484,3 +499,37 @@ par: IdSkld
 ### Build/EXE
 
 Build-ът включва основната програма, Settings GUI, API сървъра и стартовите batch файлове. Има и скрит старт на API сървъра чрез `start_api_server_hidden.bat`, когато трябва сървърът да работи без отворен CMD прозорец.
+
+## Последни възможности
+
+Текущата версия може да се управлява много по-пълно от GUI и API:
+
+- Бусовете могат да имат име. Ако е зададено, то се показва в Excel, CSV и route картите.
+- Всеки бус може да има отделна начална и крайна GPS точка. Ако крайна точка не е зададена, маршрутът завършва в стартовото депо.
+- Могат да се добавят допълнителни депа и трафик зони през опростени GUI полета.
+- Работно време на клиентите може да се чете от Excel/JSON и да се включва или изключва от GUI.
+- API режимът поддържа `/run`, `/solve`, callback URL, JSON резултат и временни настройки само за конкретната заявка.
+- През API могат да се подават бусове, депа, трафик зони, OSRM настройки, solver настройки, output пътища и `setData` настройки.
+- `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
+- Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
+
+### Пример `/run` с настройки
+
+```powershell
+curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\"}}}"
+```
+
+### Пример vehicle с крайна точка
+
+```json
+{
+  "vehicle_type": "internal_bus",
+  "name": "HELL 1",
+  "count": 1,
+  "capacity": 385,
+  "start_location": [42.695785, 23.231659],
+  "end_location": [42.700000, 23.400000]
+}
+```
+
+Ако `end_location` липсва или е празно, solver-ът използва стартовото депо като край.
