@@ -93,6 +93,10 @@ _SPECIAL_SETTING_KEYS = {
 _TOP_LEVEL_SETTING_ALIASES = {
     "solver": ("cvrp", "solver_type"),
     "solver_type": ("cvrp", "solver_type"),
+    "objective": ("cvrp", "objective_metric"),
+    "objective_metric": ("cvrp", "objective_metric"),
+    "optimize_by": ("cvrp", "objective_metric"),
+    "optimization_objective": ("cvrp", "objective_metric"),
     "time_limit": ("cvrp", "time_limit_seconds"),
     "time_limit_seconds": ("cvrp", "time_limit_seconds"),
     "parallel": ("cvrp", "enable_parallel_solving"),
@@ -155,6 +159,10 @@ _TOP_LEVEL_SETTING_ALIASES = {
 _QUERY_SETTING_ALIASES = {
     "solver": "solver",
     "solver_type": "solver_type",
+    "objective": "objective",
+    "objective_metric": "objective_metric",
+    "optimize_by": "optimize_by",
+    "optimization_objective": "optimization_objective",
     "time_limit": "time_limit",
     "time_limit_seconds": "time_limit_seconds",
     "parallel": "parallel",
@@ -342,7 +350,7 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
             "url": f"{public_url}{trigger_endpoint}",
             "description": "Стартира оптимизацията с текущия input_source и config.",
             "query_examples": [
-                f"{public_url}{trigger_endpoint}?solver=pyvrp&time_limit=180",
+                f"{public_url}{trigger_endpoint}?solver=pyvrp&objective=time&time_limit=180",
                 f"{public_url}{trigger_endpoint}?output.enable_excel_output=true&set_data.enable_set_data_upload=false",
                 f"{public_url}{trigger_endpoint}?callback_url=https://example.com/cvrp-finished",
             ],
@@ -356,6 +364,7 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
                 "callback_url": "https://example.com/cvrp-finished",
                 "settings": {
                     "solver_type": "pyvrp",
+                    "objective_metric": "time",
                     "time_limit_seconds": 180,
                     "output": {
                         "enable_excel_output": True,
@@ -381,7 +390,7 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
             "url": f"{public_url}{solve_endpoint}",
             "description": "Приема клиенти като JSON array или wrapper с customers/clients/orders/data/items/records.",
             "body_example": {
-                "settings": {"solver_type": "or_tools", "output.map_provider": "google"},
+                "settings": {"solver_type": "or_tools", "objective_metric": "distance", "output.map_provider": "google"},
                 "customers": [
                     {
                         "IdCust": "1",

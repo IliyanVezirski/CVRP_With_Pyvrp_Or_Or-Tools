@@ -95,7 +95,7 @@ OSRM режимът:
 
 Важна корекция: A->B и B->A вече не се копират симетрично. Това е важно при еднопосочни улици, завои, забрани и различни времена по посока.
 
-Valhalla режимът може да се използва за time-dependent routing, ако има работещ Valhalla сървър.
+Valhalla режимът може да се използва за time-dependent routing, ако има работещ Valhalla сървър. Ако Valhalla върне липсваща клетка (`None` distance/time), програмата попълва приблизителна fallback стойност и продължава, вместо batch-ът да счупи целия run.
 
 ## Стъпка 2: CVRP решаване
 
@@ -104,7 +104,11 @@ Valhalla режимът може да се използва за time-dependent 
 ```python
 cvrp.solver_type = "or_tools"
 cvrp.solver_type = "pyvrp"
+cvrp.objective_metric = "distance"  # най-къси километри
+cvrp.objective_metric = "time"      # най-кратко време
 ```
+
+`objective_metric` определя коя цена минимизира solver-ът. И двата solver-а използват една и съща входна distance/duration матрица, но при `time` основната цена е duration матрицата, а глобите/fixed cost стойностите се преобразуват към същия мащаб.
 
 ### OR-Tools workflow
 
@@ -117,9 +121,12 @@ OR-Tools моделът включва:
 - capacity dimension;
 - time dimension;
 - vehicle-specific transit callbacks;
+- precomputed vehicle cost matrices за arc cost;
 - disjunction penalties за пропускане на клиенти;
 - ограничения за брой клиенти, време и капацитет;
 - depot mapping.
+
+OR-Tools вече не пресмята пълната бизнес цена на всяка дъга при всяко питане от solver-а. За всеки vehicle предварително се смята cost matrix, в която са включени objective по време/км, service time, center zone penalties и fixed cost мащабиране. По време на търсенето callback-ът само връща готово число от таблица.
 
 Времето за обслужване е по конкретен бус:
 
@@ -140,10 +147,12 @@ PyVRP моделът включва:
 - отделни депа;
 - clients;
 - vehicle types;
-- profiles по тип бус;
+- компресирани profiles за еднакви vehicle правила;
 - service time в edge duration;
 - prizes/penalties за пропускане на клиенти;
 - извличане на route резултат в общия `CVRPSolution` формат.
+
+PyVRP profile compression споделя един profile между бусове, които имат еднакъв service time и еднакви правила за center zone цена. Стартовото и крайното депо не са част от profile signature, защото PyVRP ги пази на vehicle type; така различните депа остават коректни.
 
 PyVRP и OR-Tools използват еднакъв output contract, така че `output_handler.py` не се интересува кой solver е използван.
 
@@ -261,11 +270,13 @@ GUI формат:
 - посока на движение;
 - popup-и;
 - navigation links.
+- ETA пристигане и очаквано тръгване за клиентите.
+- GPS търсачка в общата карта за временни пинове по координати.
 
 Отделните route карти имат сгъваем клиентски панел:
 
 ```text
-Клиенти -> списък -> клик върху клиент -> popup + навигация
+Клиенти -> списък -> ETA -> клик върху клиент -> popup + навигация
 ```
 
 ### Excel
@@ -276,6 +287,7 @@ GUI формат:
 - необслужени клиенти;
 - summary;
 - статистики по бусове.
+- ETA пристигане, чакане и time-window статус, когато има schedule данни.
 
 Колоната `Посока на движение` показва от коя спирка към коя спирка се движи маршрутът.
 
@@ -484,6 +496,7 @@ API-то може да стартира програмата по два нач�
   "return_result": true,
   "settings": {
     "solver_type": "pyvrp",
+    "objective_metric": "time",
     "time_limit_seconds": 180,
     "vehicles": [
       {
@@ -504,6 +517,22 @@ API-то може да стартира програмата по два нач�
 ```
 
 `settings` може да съдържа solver, OSRM/Valhalla, output, депа, трафик зони, center зона, бусове и `setData` настройки. Override-ите важат само за заявката и не записват автоматично `config.py`.
+
+Кратки aliases, които са удобни за API:
+
+```json
+{
+  "settings": {
+    "solver": "or_tools",
+    "objective": "distance",
+    "optimize_by": "time",
+    "time_limit": 300,
+    "routing_engine": "osrm"
+  }
+}
+```
+
+При Excel вход програмата не изключва автоматично Враца бусовете заради липсващ `IdSkld`. Автоматичното скриване на Враца бусове по склад се прилага само при `input_source = "http_json"`, където `IdSkld` идва от Bizant.
 
 ## JSON резултат
 

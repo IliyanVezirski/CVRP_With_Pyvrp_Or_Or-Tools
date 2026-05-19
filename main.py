@@ -82,6 +82,10 @@ def get_active_vehicle_configs(allocation: WarehouseAllocation, config: MainConf
     logger = logging.getLogger(__name__)
     vehicles = copy.deepcopy(config.vehicles or [])
 
+    input_source = str(getattr(config.input, "input_source", "excel") or "excel").strip().lower()
+    if input_source != "http_json":
+        return vehicles
+
     active_sklads = {
         str(getattr(customer, "source_id_skld", "") or "").strip()
         for customer in (allocation.vehicle_customers or [])
@@ -404,7 +408,11 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
         cvrp_config.pyvrp_seed = int(getattr(cvrp_config, "pyvrp_seed_base", 42) or 42)
 
     # Добавяме лог за дебъгване
-    logger.info(f"[Работник {worker_id}]: solver_type = {cvrp_config.solver_type}, use_simple_solver = {cvrp_config.use_simple_solver}")
+    logger.info(
+        f"[Работник {worker_id}]: solver_type = {cvrp_config.solver_type}, "
+        f"objective_metric = {getattr(cvrp_config, 'objective_metric', 'distance')}, "
+        f"use_simple_solver = {cvrp_config.use_simple_solver}"
+    )
     if cvrp_config.solver_type == "pyvrp":
         logger.info(f"[Работник {worker_id}]: PyVRP seed = {cvrp_config.pyvrp_seed}")
 
@@ -515,6 +523,37 @@ def _solution_to_api_response(
     set_data_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Създава JSON-съвместимо резюме за API отговора."""
+    def _format_schedule_minutes(value) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            total_minutes = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        return f"{hours:02d}:{minutes:02d}"
+
+    def _schedule_entry_to_api(entry: Dict[str, Any]) -> Dict[str, Any]:
+        customer = entry.get("customer")
+        result = {
+            "index": entry.get("index"),
+            "customer_id": getattr(customer, "id", entry.get("customer_id", "")),
+            "customer_name": getattr(customer, "name", entry.get("customer_name", "")),
+            "previous_stop_name": entry.get("previous_stop_name", ""),
+            "distance_from_previous_km": round(float(entry.get("distance_from_previous", 0) or 0), 2),
+            "cumulative_distance_km": round(float(entry.get("cumulative_distance", 0) or 0), 2),
+            "travel_time_minutes": round(float(entry.get("travel_time_minutes", 0) or 0), 1),
+            "service_time_minutes": round(float(entry.get("service_time_minutes", 0) or 0), 1),
+            "wait_minutes": round(float(entry.get("wait_minutes", 0) or 0), 1),
+            "start_time": _format_schedule_minutes(entry.get("start_time_minutes")),
+            "arrival_time": _format_schedule_minutes(entry.get("arrival_time_minutes")),
+            "departure_time": _format_schedule_minutes(entry.get("total_time_with_start")),
+            "time_window": entry.get("time_window_text", ""),
+            "time_window_status": entry.get("time_window_status", ""),
+        }
+        return result
+
     response = {
         "status": "ok",
         "execution_time_seconds": round(execution_time, 2),
@@ -538,6 +577,10 @@ def _solution_to_api_response(
                 "total_volume": route.total_volume,
                 "total_distance_km": round(route.total_distance_km, 2),
                 "total_time_minutes": round(route.total_time_minutes, 1),
+                "schedule": [
+                    _schedule_entry_to_api(entry)
+                    for entry in (getattr(route, "schedule_entries", None) or [])
+                ],
                 "customers": [
                     {
                         "id": customer.id,
@@ -644,14 +687,16 @@ def run_optimization(
         valid_solutions = [sol for sol in results if sol is not None]
         
         if valid_solutions:
-            # ИЗБИРАМЕ ПОБЕДИТЕЛЯ ПО НАЙ-ДОБЪР ФИТНЕС СКОР (НАЙ-МАЛКО РАЗСТОЯНИЕ)
+            # ИЗБИРАМЕ ПОБЕДИТЕЛЯ ПО НАЙ-ДОБЪР ФИТНЕС СКОР (distance или time според objective_metric)
             for sol in valid_solutions:
                  sol.total_served_volume = sum(r.total_volume for r in sol.routes)
 
             best_solution = min(valid_solutions, key=lambda s: s.fitness_score)
+            objective_metric = getattr(config.cvrp, "objective_metric", "distance")
             
             logger.info(f"🏆 Избрано е най-доброто решение по ФИТНЕС СКОР от {len(valid_solutions)} намерени, "
-                        f"с fitness score: {best_solution.fitness_score:.2f} (разстояние: {best_solution.total_distance_km:.1f}км)")
+                        f"objective={objective_metric}, fitness score: {best_solution.fitness_score:.2f} "
+                        f"(разстояние: {best_solution.total_distance_km:.1f}км, време: {best_solution.total_time_minutes:.1f}мин)")
         else:
             logger.error("Всички паралелни работници се провалиха. Не е намерено решение.")
 

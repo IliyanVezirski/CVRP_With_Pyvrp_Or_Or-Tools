@@ -376,7 +376,7 @@ def calculate_customer_drop_penalties(
 @dataclass
 class RoutingConfig:
     """Конфигурация за избор на routing engine."""
-    engine: RoutingEngine = RoutingEngine.OSRM # Кой routing engine да се използва: OSRM или VALHALLA
+    engine: RoutingEngine = RoutingEngine.VALHALLA # Кой routing engine да се използва: OSRM или VALHALLA
     # Ако е VALHALLA и enable_time_dependent е True, ще се използва time-dependent routing
     enable_time_dependent: bool = False  # Дали да се използва time-dependent routing (само за Valhalla)
     departure_time: str = "08:00"  # Час на тръгване (HH:MM) за time-dependent routing
@@ -429,12 +429,12 @@ class OSRMConfig:
 @dataclass
 class InputConfig:
     """Конфигурации за обработка на входните данни от Excel файл или HTTP JSON."""
-    input_source: str = "http_json"  # Източник на данни: "excel" или "http_json"
+    input_source: str = "excel"  # Източник на данни: "excel" или "http_json"
     excel_file_path: str = _abs_path("C:\\Users\\shaman\\Documents\\New project 2\\CVRP_With_Pyvrp_Or_Or-Tools\\data/input.xlsx") # Път до входния Excel файл.
-    json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
+    json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="excel")
     json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
     json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
-    json_sklad: str = "106,128"  # Стойност за Sklad параметъра.
+    json_sklad: str = "106"  # Стойност за Sklad параметъра.
     json_done_flag: str = "1974"  # Стойност за DoneFlag параметъра.
     json_extra_query: str = ""  # Допълнителни GET параметри във формат key=value&key2=value2.
     json_date_field: str = "Date"  # Име на полето/параметъра за датата при HTTP JSON заявка.
@@ -448,7 +448,7 @@ class InputConfig:
     json_time_window_field: str = "WorkTime"  # Име на JSON полето с работно време във формат "08:00 - 16:00".
     json_time_window_start_field: str = "WorkFrom"  # Име на JSON полето за начало на работното време на клиента.
     json_time_window_end_field: str = "WorkTo"  # Име на JSON полето за край на работното време на клиента.
-    json_override_date: str = "11/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
+    json_override_date: str = "19/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
     gps_column: str = "GPS"         # Име на колоната с GPS координатите на клиентите.
     client_id_column: str = "IdCust"      # Име на колоната с ID на клиента.
@@ -469,7 +469,7 @@ class WarehouseConfig:
     sort_by_volume: bool = True        # Дали заявките да се сортират по обем (от най-малък към най-голям) преди обработка
     sort_by_distance: bool = True      # Дали да се сортират по разстояние за клиенти с еднакъв обем (от най-далечен към най-близък)
     check_max_bus_capacity: bool = True # Проверява дали клиент надвишава капацитета на най-големия наличен бус
-    max_bus_customer_volume: float = 100.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
+    max_bus_customer_volume: float = 160.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
     capacity_toleranse: float = 1.0 # Толеранс на капацитета на превозните средства.
 @dataclass
 class CVRPConfig:
@@ -482,8 +482,11 @@ class CVRPConfig:
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 180
+    time_limit_seconds: int = 300
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
+
+    objective_metric: str = "time"
+    # Описание: Какво минимизира solver-ът. "distance" = най-къси километри, "time" = най-кратко време по OSRM/Valhalla duration матрицата.
 
     first_solution_strategy: str = "PARALLEL_CHEAPEST_INSERTION"
     # Описание: Стратегия за намиране на първоначално решение. SAVINGS е по-бърза от AUTOMATIC.
@@ -493,7 +496,7 @@ class CVRPConfig:
     # Описание: SIMULATED_ANNEALING е по-добра за избягване на локални оптимуми.
     # Стойности: "AUTOMATIC", "GUIDED_LOCAL_SEARCH", "SIMULATED_ANNEALING", "TABU_SEARCH".
     
-    lns_time_limit_seconds: float = 15.0
+    lns_time_limit_seconds: float = 1.0
     # Описание: Много кратък микро-лимит принуждава solver-а да се движи бързо.
     # Употреба: 0.1 секунди е достатъчно за една стъпка, но не позволява зависване.
     
@@ -501,7 +504,7 @@ class CVRPConfig:
     lns_num_nodes: int = 120
     # Описание: Брой близки възли които LNS разглежда в една стъпка.
     
-    lns_num_arcs: int = 110
+    lns_num_arcs: int = 150
     # Описание: Брой скъпи дъги които LNS разглежда в една стъпка.
     
     use_full_propagation: bool = True
@@ -509,7 +512,7 @@ class CVRPConfig:
     log_search: bool = True
     # Описание: Дали OR-Tools да извежда детайлен лог на процеса на търсене.
 
-    search_lambda_coefficient: float = 0.8
+    search_lambda_coefficient: float = 0.6
     # Опция за пропускане на клиенти
 
     allow_customer_skipping: bool = True
@@ -529,7 +532,7 @@ class CVRPConfig:
     min_customer_drop_penalty: int = 45000
     max_customer_drop_penalty: int = 500000
 
-    enable_parallel_solving: bool = False  # Keep disabled for PyVRP stability
+    enable_parallel_solving: bool = True  # Keep disabled for PyVRP stability
     # Описание: Дали да се стартират няколко solver-а паралелно с различни стратегии.
     
     # --- Режим на solver-а ---
@@ -564,7 +567,7 @@ class CVRPConfig:
     num_workers: int = -1
     # Описание: Брой паралелни процеси. -1 означава да се използват всички ядра без едно.
 
-    pyvrp_seed_base: int = 1
+    pyvrp_seed_base: int = 42
     # Описание: Seed за PyVRP, когато pyvrp_seed е None. В паралелен режим worker-ите използват pyvrp_seed_base, pyvrp_seed_base+1...
     pyvrp_seed: Optional[int] = None
     # Описание: Ако е зададен, single mode използва точно този seed. В паралелен режим worker-ите използват pyvrp_seed, pyvrp_seed+1...
@@ -573,14 +576,14 @@ class CVRPConfig:
     # Описание: Размер на granular neighbourhood-а на PyVRP. По-голяма стойност = по-бавно, но по-добър шанс за качество при две депа.
     pyvrp_ils_no_improvement: int = 350000
     # Описание: Брой ILS итерации без подобрение преди restart. По-високо = по-търпеливо търсене.
-    pyvrp_ils_history_length: int = 650
+    pyvrp_ils_history_length: int = 500
     # Описание: Late-acceptance history length за ILS.
     pyvrp_exhaustive_on_best: bool = True
     # Описание: По-скъпо локално търсене при ново най-добро решение.
     pyvrp_use_extended_operators: bool = True
     # Описание: Добавя по-тежки PyVRP move operators (Exchange30/31/32/33, SwapStar, SwapRoutes).
     pyvrp_min_perturbations: int = 1
-    pyvrp_max_perturbations: int = 50
+    pyvrp_max_perturbations: int = 40
     # Описание: Сила на perturbation при restart-и. По-високо помага да излезе от лош локален оптимум.
     pyvrp_display_progress: bool = True
     # Описание: Ако е True, PyVRP печата собствен progress output през solve().

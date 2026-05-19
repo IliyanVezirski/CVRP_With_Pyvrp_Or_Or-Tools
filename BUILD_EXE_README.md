@@ -148,13 +148,13 @@ cd "C:\Programming\Bizant 2.0\dist"
 В `requirements.txt` PyVRP е pin-нат към:
 
 ```text
-pyvrp>=0.5.0,<0.6.0
+pyvrp>=0.13.3
 ```
 
-Ако се инсталира по-нова несъвместима версия, върни правилната:
+Ако се инсталира несъвместима версия, върни правилната:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install "pyvrp>=0.5.0,<0.6.0"
+.\.venv\Scripts\python.exe -m pip install "pyvrp>=0.13.3"
 ```
 
 ### Грешка от pandas/numpy/protobuf
@@ -289,6 +289,10 @@ Build-ът включва и последните runtime възможности
 - `/run` и `/solve` могат да приемат временни `settings`, без да променят постоянно `config.py`.
 - `return_result=true` връща пълния JSON резултат в отговора.
 - `callback_url`, `notify_url` или `webhook_url` изпращат POST известие след успешен или неуспешен background run.
+- `objective_metric` може да избира между оптимизация по километри (`distance`) и по време (`time`).
+- OR-Tools използва предварително сметнати vehicle cost матрици, а PyVRP компресира еднакви профили.
+- Route картите и Excel отчетът могат да показват ETA пристигане, очаквано тръгване, чакане и time-window статус.
+- Общата карта има GPS търсачка за временни пинове по координати.
 
 ## PyInstaller бележки
 

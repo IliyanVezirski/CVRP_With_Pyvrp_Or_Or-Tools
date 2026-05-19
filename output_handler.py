@@ -118,6 +118,42 @@ def _route_vehicle_name(route: Route, default: str = "Неизвестен") -> 
     return _fallback_vehicle_name(route.vehicle_type, default)
 
 
+def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
+    schedule_entries = getattr(route, "schedule_entries", None) or []
+    if not schedule_entries:
+        return []
+
+    normalised = []
+    for fallback_index, entry in enumerate(schedule_entries, start=1):
+        item = dict(entry)
+        try:
+            route_index = int(item.get("index") or fallback_index)
+        except (TypeError, ValueError):
+            route_index = fallback_index
+        item["index"] = route_index
+
+        if item.get("customer") is None and 1 <= route_index <= len(route.customers):
+            item["customer"] = route.customers[route_index - 1]
+
+        item.setdefault("previous_stop_name", "")
+        item.setdefault("distance_from_previous", 0.0)
+        item.setdefault("cumulative_distance", 0.0)
+        item.setdefault("travel_time_minutes", 0.0)
+        item.setdefault("service_time_minutes", 0.0)
+        item.setdefault("wait_minutes", 0.0)
+        item.setdefault("total_time_for_step", 0.0)
+        item.setdefault("cumulative_time", 0.0)
+        item.setdefault("start_time_minutes", 0.0)
+        item.setdefault("arrival_time_minutes", 0.0)
+        item.setdefault("total_time_with_start", 0.0)
+        item.setdefault("time_window_text", "")
+        item.setdefault("time_window_status", "")
+
+        normalised.append(item)
+
+    return normalised
+
+
 def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_file_names) -> str:
     vehicle_name = _route_vehicle_name(route, f"route_{route_number}")
     base_name = _safe_filename_stem(vehicle_name, f"route_{route_number}")
@@ -405,6 +441,214 @@ class StreetViewPicker(MacroElement):
         self.css = json.dumps(css, ensure_ascii=False)
 
 
+class CoordinatePinSearch(MacroElement):
+    """Leaflet control for adding temporary GPS pins to the overview map."""
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            const map = {{ this._parent.get_name() }};
+            const css = {{ this.css|safe }};
+
+            if (!document.getElementById("coordinate-pin-search-style")) {
+                const style = document.createElement("style");
+                style.id = "coordinate-pin-search-style";
+                style.textContent = css;
+                document.head.appendChild(style);
+            }
+
+            const markerLayer = L.layerGroup().addTo(map);
+            const control = L.control({ position: "bottomleft" });
+
+            control.onAdd = function() {
+                const container = L.DomUtil.create("div", "coordinate-search-control");
+                container.innerHTML = `
+                    <button type="button" class="coordinate-search-toggle" title="Покажи GPS пинове">GPS</button>
+                    <div class="coordinate-search-panel coordinate-search-hidden">
+                        <div class="coordinate-search-header">
+                            <b>GPS пинове</b>
+                            <button type="button" class="coordinate-search-close" title="Затвори">×</button>
+                        </div>
+                        <textarea class="coordinate-search-input" spellcheck="false"
+                            placeholder="42.6629,23.37682&#10;КУИК 2 ООД&#9;42.70939227145172,23.313702419400215&#9;8"></textarea>
+                        <div class="coordinate-search-actions">
+                            <button type="button" class="coordinate-search-show">Покажи</button>
+                            <button type="button" class="coordinate-search-clear">Изчисти</button>
+                        </div>
+                        <div class="coordinate-search-status"></div>
+                    </div>
+                `;
+                L.DomEvent.disableClickPropagation(container);
+                L.DomEvent.disableScrollPropagation(container);
+                return container;
+            };
+            control.addTo(map);
+
+            function escapeHtml(value) {
+                return String(value ?? "").replace(/[&<>"']/g, function(char) {
+                    return {
+                        "&": "&amp;",
+                        "<": "&lt;",
+                        ">": "&gt;",
+                        '"': "&quot;",
+                        "'": "&#39;"
+                    }[char];
+                });
+            }
+
+            function parseCoordinates(text) {
+                const points = [];
+                const invalidLines = [];
+                const lines = String(text || "").split(/\\r?\\n/);
+                const coordinatePattern = /(-?\d+(?:[.,]\d+)?)\s*,\s*(-?\d+(?:[.,]\d+)?)/;
+
+                function cleanSideText(value) {
+                    return String(value || "").replace(/^[\s,;|]+|[\s,;|]+$/g, "").trim();
+                }
+
+                lines.forEach(function(line, index) {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+
+                    const match = trimmed.match(coordinatePattern);
+                    if (!match) {
+                        invalidLines.push(index + 1);
+                        return;
+                    }
+
+                    const lat = Number(match[1].replace(",", "."));
+                    const lon = Number(match[2].replace(",", "."));
+                    if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+                        invalidLines.push(index + 1);
+                        return;
+                    }
+
+                    const coordStart = match.index || 0;
+                    const coordEnd = coordStart + match[0].length;
+                    const name = cleanSideText(trimmed.slice(0, coordStart));
+                    const stacksText = cleanSideText(trimmed.slice(coordEnd));
+                    const title = name || "GPS пин " + (points.length + 1);
+
+                    points.push({
+                        lat,
+                        lon,
+                        name,
+                        stacks: stacksText,
+                        title,
+                        label: trimmed
+                    });
+                });
+
+                return { points, invalidLines };
+            }
+
+            function setOpen(isOpen) {
+                const toggle = document.querySelector(".coordinate-search-toggle");
+                const panel = document.querySelector(".coordinate-search-panel");
+                if (!toggle || !panel) return;
+                toggle.classList.toggle("coordinate-search-hidden", isOpen);
+                panel.classList.toggle("coordinate-search-hidden", !isOpen);
+            }
+
+            function setStatus(message, isError) {
+                const status = document.querySelector(".coordinate-search-status");
+                if (!status) return;
+                status.textContent = message || "";
+                status.classList.toggle("coordinate-search-error", Boolean(isError));
+            }
+
+            function showPins() {
+                const input = document.querySelector(".coordinate-search-input");
+                if (!input) return;
+
+                const result = parseCoordinates(input.value);
+                markerLayer.clearLayers();
+
+                if (!result.points.length) {
+                    const suffix = result.invalidLines.length
+                        ? " Невалидни редове: " + result.invalidLines.join(", ") + "."
+                        : "";
+                    setStatus("Няма валидни координати." + suffix, true);
+                    return;
+                }
+
+                const bounds = L.latLngBounds([]);
+                result.points.forEach(function(point, index) {
+                    const popupTitle = escapeHtml(point.title || ("GPS пин " + (index + 1)));
+                    let popupHtml = "<b>" + popupTitle + "</b><br>" +
+                        "Координати: " + escapeHtml(point.lat.toFixed(6) + ", " + point.lon.toFixed(6));
+                    if (point.stacks) {
+                        popupHtml += "<br>Стекове: " + escapeHtml(point.stacks);
+                    }
+
+                    const marker = L.marker([point.lat, point.lon], {
+                        title: point.title || point.label
+                    }).bindPopup(popupHtml);
+                    marker.bindTooltip(popupTitle, { direction: "top", sticky: true });
+                    marker.addTo(markerLayer);
+                    bounds.extend([point.lat, point.lon]);
+                });
+
+                if (result.points.length === 1) {
+                    map.setView([result.points[0].lat, result.points[0].lon], Math.max(map.getZoom(), 16), { animate: true });
+                } else if (bounds.isValid()) {
+                    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+                }
+
+                const invalidText = result.invalidLines.length
+                    ? " Пропуснати редове: " + result.invalidLines.join(", ") + "."
+                    : "";
+                setStatus("Показани пинове: " + result.points.length + "." + invalidText, Boolean(result.invalidLines.length));
+            }
+
+            function clearPins() {
+                markerLayer.clearLayers();
+                setStatus("Пиновете са изчистени.", false);
+            }
+
+            setTimeout(function() {
+                const toggle = document.querySelector(".coordinate-search-toggle");
+                const close = document.querySelector(".coordinate-search-close");
+                const show = document.querySelector(".coordinate-search-show");
+                const clear = document.querySelector(".coordinate-search-clear");
+                const input = document.querySelector(".coordinate-search-input");
+
+                if (toggle) toggle.addEventListener("click", function(event) {
+                    event.preventDefault();
+                    setOpen(true);
+                    if (input) input.focus();
+                });
+                if (close) close.addEventListener("click", function(event) {
+                    event.preventDefault();
+                    setOpen(false);
+                });
+                if (show) show.addEventListener("click", function(event) {
+                    event.preventDefault();
+                    showPins();
+                });
+                if (clear) clear.addEventListener("click", function(event) {
+                    event.preventDefault();
+                    clearPins();
+                });
+                if (input) input.addEventListener("keydown", function(event) {
+                    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                        event.preventDefault();
+                        showPins();
+                    }
+                });
+            }, 0);
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, css: str):
+        super().__init__()
+        self._name = "CoordinatePinSearch"
+        self.css = json.dumps(css, ensure_ascii=False)
+
+
 class InteractiveMapGenerator:
     """Генератор на интерактивна карта"""
     
@@ -604,6 +848,224 @@ class InteractiveMapGenerator:
             f"{body}</div>"
         )
 
+    def _customer_time_windows_enabled(self) -> bool:
+        return bool(getattr(get_config().cvrp, "enable_customer_time_windows", False))
+
+    def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        if not self._customer_time_windows_enabled():
+            return None
+
+        start_minutes = getattr(customer, "time_window_start_minutes", None)
+        end_minutes = getattr(customer, "time_window_end_minutes", None)
+
+        if start_minutes is None:
+            start_minutes = 0
+        if end_minutes is None:
+            end_minutes = 1439
+
+        start_minutes = max(0, int(start_minutes))
+        end_minutes = max(0, int(end_minutes))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+
+        return start_minutes, end_minutes
+
+    def _format_customer_time_window(self, customer: Customer) -> str:
+        window = self._customer_time_window_minutes(customer)
+        if not window:
+            return ""
+        if (
+            getattr(customer, "time_window_start_minutes", None) is None
+            and getattr(customer, "time_window_end_minutes", None) is None
+        ):
+            return "Постоянно"
+        return f"{self._format_time_hh_mm(window[0])}-{self._format_time_hh_mm(window[1])}"
+
+    def _calculate_distance_between_points(
+        self,
+        point1: Optional[Tuple[float, float]],
+        point2: Optional[Tuple[float, float]],
+    ) -> float:
+        if not point1 or not point2:
+            return 0.0
+
+        from math import radians, sin, cos, sqrt, atan2
+
+        radius_km = 6371
+        lat1, lon1 = radians(point1[0]), radians(point1[1])
+        lat2, lon2 = radians(point2[0]), radians(point2[1])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+        c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        return radius_km * c
+
+    def _calculate_time_between_points(
+        self,
+        point1: Optional[Tuple[float, float]],
+        point2: Optional[Tuple[float, float]],
+    ) -> float:
+        if not point1 or not point2:
+            return 0.0
+        return self._calculate_distance_between_points(point1, point2) * 2
+
+    def _get_vehicle_config(self, vehicle_type):
+        vehicle_configs = get_config().vehicles
+        vehicle_type_value = _vehicle_type_value(vehicle_type)
+
+        if vehicle_configs:
+            for vehicle_config in vehicle_configs:
+                if _vehicle_type_value(vehicle_config.vehicle_type) == vehicle_type_value:
+                    return vehicle_config
+        return None
+
+    def _get_start_time_for_vehicle(self, vehicle_type) -> int:
+        vehicle_config = self._get_vehicle_config(vehicle_type)
+        if vehicle_config and hasattr(vehicle_config, "start_time_minutes"):
+            return int(vehicle_config.start_time_minutes)
+        return int(getattr(get_config().cvrp, "global_start_time_minutes", 480) or 480)
+
+    def _format_time_hh_mm(self, total_minutes: int) -> str:
+        total_minutes = int(round(float(total_minutes or 0)))
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        return f"{hours:02d}:{minutes:02d}"
+
+    def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
+        stored_entries = _stored_route_schedule_entries(route)
+        if stored_entries:
+            return stored_entries
+
+        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
+
+        entries = []
+        cumulative_distance = 0.0
+        cumulative_time = 0.0
+        previous_customer_coords = self._route_start_location(route)
+        previous_stop_name = "Депо"
+
+        for stop_index, customer in enumerate(route.customers, start=1):
+            distance_from_previous = (
+                self._calculate_distance_between_points(previous_customer_coords, customer.coordinates)
+                if customer.coordinates
+                else 0.0
+            )
+            cumulative_distance += distance_from_previous
+
+            travel_time = (
+                self._calculate_time_between_points(previous_customer_coords, customer.coordinates)
+                if customer.coordinates
+                else 0.0
+            )
+            raw_arrival = start_time_minutes + cumulative_time + travel_time
+            wait_minutes = 0.0
+            time_window_status = ""
+            window = self._customer_time_window_minutes(customer)
+
+            if window:
+                window_start, window_end = window
+                if raw_arrival < window_start:
+                    wait_minutes = window_start - raw_arrival
+                    time_window_status = "Изчакване"
+                arrival_after_wait = raw_arrival + wait_minutes
+                if arrival_after_wait > window_end:
+                    time_window_status = "След работно време"
+                elif not time_window_status:
+                    time_window_status = "OK"
+            else:
+                arrival_after_wait = raw_arrival
+
+            total_time_for_step = travel_time + wait_minutes + service_time_minutes
+            cumulative_time += total_time_for_step
+            total_time_with_start = start_time_minutes + cumulative_time
+
+            entries.append({
+                "customer": customer,
+                "index": stop_index,
+                "previous_stop_name": previous_stop_name,
+                "distance_from_previous": distance_from_previous,
+                "cumulative_distance": cumulative_distance,
+                "travel_time_minutes": travel_time,
+                "service_time_minutes": service_time_minutes,
+                "wait_minutes": wait_minutes,
+                "total_time_for_step": total_time_for_step,
+                "cumulative_time": cumulative_time,
+                "start_time_minutes": start_time_minutes,
+                "arrival_time_minutes": arrival_after_wait,
+                "total_time_with_start": total_time_with_start,
+                "time_window_text": self._format_customer_time_window(customer),
+                "time_window_status": time_window_status,
+            })
+
+            previous_customer_coords = customer.coordinates
+            previous_stop_name = customer.name
+
+        return entries
+
+    def _route_schedule_by_index(self, route: Route) -> Dict[int, Dict[str, object]]:
+        try:
+            entries = self._build_route_schedule_entries(route)
+        except Exception as e:
+            logger.warning(f"Не мога да изчисля ETA за HTML карта: {e}")
+            return {}
+        return {int(entry["index"]): entry for entry in entries}
+
+    def _route_start_time_text(self, route: Route) -> str:
+        try:
+            stored_entries = _stored_route_schedule_entries(route)
+            if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
+                return self._format_time_hh_mm(int(round(float(stored_entries[0]["start_time_minutes"]))))
+            return self._format_time_hh_mm(self._get_start_time_for_vehicle(route.vehicle_type))
+        except Exception:
+            return ""
+
+    def _schedule_entry_text(self, entry: Optional[Dict[str, object]], key: str) -> str:
+        if not entry:
+            return ""
+        if key == "arrival":
+            value = entry.get("arrival_time_minutes")
+        elif key == "departure":
+            value = entry.get("total_time_with_start")
+        else:
+            value = entry.get(key)
+        if value in (None, ""):
+            return ""
+        try:
+            return self._format_time_hh_mm(int(round(float(value))))
+        except (TypeError, ValueError):
+            return ""
+
+    def _schedule_popup_lines(self, entry: Optional[Dict[str, object]], include_start: bool = True) -> List[str]:
+        if not entry:
+            return []
+
+        lines = []
+        arrival_text = self._schedule_entry_text(entry, "arrival")
+        departure_text = self._schedule_entry_text(entry, "departure")
+        start_text = self._schedule_entry_text(entry, "start_time_minutes")
+        if include_start and start_text:
+            lines.append(f"<b>Старт на буса:</b> {html.escape(start_text)}")
+        if arrival_text:
+            lines.append(f"<b>Очаквано пристигане:</b> {html.escape(arrival_text)}")
+        if departure_text:
+            lines.append(f"<b>Очаквано тръгване:</b> {html.escape(departure_text)}")
+
+        wait_minutes = float(entry.get("wait_minutes", 0) or 0)
+        if wait_minutes > 0.1:
+            lines.append(f"<b>Изчакване:</b> {wait_minutes:.0f} мин")
+
+        time_window_text = str(entry.get("time_window_text", "") or "").strip()
+        if time_window_text:
+            lines.append(f"<b>Работно време:</b> {html.escape(time_window_text)}")
+
+        time_window_status = str(entry.get("time_window_status", "") or "").strip()
+        if time_window_status:
+            lines.append(f"<b>TW статус:</b> {html.escape(time_window_status)}")
+
+        return lines
+
     def _popup_action_buttons(self, navigation_url: str, street_view_url: str) -> str:
         safe_nav = html.escape(navigation_url, quote=True)
         safe_street = html.escape(street_view_url, quote=True)
@@ -681,7 +1143,12 @@ class InteractiveMapGenerator:
             return ""
         return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
 
-    def _build_google_routes(self, routes: List[Route], start_number: int = 1) -> List[Dict[str, object]]:
+    def _build_google_routes(
+        self,
+        routes: List[Route],
+        start_number: int = 1,
+        include_start_in_customer_popups: bool = True,
+    ) -> List[Dict[str, object]]:
         google_routes = []
         for route_idx, route in enumerate(routes):
             route_number = start_number + route_idx
@@ -694,6 +1161,8 @@ class InteractiveMapGenerator:
             vehicle_name = _route_vehicle_name(route)
             bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
             geometry, dashed, geometry_label = self._get_route_visual_geometry(route)
+            schedule_by_index = self._route_schedule_by_index(route)
+            route_start_time_text = self._route_start_time_text(route)
 
             markers = []
             for client_idx, customer in enumerate(route.customers):
@@ -702,6 +1171,9 @@ class InteractiveMapGenerator:
                 client_number = client_idx + 1
                 navigation_url = self._navigation_url(customer.coordinates)
                 street_view_url = self._street_view_url(customer.coordinates)
+                schedule_entry = schedule_by_index.get(client_number)
+                arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
+                departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
                 popup_html = self._html_popup(
                     f"Автобус {route_number} - {vehicle_name}",
                     [
@@ -710,6 +1182,10 @@ class InteractiveMapGenerator:
                         f"<b>Ред в маршрута:</b> #{client_number}",
                         f"<b>Обем:</b> {customer.volume:.2f} ст.",
                         f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
+                        *self._schedule_popup_lines(
+                            schedule_entry,
+                            include_start=include_start_in_customer_popups,
+                        ),
                         self._popup_action_buttons(navigation_url, street_view_url),
                     ],
                     bus_color,
@@ -724,6 +1200,9 @@ class InteractiveMapGenerator:
                     "volume": customer.volume,
                     "navigationUrl": navigation_url,
                     "streetViewUrl": street_view_url,
+                    "routeStartTime": route_start_time_text,
+                    "arrivalTime": arrival_time_text,
+                    "departureTime": departure_time_text,
                 })
 
             popup_html = self._html_popup(
@@ -803,7 +1282,11 @@ class InteractiveMapGenerator:
                 for depot in depot_locations
             ],
             "centerZone": None,
-            "routes": self._build_google_routes(routes, route_start),
+            "routes": self._build_google_routes(
+                routes,
+                route_start,
+                include_start_in_customer_popups=single_route_number is None,
+            ),
             "singleRouteNumber": single_route_number,
             "totals": {
                 "distanceKm": sum(route.total_distance_km for route in routes),
@@ -839,7 +1322,13 @@ class InteractiveMapGenerator:
       box-shadow: 0 2px 12px rgba(0,0,0,.25); padding: 10px; font-size: 13px;
       max-height: calc(100vh - 40px); overflow: auto;
     }}
+    #coordinate-search {{
+      position: absolute; bottom: 18px; left: 10px; z-index: 5; font-size: 13px;
+    }}
     #route-filter.collapsed {{
+      background: transparent; border: 0; box-shadow: none; padding: 0; overflow: visible;
+    }}
+    #coordinate-search.collapsed {{
       background: transparent; border: 0; box-shadow: none; padding: 0; overflow: visible;
     }}
     .client-toggle {{
@@ -922,12 +1411,55 @@ class InteractiveMapGenerator:
       color: #fff; font-weight: 700; font-size: 13px; text-align: center;
       text-shadow: 0 1px 2px rgba(0,0,0,.8);
     }}
+    .coordinate-search-toggle {{
+      min-width: 46px; height: 34px; border: 1px solid rgba(35,35,35,.35);
+      border-radius: 5px; background: #fff; color: #202124;
+      box-shadow: 0 2px 10px rgba(0,0,0,.22); cursor: pointer;
+      font-size: 13px; font-weight: 700;
+    }}
+    .coordinate-search-toggle:hover {{ background: #f4f7fb; }}
+    .coordinate-search-hidden {{ display: none !important; }}
+    .coordinate-search-panel {{
+      width: 340px; max-width: calc(100vw - 28px); background: #fff;
+      border: 1px solid rgba(35,35,35,.35); border-radius: 6px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.24); padding: 10px; color: #202124;
+    }}
+    .coordinate-search-header {{
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin-bottom: 8px;
+    }}
+    .coordinate-search-close {{
+      width: 26px; height: 26px; border: 0; border-radius: 4px; background: #f1f3f4;
+      color: #333; cursor: pointer; font-size: 18px; line-height: 1; font-weight: 700;
+    }}
+    .coordinate-search-close:hover {{ background: #e4e7eb; }}
+    .coordinate-search-input {{
+      box-sizing: border-box; width: 100%; min-height: 118px; max-height: 34vh;
+      resize: vertical; padding: 8px; border: 1px solid #c8d0d9; border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace; font-size: 12px; line-height: 1.35;
+      color: #202124; background: #fff;
+    }}
+    .coordinate-search-input:focus {{
+      outline: 2px solid rgba(26,115,232,.25); border-color: #1a73e8;
+    }}
+    .coordinate-search-actions {{ display: flex; gap: 8px; margin-top: 8px; }}
+    .coordinate-search-actions button {{
+      min-height: 30px; border: 0; border-radius: 4px; padding: 6px 10px;
+      cursor: pointer; font-size: 12px; font-weight: 700;
+    }}
+    .coordinate-search-show {{ background: #1a73e8; color: #fff; }}
+    .coordinate-search-clear {{ background: #eef1f5; color: #202124; }}
+    .coordinate-search-status {{
+      min-height: 16px; margin-top: 7px; font-size: 12px; color: #3c4043; line-height: 1.3;
+    }}
+    .coordinate-search-error {{ color: #b3261e; }}
   </style>
 </head>
 <body>
   <div id="map"></div>
   <div id="legend"></div>
   <div id="route-filter"></div>
+  <div id="coordinate-search"></div>
   <script>
     const MAP_DATA = {data_json};
     let infoWindow;
@@ -1060,6 +1592,9 @@ class InteractiveMapGenerator:
       }}
       renderLegend();
       renderFilter(routeObjects, map);
+      if (!MAP_DATA.singleRouteNumber) {{
+        renderCoordinateSearch(map);
+      }}
     }}
 
     function renderLegend() {{
@@ -1104,6 +1639,157 @@ class InteractiveMapGenerator:
           objects.line.setMap(map);
           objects.markers.forEach((marker) => marker.setMap(map));
         }});
+      }});
+    }}
+
+    function renderCoordinateSearch(map) {{
+      const container = document.getElementById("coordinate-search");
+      if (!container) return;
+      const markers = [];
+
+      container.classList.add("collapsed");
+      container.innerHTML = `
+        <button type="button" class="coordinate-search-toggle" title="Покажи GPS пинове">GPS</button>
+        <div class="coordinate-search-panel coordinate-search-hidden">
+          <div class="coordinate-search-header">
+            <b>GPS пинове</b>
+            <button type="button" class="coordinate-search-close" title="Затвори">×</button>
+          </div>
+          <textarea class="coordinate-search-input" spellcheck="false"
+            placeholder="42.6629,23.37682&#10;КУИК 2 ООД&#9;42.70939227145172,23.313702419400215&#9;8"></textarea>
+          <div class="coordinate-search-actions">
+            <button type="button" class="coordinate-search-show">Покажи</button>
+            <button type="button" class="coordinate-search-clear">Изчисти</button>
+          </div>
+          <div class="coordinate-search-status"></div>
+        </div>
+      `;
+
+      const toggle = container.querySelector(".coordinate-search-toggle");
+      const panel = container.querySelector(".coordinate-search-panel");
+      const close = container.querySelector(".coordinate-search-close");
+      const show = container.querySelector(".coordinate-search-show");
+      const clear = container.querySelector(".coordinate-search-clear");
+      const input = container.querySelector(".coordinate-search-input");
+      const status = container.querySelector(".coordinate-search-status");
+
+      function setOpen(isOpen) {{
+        container.classList.toggle("collapsed", !isOpen);
+        toggle.classList.toggle("coordinate-search-hidden", isOpen);
+        panel.classList.toggle("coordinate-search-hidden", !isOpen);
+      }}
+
+      function setStatus(message, isError) {{
+        status.textContent = message || "";
+        status.classList.toggle("coordinate-search-error", Boolean(isError));
+      }}
+
+      function clearPins() {{
+        while (markers.length) {{
+          markers.pop().setMap(null);
+        }}
+      }}
+
+      function parseCoordinates(text) {{
+        const points = [];
+        const invalidLines = [];
+        const lines = String(text || "").split(/\\r?\\n/);
+        const coordinatePattern = /(-?\d+(?:[.,]\d+)?)\s*,\s*(-?\d+(?:[.,]\d+)?)/;
+
+        function cleanSideText(value) {{
+          return String(value || "").replace(/^[\s,;|]+|[\s,;|]+$/g, "").trim();
+        }}
+
+        lines.forEach((line, index) => {{
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          const match = trimmed.match(coordinatePattern);
+          if (!match) {{
+            invalidLines.push(index + 1);
+            return;
+          }}
+          const lat = Number(match[1].replace(",", "."));
+          const lng = Number(match[2].replace(",", "."));
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {{
+            invalidLines.push(index + 1);
+            return;
+          }}
+          const coordStart = match.index || 0;
+          const coordEnd = coordStart + match[0].length;
+          const name = cleanSideText(trimmed.slice(0, coordStart));
+          const stacksText = cleanSideText(trimmed.slice(coordEnd));
+          const title = name || "GPS пин " + (points.length + 1);
+          points.push({{ lat, lng, name, stacks: stacksText, title, label: trimmed }});
+        }});
+
+        return {{ points, invalidLines }};
+      }}
+
+      function showPins() {{
+        const result = parseCoordinates(input.value);
+        clearPins();
+
+        if (!result.points.length) {{
+          const suffix = result.invalidLines.length ? " Невалидни редове: " + result.invalidLines.join(", ") + "." : "";
+          setStatus("Няма валидни координати." + suffix, true);
+          return;
+        }}
+
+        const bounds = new google.maps.LatLngBounds();
+        result.points.forEach((point, index) => {{
+          const marker = new google.maps.Marker({{
+            position: {{ lat: point.lat, lng: point.lng }},
+            map,
+            title: point.title || point.label,
+            label: {{ text: String(index + 1), color: "white", fontWeight: "bold" }},
+            icon: {{
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 12,
+              fillColor: "#d93025",
+              fillOpacity: 1,
+              strokeColor: "#ffffff",
+              strokeWeight: 2
+            }}
+          }});
+          marker.addListener("click", () => {{
+            let popupHtml = "<b>" + escapeHtml(point.title || ("GPS пин " + (index + 1))) + "</b><br>" +
+              "Координати: " + escapeHtml(point.lat.toFixed(6) + ", " + point.lng.toFixed(6));
+            if (point.stacks) {{
+              popupHtml += "<br>Стекове: " + escapeHtml(point.stacks);
+            }}
+            infoWindow.setContent(popupHtml);
+            infoWindow.open(map, marker);
+          }});
+          markers.push(marker);
+          bounds.extend(marker.getPosition());
+        }});
+
+        if (result.points.length === 1) {{
+          map.setCenter({{ lat: result.points[0].lat, lng: result.points[0].lng }});
+          map.setZoom(Math.max(map.getZoom(), 16));
+        }} else {{
+          map.fitBounds(bounds, 40);
+        }}
+
+        const invalidText = result.invalidLines.length ? " Пропуснати редове: " + result.invalidLines.join(", ") + "." : "";
+        setStatus("Показани пинове: " + result.points.length + "." + invalidText, Boolean(result.invalidLines.length));
+      }}
+
+      toggle.addEventListener("click", () => {{
+        setOpen(true);
+        input.focus();
+      }});
+      close.addEventListener("click", () => setOpen(false));
+      show.addEventListener("click", showPins);
+      clear.addEventListener("click", () => {{
+        clearPins();
+        setStatus("Пиновете са изчистени.", false);
+      }});
+      input.addEventListener("keydown", (event) => {{
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {{
+          event.preventDefault();
+          showPins();
+        }}
       }});
     }}
 
@@ -1170,6 +1856,7 @@ class InteractiveMapGenerator:
       const route = MAP_DATA.routes[0];
       const objects = routeObjects[route.id];
       const routeTimeText = formatRouteDuration(route.timeMin);
+      const routeStartText = (route.markers[0] && route.markers[0].routeStartTime) || "";
       container.classList.add("collapsed");
       container.innerHTML = `
         <button type="button" class="client-toggle">Клиенти / Google Maps</button>
@@ -1183,6 +1870,7 @@ class InteractiveMapGenerator:
             <div class="client-route-stat"><span>Стекове:</span><b>${{formatRouteNumber(route.volume)}}</b></div>
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
+            ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
           </div>
           ${{renderGoogleSegments(route)}}
           <div class="client-list"></div>
@@ -1200,6 +1888,9 @@ class InteractiveMapGenerator:
       toggle.addEventListener("click", () => setOpen(true));
       close.addEventListener("click", () => setOpen(false));
       route.markers.forEach((point, index) => {{
+        const timeLine = point.arrivalTime
+          ? `<span style="display:block;color:#188038;font-size:11px">Пристигане: ${{escapeHtml(point.arrivalTime)}}${{point.departureTime ? " · Тръгване: " + escapeHtml(point.departureTime) : ""}}</span>`
+          : "";
         const row = document.createElement("div");
         row.className = "route-row";
         row.style.cursor = "pointer";
@@ -1210,6 +1901,7 @@ class InteractiveMapGenerator:
           <span style="flex:1;min-width:0">
             <span style="display:block;font-weight:bold;font-size:12px;overflow-wrap:anywhere">${{point.customerName}}</span>
             <span style="display:block;color:#666;font-size:11px">ID: ${{point.customerId}} · ${{Number(point.volume).toFixed(2)}} ст.</span>
+            ${{timeLine}}
           </span>
           <span class="client-actions">
             <a class="client-action client-nav" href="${{point.navigationUrl}}" target="_blank" rel="noopener"
@@ -1281,14 +1973,17 @@ class InteractiveMapGenerator:
         locations = get_config().locations
         if locations.enable_center_zone_priority:
             self._add_center_zone_shape(route_map, locations)
-        
+
         # Добавяне на маршрутите с OSRM геометрия
         if self.config.show_route_colors:
             self._add_routes_to_map(route_map, solution.routes)
-        
+
+        # GPS търсачка за временни пинове в общата карта
+        self._add_coordinate_pin_search(route_map)
+
         # Добавяне на легенда
         self._add_legend(route_map, solution.routes)
-        
+
         return route_map
     
     def _add_depot_markers(self, route_map: folium.Map, depot_locations: List[Tuple[float, float]]):
@@ -1627,6 +2322,7 @@ class InteractiveMapGenerator:
             # Създаваме FeatureGroup за този автобус
             bus_layer = folium.FeatureGroup(name=f"🚌 {vehicle_name} ({len(route.customers)} клиента)")
             bus_layers[bus_id] = bus_layer
+            schedule_by_index = self._route_schedule_by_index(route)
             
             # Добавяне на клиентските маркери с номерация
             for client_idx, customer in enumerate(route.customers):
@@ -1635,6 +2331,8 @@ class InteractiveMapGenerator:
                     client_number = client_idx + 1
                     navigation_url = self._navigation_url(customer.coordinates)
                     street_view_url = self._street_view_url(customer.coordinates)
+                    schedule_entry = schedule_by_index.get(client_number)
+                    schedule_lines = self._schedule_popup_lines(schedule_entry)
                     
                     # HTML за номерирано пинче с уникален цвят на автобуса
                     icon_html = f'''
@@ -1665,6 +2363,7 @@ class InteractiveMapGenerator:
                         <b>Ред в маршрута:</b> #{client_number}<br>
                         <b>Обем:</b> {customer.volume:.2f} ст.<br>
                         <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
+                        {"<br>".join(schedule_lines)}{"<br>" if schedule_lines else ""}
                         {self._popup_action_buttons(navigation_url, street_view_url)}
                     </div>
                     """
@@ -1898,6 +2597,124 @@ class InteractiveMapGenerator:
         legend_element = folium.Element(legend_html)
         route_map.get_root().add_child(legend_element)
 
+    def _add_coordinate_pin_search(self, route_map: folium.Map) -> None:
+        """Adds a small control for temporary GPS pins on the overview map."""
+        css = """
+            .coordinate-search-control {
+                margin: 0 0 16px 10px;
+                font-family: Arial, sans-serif;
+                z-index: 9999;
+            }
+            .coordinate-search-toggle {
+                min-width: 46px;
+                height: 34px;
+                border: 1px solid rgba(35,35,35,.35);
+                border-radius: 5px;
+                background: #fff;
+                color: #202124;
+                box-shadow: 0 2px 10px rgba(0,0,0,.22);
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            .coordinate-search-toggle:hover {
+                background: #f4f7fb;
+            }
+            .coordinate-search-panel {
+                width: 340px;
+                max-width: calc(100vw - 28px);
+                background: #fff;
+                border: 1px solid rgba(35,35,35,.35);
+                border-radius: 6px;
+                box-shadow: 0 4px 18px rgba(0,0,0,.24);
+                padding: 10px;
+                color: #202124;
+            }
+            .coordinate-search-hidden {
+                display: none !important;
+            }
+            .coordinate-search-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin-bottom: 8px;
+            }
+            .coordinate-search-header b {
+                font-size: 14px;
+            }
+            .coordinate-search-close {
+                width: 26px;
+                height: 26px;
+                border: 0;
+                border-radius: 4px;
+                background: #f1f3f4;
+                color: #333;
+                cursor: pointer;
+                font-size: 18px;
+                line-height: 1;
+                font-weight: 700;
+            }
+            .coordinate-search-close:hover {
+                background: #e4e7eb;
+            }
+            .coordinate-search-input {
+                box-sizing: border-box;
+                width: 100%;
+                min-height: 118px;
+                max-height: 34vh;
+                resize: vertical;
+                padding: 8px;
+                border: 1px solid #c8d0d9;
+                border-radius: 4px;
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 12px;
+                line-height: 1.35;
+                color: #202124;
+                background: #fff;
+            }
+            .coordinate-search-input:focus {
+                outline: 2px solid rgba(26,115,232,.25);
+                border-color: #1a73e8;
+            }
+            .coordinate-search-actions {
+                display: flex;
+                gap: 8px;
+                margin-top: 8px;
+            }
+            .coordinate-search-actions button {
+                min-height: 30px;
+                border: 0;
+                border-radius: 4px;
+                padding: 6px 10px;
+                cursor: pointer;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            .coordinate-search-show {
+                background: #1a73e8;
+                color: #fff;
+            }
+            .coordinate-search-clear {
+                background: #eef1f5;
+                color: #202124;
+            }
+            .coordinate-search-actions button:hover {
+                filter: brightness(.96);
+            }
+            .coordinate-search-status {
+                min-height: 16px;
+                margin-top: 7px;
+                font-size: 12px;
+                color: #3c4043;
+                line-height: 1.3;
+            }
+            .coordinate-search-error {
+                color: #b3261e;
+            }
+        """
+        route_map.add_child(CoordinatePinSearch(css))
+
     def _navigation_url(self, coords: Tuple[float, float]) -> str:
         return (
             "https://www.google.com/maps/dir/?api=1&destination="
@@ -2032,12 +2849,19 @@ class InteractiveMapGenerator:
         return f"{number:.1f}"
 
     def _route_stats_html(self, route: Route) -> str:
+        start_time = self._route_start_time_text(route)
+        start_html = (
+            f'<div class="route-client-stat"><span>Старт:</span><b>{html.escape(start_time)}</b></div>'
+            if start_time
+            else ""
+        )
         return f'''
             <div class="route-client-stats">
                 <div class="route-client-stat"><span>Общо:</span><b>{len(route.customers)} клиента</b></div>
                 <div class="route-client-stat"><span>Стекове:</span><b>{self._format_route_number(route.total_volume)}</b></div>
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
+                {start_html}
             </div>
         '''
 
@@ -2356,6 +3180,15 @@ class InteractiveMapGenerator:
                 "street_view_url",
                 self._street_view_url((float(entry["lat"]), float(entry["lng"]))),
             )), quote=True)
+            arrival_time = html.escape(str(entry.get("arrival_time", "") or ""))
+            departure_time = html.escape(str(entry.get("departure_time", "") or ""))
+            time_html = ""
+            if arrival_time:
+                time_parts = []
+                time_parts.append(f"Пристигане: {arrival_time}")
+                if departure_time:
+                    time_parts.append(f"Тръгване: {departure_time}")
+                time_html = f'<div class="route-client-time">{" &middot; ".join(time_parts)}</div>'
             rows.append(
                 f'''
                 <div class="route-client-card" role="button" tabindex="0" data-client-index="{idx}">
@@ -2363,6 +3196,7 @@ class InteractiveMapGenerator:
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
                         <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.</div>
+                        {time_html}
                     </div>
                     <div class="route-client-actions">
                         <a class="route-client-nav" href="{nav_url}" target="_blank" rel="noopener">Навигация</a>
@@ -2509,6 +3343,12 @@ class InteractiveMapGenerator:
                 font-size: 11px;
                 color: #666;
                 margin-top: 2px;
+            }
+            .route-client-time {
+                font-size: 11px;
+                color: #188038;
+                margin-top: 2px;
+                line-height: 1.25;
             }
             .route-client-actions {
                 display: flex;
@@ -2798,6 +3638,8 @@ class InteractiveMapGenerator:
         bus_layer = folium.FeatureGroup(
             name=f"\U0001f68c {vehicle_name} ({len(route.customers)} клиента)")
         marker_entries = []
+        schedule_by_index = self._route_schedule_by_index(route)
+        route_start_time_text = self._route_start_time_text(route)
 
         # Маркери за клиентите
         for client_idx, customer in enumerate(route.customers):
@@ -2805,6 +3647,10 @@ class InteractiveMapGenerator:
                 client_number = client_idx + 1
                 navigation_url = self._navigation_url(customer.coordinates)
                 street_view_url = self._street_view_url(customer.coordinates)
+                schedule_entry = schedule_by_index.get(client_number)
+                schedule_lines = self._schedule_popup_lines(schedule_entry, include_start=False)
+                arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
+                departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
                 icon_html = f'''
                 <div style="
                     background-color: {bus_color};
@@ -2832,6 +3678,7 @@ class InteractiveMapGenerator:
                     <b>Ред в маршрута:</b> #{client_number}<br>
                     <b>Обем:</b> {customer.volume:.2f} ст.<br>
                     <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
+                    {"<br>".join(schedule_lines)}{"<br>" if schedule_lines else ""}
                     {self._popup_action_buttons(navigation_url, street_view_url)}
                 </div>
                 """
@@ -2857,6 +3704,9 @@ class InteractiveMapGenerator:
                     "lng": customer.coordinates[1],
                     "navigation_url": navigation_url,
                     "street_view_url": street_view_url,
+                    "route_start_time": route_start_time_text,
+                    "arrival_time": arrival_time_text,
+                    "departure_time": departure_time_text,
                 })
 
         # Линия на маршрута
@@ -2913,6 +3763,7 @@ class InteractiveMapGenerator:
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4cf Разстояние: {route.total_distance_km:.1f} км</p>
         <p style="margin: 3px 0; font-size: 12px;">\u23f1 Време: {route.total_time_minutes:.0f} мин</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} ст.</p>
+        {f'<p style="margin: 3px 0; font-size: 12px;">Старт: {html.escape(route_start_time_text)}</p>' if route_start_time_text else ''}
         </div>
         '''
         route_map.get_root().add_child(folium.Element(legend_html))
@@ -3367,6 +4218,10 @@ class ExcelExporter:
         return f"{self._format_time_hh_mm(window[0])}-{self._format_time_hh_mm(window[1])}"
 
     def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
+        stored_entries = _stored_route_schedule_entries(route)
+        if stored_entries:
+            return stored_entries
+
         start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
         vehicle_config = self._get_vehicle_config(route.vehicle_type)
         service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
@@ -3507,6 +4362,7 @@ class ExcelExporter:
     
     def _format_time_hh_mm(self, total_minutes: int) -> str:
         """Форматира време в минути като чч:мм"""
+        total_minutes = int(round(float(total_minutes or 0)))
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return f"{hours:02d}:{minutes:02d}"

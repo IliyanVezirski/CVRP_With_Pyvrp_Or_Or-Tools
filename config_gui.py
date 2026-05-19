@@ -410,6 +410,8 @@ cmd / command / action:
                 "Бързи aliases:",
                 """
 solver / solver_type                  -> cvrp.solver_type
+objective / objective_metric          -> cvrp.objective_metric
+optimize_by                           -> cvrp.objective_metric
 time_limit / time_limit_seconds       -> cvrp.time_limit_seconds
 parallel                              -> cvrp.enable_parallel_solving
 workers / num_workers                 -> cvrp.num_workers
@@ -430,6 +432,7 @@ done_flag / json_done_flag            -> input.json_done_flag
                 "Solver настройки:",
                 """
 cvrp.solver_type                       pyvrp или or_tools
+cvrp.objective_metric                  distance = най-къси км, time = най-кратко време
 cvrp.time_limit_seconds                време за решаване
 cvrp.enable_parallel_solving           паралелно решаване
 cvrp.num_workers                       брой процеси (-1 = автоматично)
@@ -1599,6 +1602,12 @@ solver_type:
   or_tools:
     Стабилен solver за сравнение и контрол.
 
+objective_metric:
+  distance:
+    Solver-ът търси най-къси километри.
+  time:
+    Solver-ът търси най-кратко време по OSRM/Valhalla duration матрицата.
+
 time_limit_seconds:
   Колко секунди solver-ът търси решение.
   Повече време често помага, но не гарантира подобрение.
@@ -2411,6 +2420,9 @@ setData не трябва да се пуска:
         )
         self._add_field(basic, r, "cvrp.solver_type", "Тип солвър:", c.solver_type,
                          "combo", ["pyvrp", "or_tools"]); r += 1
+        self._add_field(basic, r, "cvrp.objective_metric", "Цел на оптимизацията:", getattr(c, "objective_metric", "distance"),
+                         "combo", ["distance", "time"],
+                         tooltip="distance = най-къси километри. time = най-кратко време по OSRM/Valhalla duration матрицата."); r += 1
         self._add_field(basic, r, "cvrp.time_limit_seconds", "Време за решение (сек):", c.time_limit_seconds); r += 1
 
         pyvrp_quality, r = self._add_group(
@@ -2791,14 +2803,14 @@ setData не трябва да се пуска:
             quick,
             r,
             "Run + настройки:",
-            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\",\\"routes_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
+            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\",\\"routes_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
             "Стартира /run, но само за тази заявка сменя solver, OSRM, бусове, изходни пътища и setData настройки.",
         )
         r = self._add_copyable_command(
             quick,
             r,
             "Run + JSON резултат:",
-            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"return_result\\":true,\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"time_limit_seconds\\":180,\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
+            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"return_result\\":true,\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
             "Заявката чака програмата да завърши и връща директно JSON резултата от решението.",
         )
         r = self._add_copyable_command(
@@ -2915,8 +2927,8 @@ POST {trigger_path}
   Връща:
     202 started за background, 200 с JSON решение за return_result, 409 ако вече има активен run.
   Примери:
-    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"settings\":{{\"solver_type\":\"pyvrp\"}}}}"
-    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"return_result\":true,\"settings\":{{\"time_limit_seconds\":180}}}}"
+    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"settings\":{{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\"}}}}"
+    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"return_result\":true,\"settings\":{{\"objective_metric\":\"time\",\"time_limit_seconds\":180}}}}"
     curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"callback_url\":\"https://example.com/cvrp-finished\"}}"
 
 POST {solve_path}
@@ -2942,7 +2954,7 @@ POST {solve_path}?cmd=run
     Същото работи и с query имена command=... или action=...
   Примери:
     curl -X POST "{base_url}{solve_path}?cmd=run"
-    curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"cmd\":\"run\",\"settings\":{{\"solver_type\":\"or_tools\"}}}}"
+    curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"cmd\":\"run\",\"settings\":{{\"solver_type\":\"or_tools\",\"objective_metric\":\"distance\"}}}}"
 
 Временни settings:
   Могат да се подават като вложени секции:
@@ -2968,6 +2980,7 @@ POST {trigger_path} - run с временни настройки, без да п
 {{
   "settings": {{
     "solver_type": "pyvrp",
+    "objective_metric": "time",
     "time_limit_seconds": 180,
     "routing": {{"engine": "osrm"}},
     "osrm": {{"base_url": "http://localhost:5000", "chunk_size": 80, "timeout_seconds": 45}},
@@ -2996,6 +3009,7 @@ POST {trigger_path} - run, който връща директно JSON резу�
   "return_result": true,
   "settings": {{
     "solver_type": "pyvrp",
+    "objective_metric": "time",
     "time_limit_seconds": 180,
     "set_data": {{"enable_set_data_upload": false}}
   }}
@@ -3019,6 +3033,7 @@ POST {solve_path} - клиенти + настройки в една заявка
 {{
   "settings": {{
     "solver_type": "or_tools",
+    "objective_metric": "time",
     "output.map_provider": "google",
     "set_data.enable_set_data_upload": false
   }},
@@ -3419,6 +3434,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "warehouse.capacity_toleranse": ("capacity_toleranse", "float"),
             # CVRP
             "cvrp.solver_type": ("solver_type", "str"),
+            "cvrp.objective_metric": ("objective_metric", "str"),
             "cvrp.time_limit_seconds": ("time_limit_seconds", "int"),
             "cvrp.allow_customer_skipping": ("allow_customer_skipping", "bool"),
             "cvrp.distance_penalty_disjunction": ("distance_penalty_disjunction", "int"),
