@@ -53,6 +53,9 @@ class ConfigGUI:
         self.vehicle_next_index = 0
         self.depot_choice_widgets = []
         self.traffic_zone_listbox = None
+        self.center_zone_listbox = None
+        self.center_zone_priority_vars = {}
+        self.center_zone_restricted_vars = {}
 
         self._build_ui()
 
@@ -259,6 +262,15 @@ class ConfigGUI:
             return
 
         var.set(text.strip())
+
+    def _paste_to_text_widget(self, widget):
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showinfo("Няма текст", "Clipboard-ът е празен.")
+            return
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text.strip())
 
     def _add_field(self, parent, row, key, label, value, field_type="str", options=None, tooltip=""):
         parent.columnconfigure(1, weight=1)
@@ -940,12 +952,36 @@ locations.*:
             f"{radius:g} км | +{delay_percent}%{status}"
         )
 
+    def _center_zone_display_label(self, zone):
+        mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+        if mode == "polygon":
+            polygon = getattr(zone, "polygon", []) or []
+            geometry = f"полигон {len(polygon)} точки"
+        else:
+            center = getattr(zone, "center_coords", (0, 0))
+            radius = float(getattr(zone, "radius_km", 0) or 0)
+            geometry = f"кръг {float(center[0]):.5f}, {float(center[1]):.5f} | {radius:g} км"
+        priority = ", ".join(getattr(zone, "priority_vehicle_types", []) or []) or "-"
+        restricted = ", ".join(getattr(zone, "restricted_vehicle_types", []) or []) or "-"
+        status = "" if getattr(zone, "enabled", True) else " (изключена)"
+        return (
+            f"{getattr(zone, 'name', 'Център зона')}: {geometry} | "
+            f"приоритет: {priority} | глоба: {restricted}{status}"
+        )
+
     def _next_traffic_zone_name(self, zones):
         used = {getattr(zone, "name", "") for zone in zones}
         index = len(zones) + 1
         while f"Трафик зона {index}" in used:
             index += 1
         return f"Трафик зона {index}"
+
+    def _next_center_zone_name(self, zones):
+        used = {getattr(zone, "name", "") for zone in zones}
+        index = len(zones) + 1
+        while f"Център зона {index}" in used:
+            index += 1
+        return f"Център зона {index}"
 
     def _sync_traffic_zone_widgets(self, zones):
         zones_text = self._format_traffic_zones_text(zones)
@@ -959,6 +995,18 @@ locations.*:
             for zone in zones:
                 self.traffic_zone_listbox.insert("end", self._traffic_zone_display_label(zone))
 
+    def _sync_center_zone_widgets(self, zones):
+        zones_text = self._format_center_zones_text(zones)
+        zones_widget = self.widgets.get("locations.center_zones")
+        if isinstance(zones_widget, tk.Text):
+            zones_widget.delete("1.0", "end")
+            zones_widget.insert("1.0", zones_text)
+
+        if self.center_zone_listbox is not None:
+            self.center_zone_listbox.delete(0, "end")
+            for zone in zones:
+                self.center_zone_listbox.insert("end", self._center_zone_display_label(zone))
+
     def _parse_coords_text(self, raw):
         parts = [part.strip() for part in str(raw or "").replace(";", ",").split(",")]
         if len(parts) != 2:
@@ -967,6 +1015,15 @@ locations.*:
             return (float(parts[0]), float(parts[1]))
         except ValueError:
             return None
+
+    def _parse_polygon_points_text(self, raw):
+        points = []
+        text = str(raw or "").replace(";", "\n")
+        for line in text.splitlines():
+            coords = self._parse_coords_text(line)
+            if coords is not None:
+                points.append(coords)
+        return points
 
     def _append_depot_from_fields(self):
         name_widget = self.widgets.get("locations.new_depot_name")
@@ -1037,6 +1094,94 @@ locations.*:
         coords_widget.set("")
         self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
 
+    def _append_center_zone_from_fields(self):
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        penalty_widget = self.widgets.get("locations.new_center_zone_penalty")
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not all((name_widget, mode_widget, coords_widget, radius_widget, discount_widget, outside_widget, penalty_widget)):
+            return
+        if not isinstance(zones_widget, tk.Text):
+            return
+
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        name = name_widget.get().strip() or self._next_center_zone_name(zones)
+        mode = str(mode_widget.get() or "circle").strip().lower()
+        if mode not in ("circle", "polygon"):
+            mode = "circle"
+
+        try:
+            radius = float(radius_widget.get() or 0)
+            discount = float(discount_widget.get() or 0.9)
+            outside_penalty = float(outside_widget.get() or 0)
+            penalty = float(penalty_widget.get() or 0)
+        except ValueError:
+            messagebox.showwarning("Грешна център зона", "Радиусът, отстъпката и глобите трябва да са числа.")
+            return
+
+        raw_coords = (
+            coords_widget.get("1.0", "end-1c")
+            if isinstance(coords_widget, tk.Text)
+            else coords_widget.get()
+        )
+        polygon = []
+        if mode == "polygon":
+            polygon = self._parse_polygon_points_text(raw_coords)
+            if len(polygon) < 3:
+                messagebox.showwarning("Грешен полигон", "За polygon въведи поне 3 точки. Може всяка точка на нов ред.")
+                return
+            center_coords = polygon[0]
+            radius = 0.0
+        else:
+            center_coords = self._parse_coords_text(raw_coords)
+            if center_coords is None:
+                messagebox.showwarning("Грешни координати", "Въведи координати във формат lat, lon.")
+                return
+            if radius <= 0:
+                messagebox.showwarning("Грешен радиус", "Радиусът трябва да е по-голям от 0.")
+                return
+
+        priority_types = [
+            vehicle_type
+            for vehicle_type, var in self.center_zone_priority_vars.items()
+            if var.get()
+        ]
+        restricted_types = [
+            vehicle_type
+            for vehicle_type, var in self.center_zone_restricted_vars.items()
+            if var.get()
+        ]
+        if not priority_types and not restricted_types:
+            messagebox.showwarning("Няма правила", "Избери поне един тип бус за приоритет или глоба.")
+            return
+
+        zones.append(
+            config.CenterZoneConfig(
+                name=name,
+                mode=mode,
+                center_coords=center_coords,
+                radius_km=radius,
+                polygon=polygon,
+                enabled=True,
+                priority_vehicle_types=priority_types,
+                restricted_vehicle_types=restricted_types,
+                discount_priority_vehicle=discount,
+                priority_vehicle_outside_penalty=outside_penalty,
+                vehicle_penalties={vehicle_type: penalty for vehicle_type in restricted_types},
+            )
+        )
+        self._sync_center_zone_widgets(zones)
+        name_widget.set("")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+        else:
+            coords_widget.set("")
+        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+
     def _remove_selected_traffic_zone(self):
         zones_widget = self.widgets.get("locations.traffic_zones")
         if not isinstance(zones_widget, tk.Text) or self.traffic_zone_listbox is None:
@@ -1052,6 +1197,23 @@ locations.*:
             return
         removed = zones.pop(index)
         self._sync_traffic_zone_widgets(zones)
+        self.status_var.set(f"Премахната е {removed.name}. Натисни Запази, за да се махне от config.py.")
+
+    def _remove_selected_center_zone(self):
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not isinstance(zones_widget, tk.Text) or self.center_zone_listbox is None:
+            return
+        selection = self.center_zone_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Няма избрана зона", "Избери център зона от списъка.")
+            return
+
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        index = selection[0]
+        if index >= len(zones):
+            return
+        removed = zones.pop(index)
+        self._sync_center_zone_widgets(zones)
         self.status_var.set(f"Премахната е {removed.name}. Натисни Запази, за да се махне от config.py.")
 
     def _add_depot_choice_field(self, parent, row, key, label, value, options, tooltip=""):
@@ -2700,6 +2862,126 @@ setData не трябва да се пуска:
 
     # ── Tab: Локации ─────────────────────────────────────────
 
+    def _add_center_zones_editor(self, parent, row, loc):
+        box = ttk.LabelFrame(parent, text="Допълнителни център зони", padding=(14, 12))
+        box.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(6, 14))
+        box.columnconfigure(0, weight=0)
+        box.columnconfigure(1, weight=1)
+        box.columnconfigure(2, weight=0)
+        box.columnconfigure(3, weight=0)
+
+        ttk.Label(
+            box,
+            text=(
+                "Добави отделна център зона. Избери кои бусове са приоритетни за нея "
+                "и кои бусове да получават глоба, ако влязат вътре."
+            ),
+            style="Hint.TLabel",
+            wraplength=900,
+        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+
+        ttk.Label(box, text="Име:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        name_var = tk.StringVar(value="")
+        name_entry = ttk.Entry(box, textvariable=name_var, width=34)
+        name_entry.grid(row=1, column=1, sticky="we", padx=(0, 8), pady=6)
+        self._bind_text_editing(name_entry)
+        self.widgets["locations.new_center_zone_name"] = name_var
+        ttk.Label(box, text="Празно = автоматично име.", style="Hint.TLabel").grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Label(box, text="Тип:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        mode_var = tk.StringVar(value="circle")
+        mode_combo = ttk.Combobox(box, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
+        mode_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        self.widgets["locations.new_center_zone_mode"] = mode_var
+
+        ttk.Label(box, text="Координати:", style="Surface.TLabel").grid(row=3, column=0, sticky="nw", padx=(8, 8), pady=6)
+        coords_text = tk.Text(box, height=3, width=54, font=("Segoe UI", 9), wrap="none")
+        coords_text.grid(row=3, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        self._bind_text_editing(coords_text)
+        self._bind_text_scrolling(coords_text)
+        self.widgets["locations.new_center_zone_coords"] = coords_text
+        ttk.Button(box, text="Постави", command=lambda: self._paste_to_text_widget(coords_text)).grid(
+            row=3, column=3, sticky="nw", padx=(0, 8), pady=6
+        )
+        ttk.Label(
+            box,
+            text="За circle: 42.6977, 23.3219. За polygon: постави точки на нов ред или разделени с ;",
+            style="Hint.TLabel",
+            wraplength=850,
+        ).grid(row=4, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(0, 6))
+
+        ttk.Label(box, text="Радиус:", style="Surface.TLabel").grid(row=5, column=0, sticky="w", padx=(8, 8), pady=6)
+        radius_var = tk.StringVar(value="1.5")
+        radius_combo = ttk.Combobox(box, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
+        radius_combo.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(radius_combo)
+        self.widgets["locations.new_center_zone_radius"] = radius_var
+        ttk.Label(box, text="км; при polygon не се използва", style="Hint.TLabel").grid(row=5, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        rules = ttk.Frame(box, style="Surface.TFrame")
+        rules.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(8, 6))
+        ttk.Label(rules, text="Тип бус", style="Surface.TLabel", width=18).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 4))
+        ttk.Label(rules, text="Приоритет в зоната", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
+        ttk.Label(rules, text="Глоба в зоната", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
+        vehicle_labels = [
+            ("center_bus", "Център бус"),
+            ("internal_bus", "Вътрешен бус"),
+            ("external_bus", "Външен бус"),
+            ("special_bus", "Специален бус"),
+            ("vratza_bus", "Враца бус"),
+        ]
+        self.center_zone_priority_vars = {}
+        self.center_zone_restricted_vars = {}
+        for idx, (vehicle_type, label) in enumerate(vehicle_labels, start=1):
+            ttk.Label(rules, text=label, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", padx=(0, 12), pady=2)
+            priority_var = tk.BooleanVar(value=(vehicle_type == "center_bus"))
+            restricted_var = tk.BooleanVar(value=(vehicle_type != "center_bus"))
+            ttk.Checkbutton(rules, variable=priority_var).grid(row=idx, column=1, sticky="w", padx=(0, 22), pady=2)
+            ttk.Checkbutton(rules, variable=restricted_var).grid(row=idx, column=2, sticky="w", padx=(0, 8), pady=2)
+            self.center_zone_priority_vars[vehicle_type] = priority_var
+            self.center_zone_restricted_vars[vehicle_type] = restricted_var
+
+        ttk.Label(box, text="Отстъпка:", style="Surface.TLabel").grid(row=7, column=0, sticky="w", padx=(8, 8), pady=6)
+        discount_var = tk.StringVar(value="0.9")
+        discount_combo = ttk.Combobox(box, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
+        discount_combo.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(discount_combo)
+        self.widgets["locations.new_center_zone_discount"] = discount_var
+        ttk.Label(box, text="0.9 = 10% по-ниска цена за приоритетен бус.", style="Hint.TLabel").grid(row=7, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Label(box, text="Глоба навън:", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(8, 8), pady=6)
+        outside_var = tk.StringVar(value="0")
+        outside_entry = ttk.Entry(box, textvariable=outside_var, width=12)
+        outside_entry.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(outside_entry)
+        self.widgets["locations.new_center_zone_outside_penalty"] = outside_var
+
+        ttk.Label(box, text="Глоба вътре:", style="Surface.TLabel").grid(row=9, column=0, sticky="w", padx=(8, 8), pady=6)
+        default_penalty = float(getattr(loc, "internal_bus_center_penalty", 40000.0) or 40000.0)
+        penalty_var = tk.StringVar(value=f"{default_penalty:g}")
+        penalty_entry = ttk.Entry(box, textvariable=penalty_var, width=12)
+        penalty_entry.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(penalty_entry)
+        self.widgets["locations.new_center_zone_penalty"] = penalty_var
+        ttk.Label(box, text="Прилага се на всички маркирани в колоната 'Глоба в зоната'.", style="Hint.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Button(box, text="Добави център зона", command=self._append_center_zone_from_fields).grid(
+            row=10, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
+        )
+        ttk.Button(box, text="Премахни избраната", command=self._remove_selected_center_zone).grid(
+            row=10, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
+        )
+
+        ttk.Label(box, text="Добавени център зони:", style="Surface.TLabel").grid(
+            row=11, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4)
+        )
+        self.center_zone_listbox = tk.Listbox(box, height=5, font=("Segoe UI", 9), exportselection=False)
+        self.center_zone_listbox.grid(row=12, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
+
+        hidden_zones = tk.Text(box, width=1, height=1)
+        self.widgets["locations.center_zones"] = hidden_zones
+        self._sync_center_zone_widgets(getattr(loc, "center_zones", []) or [])
+
     def _add_locations_tab(self, nb):
         tab = ttk.Frame(nb)
         nb.add(tab, text=" 📍 Локации ")
@@ -2763,18 +3045,7 @@ setData не трябва да се пуска:
                          tooltip="0.5 = плаща 50% от разстоянието"); gr += 1
         self._add_field(center_zone, gr, "locations.center_bus_outside_center_penalty", "Глоба CENTER_BUS навън:", getattr(loc, "center_bus_outside_center_penalty", 50000.0),
                          tooltip="Добавя се към цената, когато CENTER_BUS обслужва клиент извън център зоната."); gr += 1
-        self._add_list_field(
-            center_zone,
-            gr,
-            "locations.center_zones",
-            "Доп. център зони:",
-            self._format_center_zones_text(getattr(loc, "center_zones", []) or {}).splitlines(),
-            tooltip=(
-                "Една зона на ред. Формат: Име: circle | lat, lon | радиус | приоритетни бусове | "
-                "ограничени бусове | enabled | discount | outside_penalty | bus=penalty. "
-                "За polygon: Име: polygon | lat, lon; lat, lon; lat, lon | | center_bus | internal_bus,external_bus | true | 0.9 | 0 | internal_bus=40000."
-            ),
-        ); gr += 1
+        self._add_center_zones_editor(center_zone, gr, loc); gr += 1
 
         center_penalties, gr = self._add_grid_group(
             f,
