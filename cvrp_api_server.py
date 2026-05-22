@@ -122,8 +122,20 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "json_sklad": ("input", "json_sklad"),
     "done_flag": ("input", "json_done_flag"),
     "json_done_flag": ("input", "json_done_flag"),
+    "json_delivery_comment_field": ("input", "json_delivery_comment_field"),
+    "delivery_comment_field": ("input", "json_delivery_comment_field"),
+    "enable_customer_document_grouping": ("input", "enable_customer_document_grouping"),
+    "group_customer_documents": ("input", "enable_customer_document_grouping"),
     "map_output_file": ("output", "map_output_file"),
     "routes_output_dir": ("output", "routes_output_dir"),
+    "route_maps_upload_mode": ("output", "route_maps_upload_mode"),
+    "route_maps_upload_url": ("output", "route_maps_upload_url"),
+    "route_maps_upload_token": ("output", "route_maps_upload_token"),
+    "route_maps_upload_token_field": ("output", "route_maps_upload_token_field"),
+    "route_maps_upload_file_field": ("output", "route_maps_upload_file_field"),
+    "route_maps_upload_timeout": ("output", "route_maps_upload_timeout_seconds"),
+    "route_maps_upload_timeout_seconds": ("output", "route_maps_upload_timeout_seconds"),
+    "upload_route_maps": ("output", "route_maps_upload_mode"),
     "excel_output_dir": ("output", "excel_output_dir"),
     "csv_output_file": ("output", "csv_output_file"),
     "charts_output_dir": ("output", "charts_output_dir"),
@@ -183,8 +195,20 @@ _QUERY_SETTING_ALIASES = {
     "json_sklad": "json_sklad",
     "done_flag": "done_flag",
     "json_done_flag": "json_done_flag",
+    "json_delivery_comment_field": "json_delivery_comment_field",
+    "delivery_comment_field": "delivery_comment_field",
+    "enable_customer_document_grouping": "enable_customer_document_grouping",
+    "group_customer_documents": "group_customer_documents",
     "map_output_file": "map_output_file",
     "routes_output_dir": "routes_output_dir",
+    "route_maps_upload_mode": "route_maps_upload_mode",
+    "route_maps_upload_url": "route_maps_upload_url",
+    "route_maps_upload_token": "route_maps_upload_token",
+    "route_maps_upload_token_field": "route_maps_upload_token_field",
+    "route_maps_upload_file_field": "route_maps_upload_file_field",
+    "route_maps_upload_timeout": "route_maps_upload_timeout",
+    "route_maps_upload_timeout_seconds": "route_maps_upload_timeout_seconds",
+    "upload_route_maps": "upload_route_maps",
     "excel_output_dir": "excel_output_dir",
     "csv_output_file": "csv_output_file",
     "charts_output_dir": "charts_output_dir",
@@ -352,6 +376,7 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
             "query_examples": [
                 f"{public_url}{trigger_endpoint}?solver=pyvrp&objective=time&time_limit=180",
                 f"{public_url}{trigger_endpoint}?output.enable_excel_output=true&set_data.enable_set_data_upload=false",
+                f"{public_url}{trigger_endpoint}?route_maps_upload_mode=effect_upload",
                 f"{public_url}{trigger_endpoint}?callback_url=https://example.com/cvrp-finished",
             ],
         },
@@ -369,6 +394,9 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
                     "output": {
                         "enable_excel_output": True,
                         "excel_output_dir": r"H:\Hell_Bizant_files\Bizant_with_vratza",
+                        "route_maps_upload_mode": "effect_upload",
+                        "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
+                        "route_maps_upload_token": "Effect-Bizante-Token",
                     },
                     "vehicles": [
                         {
@@ -397,7 +425,8 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
                         "CustName": "Клиент",
                         "GPS": "42.6977,23.3219",
                         "Volume": 10,
-                        "WorkTime": "08:00 - 16:00",
+                        "WorkTime": "08:00-13:00",
+                        "DeliveryComment": "Обади се 10 мин преди доставка",
                     }
                 ],
             },
@@ -612,6 +641,15 @@ def _coerce_setting_value(section_name: str, field_name: str, value: Any, curren
         return _parse_routing_engine(value)
     if section_name == "vehicles" and field_name == "vehicle_type":
         return _parse_vehicle_type(value)
+    if section_name == "output" and field_name == "route_maps_upload_mode":
+        if isinstance(value, bool):
+            return "effect_upload" if value else "disabled"
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "enabled"}:
+            return "effect_upload"
+        if text in {"0", "false", "no", "off", "none"}:
+            return "disabled"
+        return text or "disabled"
     if field_name in {"start_location", "end_location", "tsp_depot_location", "depot_location", "center_location", "vratza_depot_location", "city_center_coords", "center_coords"}:
         return _parse_coords(value)
     if field_name == "center_zone_polygon":

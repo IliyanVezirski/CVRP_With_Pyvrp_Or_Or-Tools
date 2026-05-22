@@ -376,7 +376,7 @@ def calculate_customer_drop_penalties(
 @dataclass
 class RoutingConfig:
     """Конфигурация за избор на routing engine."""
-    engine: RoutingEngine = RoutingEngine.VALHALLA # Кой routing engine да се използва: OSRM или VALHALLA
+    engine: RoutingEngine = RoutingEngine.OSRM # Кой routing engine да се използва: OSRM или VALHALLA
     # Ако е VALHALLA и enable_time_dependent е True, ще се използва time-dependent routing
     enable_time_dependent: bool = False  # Дали да се използва time-dependent routing (само за Valhalla)
     departure_time: str = "08:00"  # Час на тръгване (HH:MM) за time-dependent routing
@@ -446,9 +446,8 @@ class InputConfig:
     json_plas_doc_field: str = "IdPlasDoc"  # Име на JSON полето за IdPlasDoc, което се връща към setData.
     json_id_skld_field: str = "IdSkld"  # Име на JSON полето с оригиналния склад на заявката.
     json_time_window_field: str = "WorkTime"  # Име на JSON полето с работно време във формат "08:00 - 16:00".
-    json_time_window_start_field: str = "WorkFrom"  # Име на JSON полето за начало на работното време на клиента.
-    json_time_window_end_field: str = "WorkTo"  # Име на JSON полето за край на работното време на клиента.
-    json_override_date: str = "19/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
+    json_delivery_comment_field: str = "DeliveryComment"  # Име на JSON полето с коментар/инструкция за доставката.
+    json_override_date: str = "21/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
     gps_column: str = "GPS"         # Име на колоната с GPS координатите на клиентите.
     client_id_column: str = "IdCust"      # Име на колоната с ID на клиента.
@@ -456,8 +455,8 @@ class InputConfig:
     volume_column: str = "Брой стекове"           # Име на колоната с обема/теглото на заявката.
     document_column: str = "Документ"  # Име на колоната с номер на документа/поръчката.
     time_window_column: str = "Работно време"  # Excel колона с работно време във формат "08:00 - 16:00".
-    time_window_start_column: str = "Работи от"  # Excel колона за начало на работното време на клиента.
-    time_window_end_column: str = "Работи до"  # Excel колона за край на работното време на клиента.
+    delivery_comment_column: str = "Коментар доставка"  # Excel колона с коментар/инструкция за доставката.
+    enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
 
@@ -465,11 +464,11 @@ class InputConfig:
 @dataclass
 class WarehouseConfig:
     """Конфигурации за логиката на склада, който обработва част от заявките предварително."""
-    enable_warehouse: bool = True      # Дали да се използва логиката за предварително отделяне на заявки за склада
+    enable_warehouse: bool = False      # Дали да се използва логиката за предварително отделяне на заявки за склада
     sort_by_volume: bool = True        # Дали заявките да се сортират по обем (от най-малък към най-голям) преди обработка
     sort_by_distance: bool = True      # Дали да се сортират по разстояние за клиенти с еднакъв обем (от най-далечен към най-близък)
     check_max_bus_capacity: bool = True # Проверява дали клиент надвишава капацитета на най-големия наличен бус
-    max_bus_customer_volume: float = 160.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
+    max_bus_customer_volume: float = 20000.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
     capacity_toleranse: float = 1.0 # Толеранс на капацитета на превозните средства.
 @dataclass
 class CVRPConfig:
@@ -482,7 +481,7 @@ class CVRPConfig:
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 300
+    time_limit_seconds: int = 480
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
 
     objective_metric: str = "time"
@@ -532,7 +531,7 @@ class CVRPConfig:
     min_customer_drop_penalty: int = 45000
     max_customer_drop_penalty: int = 500000
 
-    enable_parallel_solving: bool = True  # Keep disabled for PyVRP stability
+    enable_parallel_solving: bool = False  # Keep disabled for PyVRP stability
     # Описание: Дали да се стартират няколко solver-а паралелно с различни стратегии.
     
     # --- Режим на solver-а ---
@@ -555,7 +554,7 @@ class CVRPConfig:
     # Описание: Глобално стартово време в минути от 00:00 (8:00 = 480 минути).
     # Използва се ако не е зададено стартово време за конкретен тип превозно средство.
 
-    enable_customer_time_windows: bool = False
+    enable_customer_time_windows: bool = True
     # Описание: Дали solver-ите да спазват работно време на клиентите.
 
     customer_time_window_default_start_minutes: int = 0
@@ -567,7 +566,7 @@ class CVRPConfig:
     num_workers: int = -1
     # Описание: Брой паралелни процеси. -1 означава да се използват всички ядра без едно.
 
-    pyvrp_seed_base: int = 42
+    pyvrp_seed_base: int = 1
     # Описание: Seed за PyVRP, когато pyvrp_seed е None. В паралелен режим worker-ите използват pyvrp_seed_base, pyvrp_seed_base+1...
     pyvrp_seed: Optional[int] = None
     # Описание: Ако е зададен, single mode използва точно този seed. В паралелен режим worker-ите използват pyvrp_seed, pyvrp_seed+1...
@@ -618,6 +617,12 @@ class OutputConfig:
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
     routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
+    route_maps_upload_mode: str = "effect_upload" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
+    route_maps_upload_url: str = "https://effect.bg/dragon/hellbizante/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
+    route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
+    route_maps_upload_token: str = "Effect-Bizante-Token" # Token стойност за upload endpoint-а.
+    route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
+    route_maps_upload_timeout_seconds: int = 60 # Таймаут за качване на route HTML файловете.
     map_provider: str = "osm" # Кой визуален слой да се използва: "google" или "osm".
     folium_tiles: str = "Esri.WorldStreetMap" # Фонов слой за Folium/OpenStreetMap режим. Не използва официалния OSM tile сървър.
     google_maps_api_key: str = os.environ.get("GOOGLE_MAPS_API_KEY", "") # Google Maps JavaScript API key за визуализация.
@@ -760,8 +765,8 @@ class MainConfig:
         return [
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
-                capacity=385,
-                count=6,
+                capacity=6000,
+                count=11,
                 name="Маршрут",
                 fixed_cost=0,
                 max_distance_km=None,
@@ -776,7 +781,7 @@ class MainConfig:
             ),
             VehicleConfig(
                 vehicle_type=VehicleType.CENTER_BUS,
-                capacity=320,
+                capacity=6000,
                 count=1,
                 name="Център",
                 fixed_cost=0,
@@ -799,7 +804,7 @@ class MainConfig:
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=8,
-                enabled=True,
+                enabled=False,
                 max_customers_per_route=None,
                 start_location=(42.695785029219415, 23.23165887245312),
                 start_time_minutes=450,
@@ -831,7 +836,7 @@ class MainConfig:
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=8,
-                enabled=True,
+                enabled=False,
                 max_customers_per_route=None,
                 start_location=(43.221042895146915, 23.5344026186417),
                 start_time_minutes=480,

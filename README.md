@@ -18,7 +18,7 @@
 - Поддържа център зона като кръг или начертан полигон през GUI.
 - Позволява при нужда solver-ът да пропуска заявки, като приоритетно по-лесни за пропускане са големи и близки до депото заявки.
 - Генерира обща HTML карта, отделни HTML карти за всеки маршрут, Excel отчет, CSV файл и графики.
-- В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане/тръгване, popup с обем и бутон за навигация.
+- В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане, popup с обем и бутон за навигация.
 - В общата карта има GPS търсачка за временни пинове по координати, с име и обем, ако са подадени.
 - Показва посока на движение по маршрутите с разредени стрелки.
 - Добавя дата на стартиране към имената на общата карта, Excel файловете и отделните route карти. CSV файлът остава без дата.
@@ -151,6 +151,8 @@ GPS стойностите се очакват като latitude/longitude, на
 ```
 
 HTTP JSON режимът поддържа URL с дата, декодиране на `utf-8`, `windows-1251`, `latin-1` и mapping на полетата в `InputConfig`.
+
+Ако един и същ клиентски номер (`IdCust`) идва повече от веднъж със същите GPS координати, програмата по подразбиране групира тези редове като едно посещение. Обемът се събира, solver-ът вижда един стоп, а оригиналните документи се пазят за отчетите и `setData`. Това може да се изключи от GUI: `Входни данни -> Групирай документи`, или през API/settings с `input.enable_customer_document_grouping=false`.
 
 ## Бусове, депа и сервизно време
 
@@ -340,7 +342,7 @@ CSV файлът не се променя по име, за да остане с
 - разредени стрелки за посока на движение;
 - popup-и с информация за клиенти;
 - Google Maps navigation link.
-- очакван час на пристигане и тръгване при клиентите, изчислен от същата матрица и service time, които ползва solver-ът.
+- очакван час на пристигане при клиентите, изчислен от същата матрица и service time, които ползва solver-ът.
 - GPS търсачка в общата карта за ръчно поставяне на един или много пинове.
 
 В отделните route карти има сгъваем списък:
@@ -435,9 +437,13 @@ http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&Don
 - `IdDoc`
 - `IdPlasDoc`
 - `IdSkld`
+- `WorkTime` във формат `08:00-13:00` или `08:00 - 16:00`
+- `DeliveryComment` за коментар/инструкция към доставката
 - `DoneFlag`
 
 `IdPlasDoc` се пази за връщане към `setData`, а `IdSkld` се пази като оригинален склад на клиента и се използва при необслужени клиенти.
+Ако `WorkTime` е подадено на два реда, например `08:00-13:00` и `16:00-18:00`, програмата използва първия прозорец, защото solver-ите работят с един прозорец на клиент. Работното време и коментарът се виждат в индивидуалните route карти; клиентите с работно време са оцветени леко в червено в списъка.
+При няколко документа за един и същ `IdCust` и същ GPS, настройката `enable_customer_document_grouping` определя поведението. Включена стойност означава едно посещение със сборен обем и отделни `setData` заявки за всеки `IdPlasDoc`. Изключена стойност означава всеки документ да остане отделен стоп.
 
 ### API сървър
 
@@ -466,7 +472,7 @@ cmd=start_program
 Пример:
 
 ```cmd
-curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\"}]}"
+curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
 curl "http://10.10.100.134:8088/run"
 ```
 
@@ -533,11 +539,13 @@ Build-ът включва основната програма, Settings GUI, API
 - Всеки бус може да има отделна начална и крайна GPS точка. Ако крайна точка не е зададена, маршрутът завършва в стартовото депо.
 - Могат да се добавят допълнителни депа и трафик зони през опростени GUI полета.
 - Работно време на клиентите може да се чете от Excel/JSON и да се включва или изключва от GUI.
+- Клиенти с няколко документа могат да се групират по `IdCust + GPS` в един стоп; настройката може да се изключи от GUI или API.
 - API режимът поддържа `/run`, `/solve`, callback URL, JSON резултат и временни настройки само за конкретната заявка.
 - През API могат да се подават бусове, депа, трафик зони, OSRM настройки, solver настройки, output пътища и `setData` настройки.
 - `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
 - Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
 - `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
+- Индивидуалните route HTML карти по подразбиране се качват към `https://effect.bg/dragon/hellbizante/upload-files.php` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
 - OR-Tools използва предварително сметнати vehicle cost матрици за по-малко Python callback overhead.
 - PyVRP компресира еднаквите профили, без да губи различните депа на бусовете.
 - При Excel вход Враца бусовете не се изключват автоматично само защото липсва `IdSkld`; тази автоматична филтрация важи само за HTTP JSON вход.
@@ -545,7 +553,7 @@ Build-ът включва основната програма, Settings GUI, API
 ### Пример `/run` с настройки
 
 ```powershell
-curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\"}}}"
+curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
 ```
 
 ### Пример vehicle с крайна точка

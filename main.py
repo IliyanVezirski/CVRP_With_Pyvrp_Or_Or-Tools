@@ -540,6 +540,7 @@ def _solution_to_api_response(
             "index": entry.get("index"),
             "customer_id": getattr(customer, "id", entry.get("customer_id", "")),
             "customer_name": getattr(customer, "name", entry.get("customer_name", "")),
+            "delivery_comment": getattr(customer, "delivery_comment", ""),
             "previous_stop_name": entry.get("previous_stop_name", ""),
             "distance_from_previous_km": round(float(entry.get("distance_from_previous", 0) or 0), 2),
             "cumulative_distance_km": round(float(entry.get("cumulative_distance", 0) or 0), 2),
@@ -589,6 +590,10 @@ def _solution_to_api_response(
                         "document": customer.document,
                         "plas_doc": getattr(customer, "plas_doc", ""),
                         "source_id_skld": getattr(customer, "source_id_skld", ""),
+                        "delivery_comment": getattr(customer, "delivery_comment", ""),
+                        "time_window_start_minutes": getattr(customer, "time_window_start_minutes", None),
+                        "time_window_end_minutes": getattr(customer, "time_window_end_minutes", None),
+                        "grouped_documents": getattr(customer, "grouped_documents", []),
                     }
                     for customer in route.customers
                 ],
@@ -603,6 +608,10 @@ def _solution_to_api_response(
                 "document": customer.document,
                 "plas_doc": getattr(customer, "plas_doc", ""),
                 "source_id_skld": getattr(customer, "source_id_skld", ""),
+                "delivery_comment": getattr(customer, "delivery_comment", ""),
+                "time_window_start_minutes": getattr(customer, "time_window_start_minutes", None),
+                "time_window_end_minutes": getattr(customer, "time_window_end_minutes", None),
+                "grouped_documents": getattr(customer, "grouped_documents", []),
             }
             for customer in solution.dropped_customers
         ],

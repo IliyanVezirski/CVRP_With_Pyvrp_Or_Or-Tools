@@ -425,8 +425,9 @@ osrm_chunk_size                       -> osrm.chunk_size
 date / json_override_date             -> input.json_override_date
 sklad / json_sklad                    -> input.json_sklad
 done_flag / json_done_flag            -> input.json_done_flag
+group_customer_documents              -> input.enable_customer_document_grouping
                 """,
-                16,
+                17,
             ),
             (
                 "Solver настройки:",
@@ -490,14 +491,15 @@ input.json_sklad                       складове, напр. 106,128
 input.json_done_flag                   DoneFlag
 input.json_override_date               дата DD/MM/YYYY
 input.json_timeout_seconds             timeout
+input.enable_customer_document_grouping групира един клиент/GPS с няколко документа в един стоп
 
 JSON mapping:
 input.json_gps_field, input.json_client_id_field, input.json_client_name_field
 input.json_volume_field, input.json_document_field, input.json_plas_doc_field
 input.json_id_skld_field, input.json_time_window_field
-input.json_time_window_start_field, input.json_time_window_end_field
+input.json_delivery_comment_field
                 """,
-                19,
+                21,
             ),
             (
                 "Изходни файлове:",
@@ -505,6 +507,12 @@ input.json_time_window_start_field, input.json_time_window_end_field
 output.enable_interactive_map           генерира основна HTML карта
 output.map_output_file                  път до interactive_map.html
 output.routes_output_dir                папка за HTML маршрутите
+output.route_maps_upload_mode           disabled, legacy или effect_upload
+output.route_maps_upload_url            URL за качване на индивидуалните HTML карти
+output.route_maps_upload_token_field    име на token POST поле, обикновено pData
+output.route_maps_upload_token          token стойност за upload endpoint-а
+output.route_maps_upload_file_field     multipart поле, обикновено files[]
+output.route_maps_upload_timeout_seconds timeout за качване
 output.map_provider                     osm или google
 output.folium_tiles                     слой за OSM/Folium
 output.google_maps_api_key              Google Maps key
@@ -1175,6 +1183,11 @@ locations.*:
   4. Пускай POST /run, ако програмата сама зарежда клиентите от input_source.
   5. Подай settings за бусове, депа, зони, output и setData в същия JSON.
 
+Ако един клиент има няколко документа:
+  По подразбиране програмата групира редове със същия IdCust и същия GPS в един стоп.
+  Обемът се събира, solver-ът посещава клиента веднъж, а setData връща отделна заявка за всеки оригинален документ.
+  Изключва се от Входни данни -> Групирай документи или през API с input.enable_customer_document_grouping=false.
+
 Ако търсиш защо резултатът е лош:
   1. Провери дали депата са правилни.
   2. Провери OSRM матрицата.
@@ -1185,7 +1198,7 @@ locations.*:
 Правило:
   Не започвай с фините solver настройки, ако има съмнение в данните, депата или матрицата.
                 """,
-                28,
+                33,
             ),
             (
                 "Карта на GUI-то",
@@ -1455,8 +1468,12 @@ JSON/Excel field mapping:
 
 Работно време:
   WorkTime: "08:00 - 16:00"
-  WorkFrom + WorkTo също се поддържат.
+  Поддържа и "08:00-13:00". Ако са подадени два реда, напр. 08:00-13:00 и 16:00-18:00,
+  програмата използва първия прозорец, защото solver-ите са настроени за един прозорец на клиент.
   Ако липсва, клиентът се приема постоянно отворен.
+
+Коментар доставка:
+  DeliveryComment / DeliveryNote / Comment се запазва към клиента и се показва в route картите и отчетите.
 
 Клиент без GPS:
   Не се дава на solver-а, защото би разместил matrix indices.
@@ -1722,6 +1739,14 @@ HTML карти:
     Файл за общата карта.
   routes_output_dir:
     Папка за отделни route HTML файлове.
+  route_maps_upload_mode:
+    disabled = не качва, legacy = старото поведение, effect_upload = качва HTML маршрутите към upload endpoint.
+  route_maps_upload_url:
+    URL за качване, напр. https://effect.bg/dragon/hellbizante/upload-files.php
+  route_maps_upload_token:
+    Token за pData. За Effect endpoint-а е Effect-Bizante-Token.
+  route_maps_upload_file_field:
+    Обикновено files[], за да стигне до PHP като $_FILES['files'].
   map_provider:
     osm или google.
   google_maps_api_key:
@@ -1955,7 +1980,7 @@ POST /solve с клиенти, настройки, депа, бусове, outpu
     }
   },
   "customers": [
-    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00 - 16:00" }
+    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00-13:00", "DeliveryComment": "Обади се 10 мин преди доставка" }
   ]
 }
                 """,
@@ -2073,6 +2098,8 @@ setData не трябва да се пуска:
                          tooltip="http_json = зарежда от Bizant/API. excel = зарежда от файл."); gr += 1
         self._add_field(source, gr, "input.excel_file_path", "Excel файл:", inp.excel_file_path,
                         tooltip="Използва се само когато активният източник е excel."); gr += 1
+        self._add_field(source, gr, "input.enable_customer_document_grouping", "Групирай документи:", getattr(inp, "enable_customer_document_grouping", True), "bool",
+                        tooltip="Ако един и същ клиент/GPS има няколко документа, solver-ът го посещава веднъж със сборен обем. Изключи, ако искаш всеки документ да е отделен стоп."); gr += 1
 
         http, gr = self._add_grid_group(
             f,
@@ -2108,10 +2135,8 @@ setData не трябва да се пуска:
         self._add_field(json_fields, gr, "input.json_id_skld_field", "IdSkld:", getattr(inp, "json_id_skld_field", "IdSkld")); gr += 1
         self._add_field(json_fields, gr, "input.json_time_window_field", "Работно време:", getattr(inp, "json_time_window_field", "WorkTime"),
                         tooltip="JSON поле за GET/POST отговор във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
-        self._add_field(json_fields, gr, "input.json_time_window_start_field", "Работи от:", getattr(inp, "json_time_window_start_field", "WorkFrom"),
-                        tooltip="Опционално старо поле само за начало. Използва се ако няма поле 'Работно време'."); gr += 1
-        self._add_field(json_fields, gr, "input.json_time_window_end_field", "Работи до:", getattr(inp, "json_time_window_end_field", "WorkTo"),
-                        tooltip="Опционално старо поле само за край. Използва се ако няма поле 'Работно време'."); gr += 1
+        self._add_field(json_fields, gr, "input.json_delivery_comment_field", "Коментар доставка:", getattr(inp, "json_delivery_comment_field", "DeliveryComment"),
+                        tooltip="JSON поле с коментар/инструкция към шофьора. Поддържат се и DeliveryNote, Comment, Note като fallback."); gr += 1
 
         excel_fields, gr = self._add_grid_group(
             f,
@@ -2126,10 +2151,8 @@ setData не трябва да се пуска:
         self._add_field(excel_fields, gr, "input.document_column", "Документ:", inp.document_column); gr += 1
         self._add_field(excel_fields, gr, "input.time_window_column", "Работно време:", getattr(inp, "time_window_column", "Работно време"),
                         tooltip="Excel колона във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
-        self._add_field(excel_fields, gr, "input.time_window_start_column", "Работи от:", getattr(inp, "time_window_start_column", "Работи от"),
-                        tooltip="Опционална стара колона само за начало. Използва се ако няма колона 'Работно време'."); gr += 1
-        self._add_field(excel_fields, gr, "input.time_window_end_column", "Работи до:", getattr(inp, "time_window_end_column", "Работи до"),
-                        tooltip="Опционална стара колона само за край. Използва се ако няма колона 'Работно време'."); gr += 1
+        self._add_field(excel_fields, gr, "input.delivery_comment_column", "Коментар доставка:", getattr(inp, "delivery_comment_column", "Коментар доставка"),
+                        tooltip="Excel колона с коментар/инструкция към шофьора."); gr += 1
 
     # ── Tab: Превозни средства ───────────────────────────────
 
@@ -2718,6 +2741,25 @@ setData не трябва да се пуска:
         self._add_field(maps, gr, "output.map_output_file", "Файл карта:", out.map_output_file); gr += 1
         self._add_field(maps, gr, "output.routes_output_dir", "HTML маршрути:", out.routes_output_dir,
                          tooltip="Отделни HTML файлове за всеки маршрут"); gr += 1
+        self._add_field(
+            maps,
+            gr,
+            "output.route_maps_upload_mode",
+            "Качване маршрути:",
+            getattr(out, "route_maps_upload_mode", "disabled"),
+            "combo",
+            ["disabled", "legacy", "effect_upload"],
+            tooltip="disabled = не качва. legacy = старото поведение. effect_upload = качва индивидуалните HTML карти към upload endpoint.",
+        ); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_url", "Upload URL:", getattr(out, "route_maps_upload_url", ""),
+                         tooltip="Endpoint за индивидуалните route HTML файлове."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_token", "Upload token:", getattr(out, "route_maps_upload_token", ""),
+                         tooltip="Стойност за pData. За Effect endpoint-а е Effect-Bizante-Token."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_token_field", "Token поле:", getattr(out, "route_maps_upload_token_field", "pData"),
+                         tooltip="Име на POST полето за token-а."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_file_field", "File поле:", getattr(out, "route_maps_upload_file_field", "files[]"),
+                         tooltip="За PHP $_FILES['files'] с много файлове използвай files[]."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_timeout_seconds", "Upload timeout:", getattr(out, "route_maps_upload_timeout_seconds", 60), "int"); gr += 1
         self._add_field(maps, gr, "output.map_provider", "Map provider:", out.map_provider,
                          tooltip='google за Google Maps визуализация или osm за Folium/OpenStreetMap.'); gr += 1
         self._add_field(maps, gr, "output.folium_tiles", "Folium tiles:", out.folium_tiles,
@@ -2990,7 +3032,11 @@ POST {trigger_path} - run с временни настройки, без да п
       "excel_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza",
       "routes_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\Routes",
       "enable_csv_output": true,
-      "csv_output_file": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\routes.csv"
+      "csv_output_file": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\routes.csv",
+      "route_maps_upload_mode": "effect_upload",
+      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
+      "route_maps_upload_token": "Effect-Bizante-Token",
+      "route_maps_upload_file_field": "files[]"
     }},
     "set_data": {{
       "enable_set_data_upload": false,
@@ -3409,16 +3455,15 @@ POST {solve_path} - клиенти + настройки в една заявка
             "input.json_plas_doc_field": ("json_plas_doc_field", "str"),
             "input.json_id_skld_field": ("json_id_skld_field", "str"),
             "input.json_time_window_field": ("json_time_window_field", "str"),
-            "input.json_time_window_start_field": ("json_time_window_start_field", "str"),
-            "input.json_time_window_end_field": ("json_time_window_end_field", "str"),
+            "input.json_delivery_comment_field": ("json_delivery_comment_field", "str"),
             "input.gps_column": ("gps_column", "str"),
             "input.client_id_column": ("client_id_column", "str"),
             "input.client_name_column": ("client_name_column", "str"),
             "input.volume_column": ("volume_column", "str"),
             "input.document_column": ("document_column", "str"),
             "input.time_window_column": ("time_window_column", "str"),
-            "input.time_window_start_column": ("time_window_start_column", "str"),
-            "input.time_window_end_column": ("time_window_end_column", "str"),
+            "input.delivery_comment_column": ("delivery_comment_column", "str"),
+            "input.enable_customer_document_grouping": ("enable_customer_document_grouping", "bool"),
             # Routing
             "routing.engine": ("engine", "routing_engine"),
             "routing.enable_time_dependent": ("enable_time_dependent", "bool"),
@@ -3485,6 +3530,12 @@ POST {solve_path} - клиенти + настройки в една заявка
             "output.enable_interactive_map": ("enable_interactive_map", "bool"),
             "output.map_output_file": ("map_output_file", "path"),
             "output.routes_output_dir": ("routes_output_dir", "path"),
+            "output.route_maps_upload_mode": ("route_maps_upload_mode", "str"),
+            "output.route_maps_upload_url": ("route_maps_upload_url", "str"),
+            "output.route_maps_upload_token_field": ("route_maps_upload_token_field", "str"),
+            "output.route_maps_upload_token": ("route_maps_upload_token", "str"),
+            "output.route_maps_upload_file_field": ("route_maps_upload_file_field", "str"),
+            "output.route_maps_upload_timeout_seconds": ("route_maps_upload_timeout_seconds", "int"),
             "output.map_provider": ("map_provider", "str"),
             "output.folium_tiles": ("folium_tiles", "str"),
             "output.google_maps_api_key": ("google_maps_api_key", "str"),

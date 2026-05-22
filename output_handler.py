@@ -134,6 +134,7 @@ def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
 
         if item.get("customer") is None and 1 <= route_index <= len(route.customers):
             item["customer"] = route.customers[route_index - 1]
+        customer = item.get("customer")
 
         item.setdefault("previous_stop_name", "")
         item.setdefault("distance_from_previous", 0.0)
@@ -148,6 +149,19 @@ def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
         item.setdefault("total_time_with_start", 0.0)
         item.setdefault("time_window_text", "")
         item.setdefault("time_window_status", "")
+        if customer is not None:
+            if not item.get("delivery_comment"):
+                item["delivery_comment"] = getattr(customer, "delivery_comment", "")
+            raw_start = getattr(customer, "time_window_start_minutes", None)
+            raw_end = getattr(customer, "time_window_end_minutes", None)
+            if not item.get("time_window_text") and (raw_start is not None or raw_end is not None):
+                start_minutes = 0 if raw_start is None else max(0, int(raw_start))
+                end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
+                if end_minutes < start_minutes:
+                    end_minutes += 24 * 60
+                item["time_window_text"] = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}-{end_minutes // 60:02d}:{end_minutes % 60:02d}"
+        else:
+            item.setdefault("delivery_comment", "")
 
         normalised.append(item)
 
@@ -178,26 +192,26 @@ def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_
 
 # Цветове за всеки отделен автобус
 BUS_COLORS = [
-    '#FF0000',  # Червен
-    '#00FF00',  # Зелен  
-    '#0000FF',  # Син
-    '#FFFF00',  # Жълт
-    '#FF00FF',  # Магента
-    '#00FFFF',  # Циан
-    '#FFA500',  # Оранжев
-    '#800080',  # Лилав
-    '#008000',  # Тъмно зелен
-    '#000080',  # Тъмно син
-    '#800000',  # Бордо
-    '#808000',  # Маслинен
-    '#FF69B4',  # Розов
-    '#32CD32',  # Лайм зелен
-    '#8A2BE2',  # Синьо виолетов
-    '#FF4500',  # Червено оранжев
-    '#2E8B57',  # Морско зелен
-    '#4682B4',  # Стоманено син
-    '#D2691E',  # Шоколадов
-    '#DC143C'   # Тъмно червен
+    '#C74440',  # Меко червен
+    '#4C956C',  # Приглушен зелен
+    '#3B6EA8',  # Спокоен син
+    '#D8A31A',  # Мек жълт
+    '#B35C9E',  # Мека магента
+    '#339A9A',  # Приглушен циан
+    '#C97A2B',  # Мек оранжев
+    '#7A5BA6',  # Меко лилав
+    '#4F7F52',  # Горски зелен
+    '#405C87',  # Приглушен тъмносин
+    '#8E4A4A',  # Меко бордо
+    '#8A8543',  # Маслинен
+    '#C06C91',  # Мек розов
+    '#6FA64F',  # Листно зелен
+    '#7A68B8',  # Синьо виолетов
+    '#B85A35',  # Ръждив
+    '#4E8D78',  # Морско зелен
+    '#5D7F9D',  # Стоманено син
+    '#9A6844',  # Кафяв
+    '#B84C5F'   # Меко тъмночервен
 ]
 
 
@@ -871,15 +885,24 @@ class InteractiveMapGenerator:
         return start_minutes, end_minutes
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        window = self._customer_time_window_minutes(customer)
-        if not window:
+        raw_start = getattr(customer, "time_window_start_minutes", None)
+        raw_end = getattr(customer, "time_window_end_minutes", None)
+        if raw_start is None and raw_end is None:
+            if self._customer_time_windows_enabled():
+                return "Постоянно"
             return ""
-        if (
-            getattr(customer, "time_window_start_minutes", None) is None
-            and getattr(customer, "time_window_end_minutes", None) is None
-        ):
-            return "Постоянно"
-        return f"{self._format_time_hh_mm(window[0])}-{self._format_time_hh_mm(window[1])}"
+
+        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
+        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
+
+    def _customer_has_declared_time_window(self, customer: Customer) -> bool:
+        return (
+            getattr(customer, "time_window_start_minutes", None) is not None
+            or getattr(customer, "time_window_end_minutes", None) is not None
+        )
 
     def _calculate_distance_between_points(
         self,
@@ -997,6 +1020,7 @@ class InteractiveMapGenerator:
                 "total_time_with_start": total_time_with_start,
                 "time_window_text": self._format_customer_time_window(customer),
                 "time_window_status": time_window_status,
+                "delivery_comment": getattr(customer, "delivery_comment", ""),
             })
 
             previous_customer_coords = customer.coordinates
@@ -1018,6 +1042,36 @@ class InteractiveMapGenerator:
             if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
                 return self._format_time_hh_mm(int(round(float(stored_entries[0]["start_time_minutes"]))))
             return self._format_time_hh_mm(self._get_start_time_for_vehicle(route.vehicle_type))
+        except Exception:
+            return ""
+
+    def _route_end_time_text(self, route: Route) -> str:
+        """Return route end time including the final leg back to the route end/depot."""
+        try:
+            stored_entries = _stored_route_schedule_entries(route)
+            if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
+                start_minutes = float(stored_entries[0]["start_time_minutes"])
+            else:
+                start_minutes = float(self._get_start_time_for_vehicle(route.vehicle_type))
+
+            total_route_minutes = float(getattr(route, "total_time_minutes", 0) or 0)
+            if total_route_minutes > 0:
+                return self._format_time_hh_mm(start_minutes + total_route_minutes)
+
+            entries = stored_entries or self._build_route_schedule_entries(route)
+            if not entries:
+                return ""
+
+            last_entry = entries[-1]
+            end_minutes = float(last_entry.get("total_time_with_start", 0) or 0)
+            customer = last_entry.get("customer")
+            if customer is not None:
+                route_end = self._route_end_location(route)
+                end_minutes += self._calculate_time_between_points(
+                    getattr(customer, "coordinates", None),
+                    route_end,
+                )
+            return self._format_time_hh_mm(end_minutes)
         except Exception:
             return ""
 
@@ -1057,12 +1111,24 @@ class InteractiveMapGenerator:
             lines.append(f"<b>Изчакване:</b> {wait_minutes:.0f} мин")
 
         time_window_text = str(entry.get("time_window_text", "") or "").strip()
-        if time_window_text:
+        customer = entry.get("customer")
+        has_declared_window = bool(
+            customer is not None
+            and (
+                getattr(customer, "time_window_start_minutes", None) is not None
+                or getattr(customer, "time_window_end_minutes", None) is not None
+            )
+        )
+        if time_window_text and (has_declared_window or time_window_text != "Постоянно"):
             lines.append(f"<b>Работно време:</b> {html.escape(time_window_text)}")
 
         time_window_status = str(entry.get("time_window_status", "") or "").strip()
         if time_window_status:
             lines.append(f"<b>TW статус:</b> {html.escape(time_window_status)}")
+
+        delivery_comment = str(entry.get("delivery_comment", "") or "").strip()
+        if delivery_comment:
+            lines.append(f"<b>Коментар:</b> {html.escape(delivery_comment)}")
 
         return lines
 
@@ -1222,6 +1288,8 @@ class InteractiveMapGenerator:
                 "name": f"{vehicle_name} ({len(route.customers)} клиента)",
                 "color": bus_color,
                 "vehicleName": vehicle_name,
+                "routeStartTime": route_start_time_text,
+                "routeEndTime": self._route_end_time_text(route),
                 "markers": markers,
                 "path": [self._json_coords(point) for point in geometry],
                 "dashed": dashed,
@@ -1624,7 +1692,7 @@ class InteractiveMapGenerator:
         row.innerHTML = `
           <input type="checkbox" checked data-route="${{route.id}}">
           <span class="swatch" style="background:${{route.color}}"></span>
-          <span>${{route.name}}</span>
+          <span style="color:${{route.color}};font-weight:700">${{route.name}}</span>
         `;
         container.appendChild(row);
       }});
@@ -1856,7 +1924,8 @@ class InteractiveMapGenerator:
       const route = MAP_DATA.routes[0];
       const objects = routeObjects[route.id];
       const routeTimeText = formatRouteDuration(route.timeMin);
-      const routeStartText = (route.markers[0] && route.markers[0].routeStartTime) || "";
+      const routeStartText = route.routeStartTime || (route.markers[0] && route.markers[0].routeStartTime) || "";
+      const routeEndText = route.routeEndTime || "";
       container.classList.add("collapsed");
       container.innerHTML = `
         <button type="button" class="client-toggle">Клиенти / Google Maps</button>
@@ -1871,6 +1940,7 @@ class InteractiveMapGenerator:
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
             ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
+            ${{routeEndText ? '<div class="client-route-stat"><span>Край:</span><b>' + escapeHtml(routeEndText) + '</b></div>' : ''}}
           </div>
           ${{renderGoogleSegments(route)}}
           <div class="client-list"></div>
@@ -1889,7 +1959,7 @@ class InteractiveMapGenerator:
       close.addEventListener("click", () => setOpen(false));
       route.markers.forEach((point, index) => {{
         const timeLine = point.arrivalTime
-          ? `<span style="display:block;color:#188038;font-size:11px">Пристигане: ${{escapeHtml(point.arrivalTime)}}${{point.departureTime ? " · Тръгване: " + escapeHtml(point.departureTime) : ""}}</span>`
+          ? `<span style="display:block;color:#188038;font-size:11px">Пристигане: ${{escapeHtml(point.arrivalTime)}}</span>`
           : "";
         const row = document.createElement("div");
         row.className = "route-row";
@@ -2319,8 +2389,16 @@ class InteractiveMapGenerator:
             bus_color = BUS_COLORS[route_idx % len(BUS_COLORS)]
             bus_id = f"bus_{route_idx + 1}"
             
-            # Създаваме FeatureGroup за този автобус
-            bus_layer = folium.FeatureGroup(name=f"🚌 {vehicle_name} ({len(route.customers)} клиента)")
+            # Създаваме FeatureGroup за този автобус.
+            # LayerControl приема HTML, затова оцветяваме името със същия цвят като линията.
+            safe_vehicle_name = html.escape(str(vehicle_name))
+            safe_bus_color = html.escape(str(bus_color), quote=True)
+            bus_layer_name = (
+                f'<span style="color:{safe_bus_color};font-weight:700;">'
+                f'🚌 {safe_vehicle_name} ({len(route.customers)} клиента)'
+                '</span>'
+            )
+            bus_layer = folium.FeatureGroup(name=bus_layer_name)
             bus_layers[bus_id] = bus_layer
             schedule_by_index = self._route_schedule_by_index(route)
             
@@ -2850,9 +2928,15 @@ class InteractiveMapGenerator:
 
     def _route_stats_html(self, route: Route) -> str:
         start_time = self._route_start_time_text(route)
+        end_time = self._route_end_time_text(route)
         start_html = (
             f'<div class="route-client-stat"><span>Старт:</span><b>{html.escape(start_time)}</b></div>'
             if start_time
+            else ""
+        )
+        end_html = (
+            f'<div class="route-client-stat"><span>Край:</span><b>{html.escape(end_time)}</b></div>'
+            if end_time
             else ""
         )
         return f'''
@@ -2862,6 +2946,7 @@ class InteractiveMapGenerator:
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
                 {start_html}
+                {end_html}
             </div>
         '''
 
@@ -3181,22 +3266,33 @@ class InteractiveMapGenerator:
                 self._street_view_url((float(entry["lat"]), float(entry["lng"]))),
             )), quote=True)
             arrival_time = html.escape(str(entry.get("arrival_time", "") or ""))
-            departure_time = html.escape(str(entry.get("departure_time", "") or ""))
+            time_window_text = html.escape(str(entry.get("time_window_text", "") or ""))
+            delivery_comment = html.escape(str(entry.get("delivery_comment", "") or ""))
+            has_time_window = bool(entry.get("has_time_window"))
+            card_extra_class = " route-client-card-time-window" if has_time_window else ""
             time_html = ""
             if arrival_time:
-                time_parts = []
-                time_parts.append(f"Пристигане: {arrival_time}")
-                if departure_time:
-                    time_parts.append(f"Тръгване: {departure_time}")
-                time_html = f'<div class="route-client-time">{" &middot; ".join(time_parts)}</div>'
+                time_html = f'<div class="route-client-time">Пристигане: {arrival_time}</div>'
+            time_window_html = (
+                f'<div class="route-client-window">Работно време: {time_window_text}</div>'
+                if has_time_window and time_window_text
+                else ""
+            )
+            comment_html = (
+                f'<div class="route-client-comment">Коментар: {delivery_comment}</div>'
+                if delivery_comment
+                else ""
+            )
             rows.append(
                 f'''
-                <div class="route-client-card" role="button" tabindex="0" data-client-index="{idx}">
+                <div class="route-client-card{card_extra_class}" role="button" tabindex="0" data-client-index="{idx}">
                     <div class="route-client-number" style="background:{safe_color}">{number}</div>
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
                         <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.</div>
                         {time_html}
+                        {time_window_html}
+                        {comment_html}
                     </div>
                     <div class="route-client-actions">
                         <a class="route-client-nav" href="{nav_url}" target="_blank" rel="noopener">Навигация</a>
@@ -3315,11 +3411,21 @@ class InteractiveMapGenerator:
                 align-items: center;
                 padding: 7px 6px;
                 border-top: 1px solid #ececec;
+                border-radius: 6px;
                 cursor: pointer;
             }
             .route-client-card:hover, .route-client-card:focus {
                 background: #f4f7fb;
                 outline: none;
+            }
+            .route-client-card-time-window {
+                background: #ffe4e4;
+                border: 1px solid #eaa6a6;
+                margin-top: 5px;
+            }
+            .route-client-card-time-window:hover,
+            .route-client-card-time-window:focus {
+                background: #ffdada;
             }
             .route-client-number {
                 width: 26px;
@@ -3349,6 +3455,21 @@ class InteractiveMapGenerator:
                 color: #188038;
                 margin-top: 2px;
                 line-height: 1.25;
+            }
+            .route-client-window {
+                font-size: 11px;
+                color: #9f2020;
+                font-weight: 700;
+                margin-top: 3px;
+                line-height: 1.25;
+            }
+            .route-client-comment {
+                font-size: 11px;
+                color: #9f2020;
+                font-weight: 700;
+                margin-top: 3px;
+                line-height: 1.25;
+                overflow-wrap: anywhere;
             }
             .route-client-actions {
                 display: flex;
@@ -3651,6 +3772,9 @@ class InteractiveMapGenerator:
                 schedule_lines = self._schedule_popup_lines(schedule_entry, include_start=False)
                 arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
                 departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
+                time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
+                has_time_window = self._customer_has_declared_time_window(customer)
+                delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
                 icon_html = f'''
                 <div style="
                     background-color: {bus_color};
@@ -3707,6 +3831,9 @@ class InteractiveMapGenerator:
                     "route_start_time": route_start_time_text,
                     "arrival_time": arrival_time_text,
                     "departure_time": departure_time_text,
+                    "time_window_text": time_window_text,
+                    "has_time_window": has_time_window,
+                    "delivery_comment": delivery_comment,
                 })
 
         # Линия на маршрута
@@ -3748,6 +3875,7 @@ class InteractiveMapGenerator:
         bus_layer.add_to(route_map)
         self._add_single_route_customer_control(route_map, route, route_number, bus_color, marker_entries)
         self._add_google_route_segments_control(route_map, route, route_number, bus_color, route_depot)
+        route_end_time_text = self._route_end_time_text(route)
 
         # Легенда с информация за маршрута
         legend_html = f'''
@@ -3764,6 +3892,7 @@ class InteractiveMapGenerator:
         <p style="margin: 3px 0; font-size: 12px;">\u23f1 Време: {route.total_time_minutes:.0f} мин</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} ст.</p>
         {f'<p style="margin: 3px 0; font-size: 12px;">Старт: {html.escape(route_start_time_text)}</p>' if route_start_time_text else ''}
+        {f'<p style="margin: 3px 0; font-size: 12px;">Край: {html.escape(route_end_time_text)}</p>' if route_end_time_text else ''}
         </div>
         '''
         route_map.get_root().add_child(folium.Element(legend_html))
@@ -3857,7 +3986,7 @@ class ExcelExporter:
         # Заглавни редове
         headers = [
             'ID бус', 'Маршрут', 'Превозно средство', 'Ред в маршрута',
-            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Обем (ст.)', 'GPS координати',
+            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', 'Обем (ст.)', 'GPS координати',
             'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
             'Време от предишен (ч)', 'Накоплено време (ч)',
@@ -3900,6 +4029,7 @@ class ExcelExporter:
                     customer.id,  # ID клиент
                     customer.name,  # Име клиент
                     customer.document,  # Номер поръчка
+                    getattr(customer, "delivery_comment", ""),  # Коментар доставка
                     customer.volume,  # Обем
                     customer.original_gps_data,  # GPS
                     round(distance_to_center, 2),  # Разстояние до центъра
@@ -4207,15 +4337,18 @@ class ExcelExporter:
         return start_minutes, end_minutes
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        window = self._customer_time_window_minutes(customer)
-        if not window:
+        raw_start = getattr(customer, "time_window_start_minutes", None)
+        raw_end = getattr(customer, "time_window_end_minutes", None)
+        if raw_start is None and raw_end is None:
+            if self._customer_time_windows_enabled():
+                return "Постоянно"
             return ""
-        if (
-            getattr(customer, "time_window_start_minutes", None) is None
-            and getattr(customer, "time_window_end_minutes", None) is None
-        ):
-            return "Постоянно"
-        return f"{self._format_time_hh_mm(window[0])}-{self._format_time_hh_mm(window[1])}"
+
+        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
+        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
+        if end_minutes < start_minutes:
+            end_minutes += 24 * 60
+        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
 
     def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
         stored_entries = _stored_route_schedule_entries(route)
@@ -4283,6 +4416,7 @@ class ExcelExporter:
                 "total_time_with_start": total_time_with_start,
                 "time_window_text": self._format_customer_time_window(customer),
                 "time_window_status": time_window_status,
+                "delivery_comment": getattr(customer, "delivery_comment", ""),
             })
 
             previous_customer_coords = customer.coordinates
@@ -4434,6 +4568,8 @@ class ExcelExporter:
                     'ID клиент': customer.id,
                     'Име клиент': customer.name,
                     'Номер поръчка': customer.document,
+                    'Коментар доставка': getattr(customer, "delivery_comment", ""),
+                    'Работно време': self._format_customer_time_window(customer),
                     'Обем (ст.)': customer.volume,
                     'GPS': customer.original_gps_data
                 })
@@ -4454,7 +4590,7 @@ class ExcelExporter:
         
         headers = [
             'Маршрут', 'Превозно средство', 'Ред в маршрута',
-            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Обем (ст.)', 'GPS координати',
+            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', 'Обем (ст.)', 'GPS координати',
             'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
             'Време от предишен (мин)', 'Накоплено време (мин)',
@@ -4485,6 +4621,7 @@ class ExcelExporter:
                         customer.id,
                         customer.name,
                         customer.document,
+                        getattr(customer, "delivery_comment", ""),
                         customer.volume,
                         customer.original_gps_data,
                         round(distance_to_center, 2),
@@ -4733,6 +4870,82 @@ class OutputHandler:
     def __init__(self, config: Optional[OutputConfig] = None):
         self.config = config or get_config().output
         self.excel_exporter = ExcelExporter(self.config)
+
+    def _route_maps_upload_mode(self) -> str:
+        return str(getattr(self.config, "route_maps_upload_mode", "disabled") or "disabled").strip().lower()
+
+    def _upload_route_maps(self, route_map_files: List[str]) -> Optional[str]:
+        """Upload generated individual route HTML maps when configured."""
+        mode = self._route_maps_upload_mode()
+        if mode in {"", "0", "false", "off", "none", "disabled"}:
+            return None
+        if mode in {"legacy", "old", "classic"}:
+            logger.info("Route map upload mode is legacy: запазвам старото поведение без нов HTTP upload.")
+            return None
+        if mode not in {"effect", "effect_upload", "upload", "new"}:
+            message = f"Непознат режим за качване на route карти: {mode}"
+            logger.warning(message)
+            return f"skipped: {message}"
+
+        upload_url = str(getattr(self.config, "route_maps_upload_url", "") or "").strip()
+        if not upload_url:
+            message = "route_maps_upload_url не е зададен"
+            logger.warning(message)
+            return f"failed: {message}"
+
+        existing_files = [path for path in route_map_files if path and os.path.isfile(path)]
+        if not existing_files:
+            logger.info("Няма индивидуални HTML карти за качване.")
+            return "skipped: няма route HTML файлове"
+
+        token_field = str(getattr(self.config, "route_maps_upload_token_field", "pData") or "pData").strip()
+        token = str(getattr(self.config, "route_maps_upload_token", "") or "").strip()
+        file_field = str(getattr(self.config, "route_maps_upload_file_field", "files[]") or "files[]").strip()
+        timeout = int(getattr(self.config, "route_maps_upload_timeout_seconds", 60) or 60)
+
+        opened_files = []
+        files_payload = []
+        try:
+            for file_path in existing_files:
+                file_handle = open(file_path, "rb")
+                opened_files.append(file_handle)
+                files_payload.append(
+                    (
+                        file_field,
+                        (
+                            os.path.basename(file_path),
+                            file_handle,
+                            "text/html; charset=utf-8",
+                        ),
+                    )
+                )
+
+            data = {token_field: token} if token_field else {}
+            logger.info("Качвам %s route HTML карти към %s", len(files_payload), upload_url)
+            response = requests.post(
+                upload_url,
+                data=data,
+                files=files_payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            response_text = (response.text or "").strip()
+            short_response = response_text[:500]
+            logger.info(
+                "Route HTML upload завърши: HTTP %s, отговор: %s",
+                response.status_code,
+                short_response,
+            )
+            return f"HTTP {response.status_code}: {short_response or 'OK'}"
+        except Exception as exc:
+            logger.error("Грешка при качване на route HTML карти: %s", exc, exc_info=True)
+            return f"failed: {exc}"
+        finally:
+            for file_handle in opened_files:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
     
     def generate_all_outputs(self, solution: CVRPSolution, 
                            warehouse_allocation: WarehouseAllocation,
@@ -4760,6 +4973,7 @@ class OutputHandler:
                 # 1.1. Отделни HTML карти за всеки маршрут
                 routes_dir = self.config.routes_output_dir
                 generated_route_maps = 0
+                route_map_files: List[str] = []
                 try:
                     os.makedirs(routes_dir, exist_ok=True)
                     used_route_file_names = set()
@@ -4776,10 +4990,14 @@ class OutputHandler:
                             route_file = os.path.join(routes_dir, route_filename)
                             saved_route_file = map_gen.save_map(single_map, route_file)
                             output_files[f'route_map_{route_number}'] = saved_route_file
+                            route_map_files.append(saved_route_file)
                             generated_route_maps += 1
                         except Exception as e:
                             logger.error(f"Грешка при генериране на HTML карта за маршрут {route_number}: {e}", exc_info=True)
                     logger.info(f"Генерирани {generated_route_maps}/{len(solution.routes)} отделни HTML карти в {routes_dir}")
+                    upload_summary = self._upload_route_maps(route_map_files)
+                    if upload_summary:
+                        output_files["route_maps_upload"] = upload_summary
                 except Exception as e:
                     logger.error(f"Грешка при подготовка на директорията за route карти: {e}", exc_info=True)
         
