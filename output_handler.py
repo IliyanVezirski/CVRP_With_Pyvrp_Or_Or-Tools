@@ -15,7 +15,7 @@ import os
 import logging
 from datetime import datetime
 from urllib.parse import urlencode
-from config import get_config, OutputConfig, RoutingEngine, is_location_in_center_zone
+from config import get_config, OutputConfig, RoutingEngine, is_location_in_center_zone, get_center_zones
 from cvrp_solver import CVRPSolution, Route
 from warehouse_manager import WarehouseAllocation
 from input_handler import Customer
@@ -839,19 +839,34 @@ class InteractiveMapGenerator:
         return {"lat": float(coords[0]), "lng": float(coords[1])}
 
     def _center_zone_map_data(self, locations) -> Optional[Dict]:
-        polygon = getattr(locations, "center_zone_polygon", [])
-        mode = str(getattr(locations, "center_zone_mode", "circle")).lower()
-        if mode == "polygon" and len(polygon) >= 3:
-            return {
-                "type": "polygon",
-                "path": [self._json_coords(point) for point in polygon],
+        zones = []
+        for zone in get_center_zones(locations):
+            polygon = getattr(zone, "polygon", []) or []
+            mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+            zone_data = {
+                "name": str(getattr(zone, "name", "Center zone") or "Center zone"),
+                "priorityVehicleTypes": list(getattr(zone, "priority_vehicle_types", []) or []),
+                "restrictedVehicleTypes": list(getattr(zone, "restricted_vehicle_types", []) or []),
             }
+            if mode == "polygon" and len(polygon) >= 3:
+                zone_data.update({
+                    "type": "polygon",
+                    "path": [self._json_coords(point) for point in polygon],
+                })
+            else:
+                center = getattr(zone, "center_coords", None) or getattr(locations, "center_location", None)
+                if not center:
+                    continue
+                zone_data.update({
+                    "type": "circle",
+                    "center": self._json_coords(center),
+                    "radiusMeters": float(getattr(zone, "radius_km", 0) or 0) * 1000,
+                })
+            zones.append(zone_data)
 
-        return {
-            "type": "circle",
-            "center": self._json_coords(locations.center_location),
-            "radiusMeters": locations.center_zone_radius_km * 1000,
-        }
+        if not zones:
+            return None
+        return {"zones": zones}
 
     def _html_popup(self, title: str, lines: List[str], color: str = "#222") -> str:
         body = "<br>".join(lines)
@@ -1364,7 +1379,7 @@ class InteractiveMapGenerator:
             },
         }
 
-        if cfg.locations.enable_center_zone_priority:
+        if get_center_zones(cfg.locations):
             map_data["centerZone"] = self._center_zone_map_data(cfg.locations)
 
         data_json = json.dumps(map_data, ensure_ascii=False)
@@ -1563,32 +1578,34 @@ class InteractiveMapGenerator:
         bounds.extend(depot.position);
       }});
 
-      if (MAP_DATA.centerZone) {{
-        if (MAP_DATA.centerZone.type === "polygon") {{
+      const centerZones = MAP_DATA.centerZone?.zones || (MAP_DATA.centerZone ? [MAP_DATA.centerZone] : []);
+      centerZones.forEach((zone, index) => {{
+        const zoneColor = ["#b91c1c", "#be185d", "#7c3aed", "#047857", "#b45309"][index % 5];
+        if (zone.type === "polygon") {{
           new google.maps.Polygon({{
             map,
-            paths: MAP_DATA.centerZone.path,
-            strokeColor: "#d32f2f",
+            paths: zone.path,
+            strokeColor: zoneColor,
             strokeOpacity: 0.9,
             strokeWeight: 2,
-            fillColor: "#d32f2f",
+            fillColor: zoneColor,
             fillOpacity: 0.12
           }});
-          MAP_DATA.centerZone.path.forEach((point) => bounds.extend(point));
+          zone.path.forEach((point) => bounds.extend(point));
         }} else {{
           new google.maps.Circle({{
             map,
-            center: MAP_DATA.centerZone.center,
-            radius: MAP_DATA.centerZone.radiusMeters,
-            strokeColor: "#d32f2f",
+            center: zone.center,
+            radius: zone.radiusMeters,
+            strokeColor: zoneColor,
             strokeOpacity: 0.9,
             strokeWeight: 2,
-            fillColor: "#d32f2f",
+            fillColor: zoneColor,
             fillOpacity: 0.12
           }});
-          bounds.extend(MAP_DATA.centerZone.center);
+          bounds.extend(zone.center);
         }}
-      }}
+      }});
 
       MAP_DATA.routes.forEach((route) => {{
         const directionArrow = {{
@@ -2041,7 +2058,7 @@ class InteractiveMapGenerator:
         # Добавяне на център зоната
         from config import get_config
         locations = get_config().locations
-        if locations.enable_center_zone_priority:
+        if get_center_zones(locations):
             self._add_center_zone_shape(route_map, locations)
 
         # Добавяне на маршрутите с OSRM геометрия
@@ -2095,27 +2112,49 @@ class InteractiveMapGenerator:
         ).add_to(route_map)
 
     def _add_center_zone_shape(self, route_map: folium.Map, locations):
-        polygon = getattr(locations, "center_zone_polygon", [])
-        mode = str(getattr(locations, "center_zone_mode", "circle")).lower()
-        if mode == "polygon" and len(polygon) >= 3:
-            folium.Polygon(
-                locations=polygon,
-                color="red",
-                fill=True,
-                fillColor="red",
-                fillOpacity=0.1,
-                popup=f"<b>Център зона</b><br>Полигон: {len(polygon)} точки",
-                tooltip="Център зона",
-            ).add_to(route_map)
-            folium.Marker(
-                location=locations.center_location,
-                popup=f"<b>Център</b><br>Координати: {locations.center_location[0]:.6f}, {locations.center_location[1]:.6f}",
-                icon=folium.Icon(color="red", icon="star"),
-                tooltip="Център",
-            ).add_to(route_map)
-            return
+        colors = ["red", "darkred", "purple", "green", "orange"]
+        for index, zone in enumerate(get_center_zones(locations)):
+            color = colors[index % len(colors)]
+            name = str(getattr(zone, "name", "Център зона") or "Център зона")
+            polygon = getattr(zone, "polygon", []) or []
+            mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+            center = getattr(zone, "center_coords", None) or getattr(locations, "center_location", None)
+            popup_lines = [
+                f"<b>{html.escape(name)}</b>",
+                "Приоритет: " + html.escape(", ".join(getattr(zone, "priority_vehicle_types", []) or []) or "-"),
+                "Ограничения: " + html.escape(", ".join(getattr(zone, "restricted_vehicle_types", []) or []) or "-"),
+            ]
 
-        self._add_center_zone_circle(route_map, locations.center_location, locations.center_zone_radius_km)
+            if mode == "polygon" and len(polygon) >= 3:
+                folium.Polygon(
+                    locations=polygon,
+                    color=color,
+                    fill=True,
+                    fillColor=color,
+                    fillOpacity=0.1,
+                    popup="<br>".join(popup_lines + [f"Полигон: {len(polygon)} точки"]),
+                    tooltip=name,
+                ).add_to(route_map)
+            elif center:
+                radius_km = float(getattr(zone, "radius_km", 0) or 0)
+                folium.Circle(
+                    location=center,
+                    radius=radius_km * 1000,
+                    color=color,
+                    fill=True,
+                    fillColor=color,
+                    fillOpacity=0.1,
+                    popup="<br>".join(popup_lines + [f"Радиус: {radius_km:g} км"]),
+                    tooltip=name,
+                ).add_to(route_map)
+
+            if center:
+                folium.Marker(
+                    location=center,
+                    popup=f"<b>{html.escape(name)}</b><br>{center[0]:.6f}, {center[1]:.6f}",
+                    icon=folium.Icon(color=color, icon="star"),
+                    tooltip=name,
+                ).add_to(route_map)
     
     def _get_osrm_route_geometry(self, start_coords: Tuple[float, float],
                                 end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
@@ -3746,7 +3785,7 @@ class InteractiveMapGenerator:
         # Добавяме център зоната
         from config import get_config
         cfg = get_config()
-        if cfg.locations.enable_center_zone_priority:
+        if get_center_zones(cfg.locations):
             self._add_center_zone_shape(route_map, cfg.locations)
 
         # Добавяме маршрута

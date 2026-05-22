@@ -221,7 +221,17 @@ GUI поток за polygon:
 4. Потребителят чертае/редактира полигон.
 5. Полигонът се записва в `center_zone_polygon`.
 
-Тази зона се използва и в solver логика, и във визуализацията.
+Допълнителните център зони са отделни от основната зона и се записват в `center_zones`. Всяка зона има:
+
+- собствена геометрия (`circle` или `polygon`);
+- `priority_vehicle_types`: типове бусове, които получават отстъпка вътре в зоната;
+- `restricted_vehicle_types`: типове бусове, които получават глоба вътре в зоната;
+- `vehicle_penalties`: глоба по тип бус;
+- `priority_vehicle_outside_penalty`: глоба за приоритетен бус, ако е извън всички зони, които го таргетират.
+
+Така може да има повече от една център зона, без новата да променя правилата на старата. Solver-ите използват общата функция `center_zone_cost_adjustment(...)`, за да прилагат еднакви правила в OR-Tools и PyVRP.
+
+Тези зони се използват и в solver логика, и във визуализацията.
 
 ## Депа
 
@@ -531,7 +541,33 @@ API-то може да стартира програмата по два нач�
 }
 ```
 
-`settings` може да съдържа solver, OSRM/Valhalla, output, депа, трафик зони, center зона, бусове и `setData` настройки. Override-ите важат само за заявката и не записват автоматично `config.py`.
+`settings` може да съдържа solver, OSRM/Valhalla, output, депа, трафик зони, основна center зона, допълнителни `center_zones`, бусове и `setData` настройки. Override-ите важат само за заявката и не записват автоматично `config.py`.
+
+Пример за независима допълнителна център зона:
+
+```json
+{
+  "settings": {
+    "center_zones": [
+      {
+        "name": "Център 2",
+        "mode": "circle",
+        "center": [42.7093, 23.3137],
+        "radius_km": 1.2,
+        "priority_vehicle_types": ["center_bus"],
+        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+        "discount_priority_vehicle": 0.9,
+        "vehicle_penalties": {
+          "internal_bus": 40000,
+          "external_bus": 40000,
+          "vratza_bus": 40000
+        },
+        "enabled": true
+      }
+    ]
+  }
+}
+```
 
 За качване на индивидуалните HTML карти през API:
 

@@ -15,7 +15,7 @@
 - Поддържа индивидуално време за обслужване по тип бус.
 - Поддържа различни начални депа по тип бус.
 - Поддържа различна крайна точка на бус; ако няма крайна точка, маршрутът завършва в стартовото депо.
-- Поддържа център зона като кръг или начертан полигон през GUI.
+- Поддържа основна център зона и допълнителни независими център зони. Всяка допълнителна зона може да има собствени правила за кои типове бусове важат приоритетите и глобите.
 - Позволява при нужда solver-ът да пропуска заявки, като приоритетно по-лесни за пропускане са големи и близки до депото заявки.
 - Генерира обща HTML карта, отделни HTML карти за всеки маршрут, Excel отчет, CSV файл и графики.
 - В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане, popup с обем и бутон за навигация.
@@ -198,6 +198,26 @@ center_zone_mode = "polygon"
 - `center_zone_polygon`
 
 GUI бутонът `Чертай на карта` отваря локален Leaflet редактор, в който зоната може да се начертае и запише като полигон.
+
+Допълнителните център зони се настройват през `locations.center_zones`. Те са независими от старата основна зона:
+
+```python
+center_zones = [
+    CenterZoneConfig(
+        name="Център 2",
+        mode="circle",
+        center_coords=(42.7093, 23.3137),
+        radius_km=1.2,
+        priority_vehicle_types=["center_bus"],
+        restricted_vehicle_types=["internal_bus", "external_bus", "vratza_bus"],
+        discount_priority_vehicle=0.9,
+        priority_vehicle_outside_penalty=0,
+        vehicle_penalties={"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000},
+    )
+]
+```
+
+При клиент в няколко зони отстъпката за приоритетен бус взема най-добрата приложима отстъпка, а глобите за ограничени бусове се събират. Ако приоритетен бус е извън всички зони, които го таргетират, се прилага най-голямата `priority_vehicle_outside_penalty`.
 
 Зоната влияе върху:
 
@@ -541,7 +561,7 @@ Build-ът включва основната програма, Settings GUI, API
 - Работно време на клиентите може да се чете от Excel/JSON и да се включва или изключва от GUI.
 - Клиенти с няколко документа могат да се групират по `IdCust + GPS` в един стоп; настройката може да се изключи от GUI или API.
 - API режимът поддържа `/run`, `/solve`, callback URL, JSON резултат и временни настройки само за конкретната заявка.
-- През API могат да се подават бусове, депа, трафик зони, OSRM настройки, solver настройки, output пътища и `setData` настройки.
+- През API могат да се подават бусове, депа, трафик зони, независими център зони с правила по тип бус, OSRM настройки, solver настройки, output пътища и `setData` настройки.
 - `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
 - Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
 - `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
@@ -554,6 +574,33 @@ Build-ът включва основната програма, Settings GUI, API
 
 ```powershell
 curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
+```
+
+### Пример API center_zones
+
+```json
+{
+  "settings": {
+    "center_zones": [
+      {
+        "name": "Център 2",
+        "mode": "circle",
+        "center": [42.7093, 23.3137],
+        "radius_km": 1.2,
+        "priority_vehicle_types": ["center_bus"],
+        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+        "discount_priority_vehicle": 0.9,
+        "priority_vehicle_outside_penalty": 0,
+        "vehicle_penalties": {
+          "internal_bus": 40000,
+          "external_bus": 40000,
+          "vratza_bus": 40000
+        },
+        "enabled": true
+      }
+    ]
+  }
+}
 ```
 
 ### Пример vehicle с крайна точка

@@ -609,7 +609,7 @@ replace_vehicles:
   max_customers_per_route, start_time_minutes, tsp_depot_location
 
 center_zone:
-  Управлява център зоната и глобите за нея.
+  Управлява старата основна център зона и глобите за нея.
   "center_zone": {
     "mode": "circle",
     "center": [42.6977, 23.3219],
@@ -619,6 +619,27 @@ center_zone:
     "vratza_bus_penalty": 40000,
     "center_bus_outside_penalty": 0
   }
+
+center_zones:
+  Допълнителни независими център зони. Всяка зона има собствени правила за кои бусове да важи.
+  "center_zones": [
+    {
+      "name": "Център 2",
+      "mode": "circle",
+      "center": [42.7093, 23.3137],
+      "radius_km": 1.2,
+      "priority_vehicle_types": ["center_bus"],
+      "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+      "discount_priority_vehicle": 0.9,
+      "priority_vehicle_outside_penalty": 0,
+      "vehicle_penalties": {
+        "internal_bus": 40000,
+        "external_bus": 40000,
+        "vratza_bus": 40000
+      },
+      "enabled": true
+    }
+  ]
 
 traffic_zones:
   Допълнителни зони с multiplier за време.
@@ -638,7 +659,7 @@ city_traffic:
 locations.*:
   Можеш да подадеш и директните вътрешни полета:
   locations.depot_location, locations.center_location, locations.vratza_depot_location
-  locations.center_zone_polygon, locations.depot_locations, locations.traffic_zones
+  locations.center_zone_polygon, locations.center_zones, locations.depot_locations, locations.traffic_zones
                 """,
                 48,
             ),
@@ -768,6 +789,36 @@ locations.*:
             lines.append(f"{name}: {float(center[0])}, {float(center[1])}, {radius}, {multiplier}, {enabled}")
         return "\n".join(lines)
 
+    def _format_center_zones_text(self, zones):
+        lines = []
+        for zone in zones or []:
+            name = getattr(zone, "name", "Център зона")
+            mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+            if mode == "polygon":
+                points = getattr(zone, "polygon", []) or []
+                geometry = "; ".join(f"{float(lat)}, {float(lon)}" for lat, lon in points)
+                radius = ""
+            else:
+                center = getattr(zone, "center_coords", None)
+                if not center:
+                    continue
+                geometry = f"{float(center[0])}, {float(center[1])}"
+                radius = f"{float(getattr(zone, 'radius_km', 0) or 0):g}"
+            priority = ",".join(getattr(zone, "priority_vehicle_types", []) or [])
+            restricted = ",".join(getattr(zone, "restricted_vehicle_types", []) or [])
+            enabled = "true" if getattr(zone, "enabled", True) else "false"
+            discount = f"{float(getattr(zone, 'discount_priority_vehicle', 1.0) or 1.0):g}"
+            outside = f"{float(getattr(zone, 'priority_vehicle_outside_penalty', 0.0) or 0.0):g}"
+            penalties = ",".join(
+                f"{bus}={float(value):g}"
+                for bus, value in (getattr(zone, "vehicle_penalties", {}) or {}).items()
+            )
+            lines.append(
+                f"{name}: {mode} | {geometry} | {radius} | {priority} | {restricted} | "
+                f"{enabled} | {discount} | {outside} | {penalties}"
+            )
+        return "\n".join(lines)
+
     def _parse_depots_text(self, raw):
         depots = {}
         for line in (raw or "").splitlines():
@@ -805,6 +856,72 @@ locations.*:
                         radius_km=float(parts[2]),
                         duration_multiplier=float(parts[3]),
                         enabled=enabled,
+                    )
+                )
+            except ValueError:
+                continue
+        return zones
+
+    def _parse_center_zones_text(self, raw):
+        zones = []
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            name, zone_raw = line.split(":", 1)
+            parts = [part.strip() for part in zone_raw.split("|")]
+            if len(parts) < 5:
+                continue
+            try:
+                mode = (parts[0] or "circle").lower()
+                geometry = parts[1]
+                radius = float(parts[2] or 0)
+                priority_types = [item.strip() for item in parts[3].replace(";", ",").split(",") if item.strip()]
+                restricted_types = [item.strip() for item in parts[4].replace(";", ",").split(",") if item.strip()]
+                enabled = True
+                if len(parts) >= 6 and parts[5]:
+                    enabled = parts[5].lower() not in ("0", "false", "no", "off", "не")
+                discount = float(parts[6]) if len(parts) >= 7 and parts[6] else 0.9
+                outside_penalty = float(parts[7]) if len(parts) >= 8 and parts[7] else 0.0
+                penalties = {}
+                if len(parts) >= 9 and parts[8]:
+                    for item in parts[8].replace(";", ",").split(","):
+                        if "=" not in item:
+                            continue
+                        bus, value = item.split("=", 1)
+                        penalties[bus.strip()] = float(value.strip())
+                if not penalties:
+                    penalties = {bus: 40000.0 for bus in restricted_types}
+
+                if mode == "polygon":
+                    polygon = []
+                    for point_raw in geometry.split(";"):
+                        point_parts = [float(part.strip()) for part in point_raw.split(",") if part.strip()]
+                        if len(point_parts) == 2:
+                            polygon.append((point_parts[0], point_parts[1]))
+                    if len(polygon) < 3:
+                        continue
+                    center_coords = polygon[0]
+                else:
+                    coord_parts = [float(part.strip()) for part in geometry.split(",") if part.strip()]
+                    if len(coord_parts) != 2:
+                        continue
+                    center_coords = (coord_parts[0], coord_parts[1])
+                    polygon = []
+
+                zones.append(
+                    config.CenterZoneConfig(
+                        name=name.strip(),
+                        mode=mode,
+                        center_coords=center_coords,
+                        radius_km=radius,
+                        polygon=polygon,
+                        enabled=enabled,
+                        priority_vehicle_types=priority_types,
+                        restricted_vehicle_types=restricted_types,
+                        discount_priority_vehicle=discount,
+                        priority_vehicle_outside_penalty=outside_penalty,
+                        vehicle_penalties=penalties,
                     )
                 )
             except ValueError:
@@ -1600,6 +1717,16 @@ API пример:
     internal_bus_penalty, external_bus_penalty, special_bus_penalty, vratza_bus_penalty.
   center_bus_outside_penalty:
     Глоба за center bus извън центъра.
+
+Допълнителни център зони:
+  center_zones:
+    Списък от независими зони. Всяка има собствен radius/polygon и собствени правила по тип бус.
+  priority_vehicle_types:
+    Кои бусове получават отстъпка вътре в тази зона.
+  restricted_vehicle_types:
+    Кои бусове получават глоба вътре в тази зона.
+  vehicle_penalties:
+    Глоба по тип бус, напр. {"internal_bus": 40000, "external_bus": 40000}.
 
 Трафик:
   city_traffic:
@@ -2636,6 +2763,18 @@ setData не трябва да се пуска:
                          tooltip="0.5 = плаща 50% от разстоянието"); gr += 1
         self._add_field(center_zone, gr, "locations.center_bus_outside_center_penalty", "Глоба CENTER_BUS навън:", getattr(loc, "center_bus_outside_center_penalty", 50000.0),
                          tooltip="Добавя се към цената, когато CENTER_BUS обслужва клиент извън център зоната."); gr += 1
+        self._add_list_field(
+            center_zone,
+            gr,
+            "locations.center_zones",
+            "Доп. център зони:",
+            self._format_center_zones_text(getattr(loc, "center_zones", []) or {}).splitlines(),
+            tooltip=(
+                "Една зона на ред. Формат: Име: circle | lat, lon | радиус | приоритетни бусове | "
+                "ограничени бусове | enabled | discount | outside_penalty | bus=penalty. "
+                "За polygon: Име: polygon | lat, lon; lat, lon; lat, lon | | center_bus | internal_bus,external_bus | true | 0.9 | 0 | internal_bus=40000."
+            ),
+        ); gr += 1
 
         center_penalties, gr = self._add_grid_group(
             f,
@@ -3109,6 +3248,20 @@ POST {solve_path} - клиенти + настройки в една заявка
       "vratza_bus_penalty": 40000,
       "center_bus_outside_penalty": 0
     }},
+    "center_zones": [
+      {{
+        "name": "Център 2",
+        "mode": "circle",
+        "center": [42.7093, 23.3137],
+        "radius_km": 1.2,
+        "priority_vehicle_types": ["center_bus"],
+        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+        "discount_priority_vehicle": 0.9,
+        "priority_vehicle_outside_penalty": 0,
+        "vehicle_penalties": {{"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000}},
+        "enabled": true
+      }}
+    ],
     "traffic_zones": [
       {{"name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true}}
     ]
@@ -3643,6 +3796,12 @@ POST {solve_path} - клиенти + настройки в една заявка
                 values["locations.traffic_zones"],
             )
 
+        if "locations.center_zones" in values:
+            content = self._replace_center_zones_value(
+                content,
+                values["locations.center_zones"],
+            )
+
         # ─── Vehicle fields ───
         if self._should_rewrite_vehicle_list(values):
             content = self._replace_vehicles_block(content, values)
@@ -3788,6 +3947,60 @@ POST {solve_path} - клиенти + настройки в една заявка
             r'field\(default_factory=lambda:\s*\[.*?\]\)'
         )
         return re.sub(pattern, rf'\g<1>{new_block}', content, flags=re.S)
+
+    def _replace_center_zones_value(self, content, raw_val):
+        import re
+
+        zones = self._parse_center_zones_text(raw_val)
+        if zones:
+            zone_blocks = []
+            for zone in zones:
+                polygon = getattr(zone, "polygon", []) or []
+                polygon_block = "[" + ", ".join(f"({float(lat)}, {float(lon)})" for lat, lon in polygon) + "]"
+                center = getattr(zone, "center_coords", None)
+                center_block = f"({float(center[0])}, {float(center[1])})" if center else "None"
+                priority = "[" + ", ".join(f'"{item}"' for item in (zone.priority_vehicle_types or [])) + "]"
+                restricted = "[" + ", ".join(f'"{item}"' for item in (zone.restricted_vehicle_types or [])) + "]"
+                penalties = "{" + ", ".join(
+                    f'"{bus}": {float(value)}'
+                    for bus, value in (zone.vehicle_penalties or {}).items()
+                ) + "}"
+                safe_name = zone.name.replace(chr(34), chr(92) + chr(34))
+                zone_blocks.append(
+                    "\n        ".join([
+                        "CenterZoneConfig(",
+                        f'    name="{safe_name}",',
+                        f'    mode="{zone.mode}",',
+                        f"    center_coords={center_block},",
+                        f"    radius_km={float(zone.radius_km)},",
+                        f"    polygon={polygon_block},",
+                        f"    enabled={'True' if zone.enabled else 'False'},",
+                        f"    priority_vehicle_types={priority},",
+                        f"    restricted_vehicle_types={restricted},",
+                        f"    discount_priority_vehicle={float(zone.discount_priority_vehicle)},",
+                        f"    priority_vehicle_outside_penalty={float(zone.priority_vehicle_outside_penalty)},",
+                        f"    vehicle_penalties={penalties},",
+                        ")",
+                    ])
+                )
+            joined_blocks = ",\n        ".join(zone_blocks)
+            new_block = f"field(default_factory=lambda: [\n        {joined_blocks}\n    ])"
+        else:
+            new_block = "field(default_factory=lambda: [])"
+
+        multiline_pattern = (
+            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*\[.*?\n    \]\)'
+        )
+        content, count = re.subn(multiline_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        if count:
+            return content
+
+        empty_pattern = (
+            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*\[\]\)'
+        )
+        return re.sub(empty_pattern, rf'\g<1>{new_block}', content, flags=re.S)
 
     def _replace_list_field_value(self, content, field_name, raw_val):
         """Замества List[str] поле с field(default_factory=lambda: [...]) в config.py"""

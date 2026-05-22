@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, urlparse
 from config import (
     MainConfig,
     RoutingEngine,
+    CenterZoneConfig,
     TrafficZoneConfig,
     VehicleConfig,
     VehicleType,
@@ -85,6 +86,7 @@ _SPECIAL_SETTING_KEYS = {
     "depot_location",
     "center_location",
     "center_zone",
+    "center_zones",
     "traffic_zones",
     "city_traffic",
     "vratza_depot",
@@ -162,6 +164,7 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "center_zone_mode": ("locations", "center_zone_mode"),
     "center_zone_radius": ("locations", "center_zone_radius_km"),
     "center_zone_radius_km": ("locations", "center_zone_radius_km"),
+    "center_zones": ("locations", "center_zones"),
     "city_traffic_center": ("locations", "city_center_coords"),
     "city_traffic_radius": ("locations", "city_traffic_radius_km"),
     "city_traffic_radius_km": ("locations", "city_traffic_radius_km"),
@@ -235,6 +238,7 @@ _QUERY_SETTING_ALIASES = {
     "center_zone_mode": "center_zone_mode",
     "center_zone_radius": "center_zone_radius",
     "center_zone_radius_km": "center_zone_radius_km",
+    "center_zones": "center_zones",
     "city_traffic_center": "city_traffic_center",
     "city_traffic_radius": "city_traffic_radius",
     "city_traffic_radius_km": "city_traffic_radius_km",
@@ -656,6 +660,10 @@ def _coerce_setting_value(section_name: str, field_name: str, value: Any, curren
         return _parse_coords_list(value)
     if field_name in {"parallel_first_solution_strategies", "parallel_local_search_metaheuristics"}:
         return _parse_string_list(value)
+    if field_name == "center_zones":
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else []
+        return [_center_zone_from_payload(item) for item in (value or [])]
     if field_name == "traffic_zones":
         return [_traffic_zone_from_payload(item) for item in (value or [])]
     if field_name == "depot_locations" and isinstance(value, dict):
@@ -702,6 +710,77 @@ def _traffic_zone_from_payload(payload: Any) -> TrafficZoneConfig:
         radius_km=float(payload.get("radius_km", payload.get("radius", 0)) or 0),
         duration_multiplier=float(payload.get("duration_multiplier", payload.get("multiplier", payload.get("delay_multiplier", 1.0))) or 1.0),
         enabled=_parse_bool(payload.get("enabled", True)),
+    )
+
+
+def _vehicle_type_list_from_payload(value: Any) -> list[str]:
+    vehicle_types = []
+    for item in _parse_string_list(value):
+        text = item.strip().lower()
+        matched = False
+        for vehicle_type in VehicleType:
+            if text in {vehicle_type.value.lower(), vehicle_type.name.lower()}:
+                vehicle_types.append(vehicle_type.value)
+                matched = True
+                break
+        if not matched and text:
+            vehicle_types.append(text)
+    return vehicle_types
+
+
+def _center_zone_from_payload(payload: Any) -> CenterZoneConfig:
+    if isinstance(payload, CenterZoneConfig):
+        return payload
+    if not isinstance(payload, dict):
+        raise ValueError(f"center_zones трябва да съдържа JSON обекти: {payload!r}")
+
+    raw_penalties = payload.get("vehicle_penalties", payload.get("penalties", {})) or {}
+    vehicle_penalties: dict[str, float] = {}
+    if isinstance(raw_penalties, dict):
+        for key, raw_value in raw_penalties.items():
+            vehicle_key = _vehicle_type_list_from_payload([key])
+            if vehicle_key:
+                vehicle_penalties[vehicle_key[0]] = float(raw_value or 0)
+
+    priority_types = _vehicle_type_list_from_payload(
+        payload.get("priority_vehicle_types", payload.get("priority_buses", payload.get("priority", ["center_bus"])))
+    )
+    restricted_types = _vehicle_type_list_from_payload(
+        payload.get(
+            "restricted_vehicle_types",
+            payload.get("restricted_buses", payload.get("restricted", ["internal_bus", "external_bus", "special_bus", "vratza_bus"])),
+        )
+    )
+    if not vehicle_penalties:
+        vehicle_penalties = {vehicle_type: 40000.0 for vehicle_type in restricted_types}
+    center_payload = payload.get("center_coords", payload.get("center", payload.get("location", None)))
+    if center_payload is None and any(key in payload for key in ("lat", "latitude", "lon", "lng", "longitude")):
+        center_payload = payload
+    polygon_payload = payload.get("polygon", payload.get("path", []))
+    if isinstance(polygon_payload, str) and ";" in polygon_payload:
+        polygon_payload = [part.strip() for part in polygon_payload.split(";") if part.strip()]
+
+    return CenterZoneConfig(
+        name=str(payload.get("name", payload.get("label", "Center zone"))),
+        mode=str(payload.get("mode", "circle") or "circle").strip().lower(),
+        center_coords=_parse_coords(center_payload),
+        radius_km=float(payload.get("radius_km", payload.get("radius", 1.0)) or 0),
+        polygon=_parse_coords_list(polygon_payload),
+        enabled=_parse_bool(payload.get("enabled", True)),
+        enable_priority=_parse_bool(payload.get("enable_priority", True)),
+        enable_restrictions=_parse_bool(payload.get("enable_restrictions", True)),
+        priority_vehicle_types=priority_types,
+        restricted_vehicle_types=restricted_types,
+        discount_priority_vehicle=float(
+            payload.get("discount_priority_vehicle", payload.get("discount", payload.get("discount_center_bus", 0.9))) or 1.0
+        ),
+        priority_vehicle_outside_penalty=float(
+            payload.get(
+                "priority_vehicle_outside_penalty",
+                payload.get("outside_penalty", payload.get("center_bus_outside_penalty", 0.0)),
+            ) or 0.0
+        ),
+        vehicle_penalties=vehicle_penalties,
     )
 
 
@@ -816,6 +895,13 @@ def _apply_center_zone(config: MainConfig, value: Any) -> list[str]:
     if not isinstance(value, dict):
         raise ValueError("center_zone трябва да е JSON обект")
     locations = config.locations
+    applied: list[str] = []
+    if "zones" in value:
+        locations.center_zones = [_center_zone_from_payload(item) for item in (value.get("zones") or [])]
+        applied.append("locations.center_zones")
+    if "center_zones" in value:
+        locations.center_zones = [_center_zone_from_payload(item) for item in (value.get("center_zones") or [])]
+        applied.append("locations.center_zones")
     mapping = {
         "mode": "center_zone_mode",
         "radius": "center_zone_radius_km",
@@ -833,8 +919,9 @@ def _apply_center_zone(config: MainConfig, value: Any) -> list[str]:
         "vratza_bus_penalty": "vratza_bus_center_penalty",
         "discount_center_bus": "discount_center_bus",
     }
-    applied: list[str] = []
     for key, raw_value in value.items():
+        if key in {"zones", "center_zones"}:
+            continue
         field_name = mapping.get(key, key if hasattr(locations, key) else "")
         if not field_name or not hasattr(locations, field_name):
             continue
@@ -873,6 +960,9 @@ def _apply_special_location_setting(config: MainConfig, key: str, value: Any) ->
         return _apply_depots(config, value)
     if key == "center_zone":
         return _apply_center_zone(config, value)
+    if key == "center_zones":
+        config.locations.center_zones = [_center_zone_from_payload(item) for item in (value or [])]
+        return ["locations.center_zones"]
     if key == "traffic_zones":
         config.locations.traffic_zones = [_traffic_zone_from_payload(item) for item in (value or [])]
         return ["locations.traffic_zones"]

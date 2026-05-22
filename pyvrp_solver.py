@@ -49,6 +49,8 @@ from config import (
     LocationConfig,
     calculate_customer_drop_penalties,
     is_location_in_center_zone,
+    center_zone_cost_adjustment,
+    center_zone_profile_signature,
     build_ordered_depots,
     get_traffic_multiplier,
     get_traffic_zones,
@@ -267,8 +269,6 @@ class PyVRPSolver:
         Returns:
             PyVRP Model инстанция
         """
-        from config import VehicleType as ConfigVehicleType
-        
         model = Model()
         
         # Всички локации (депа + клиенти) в списък за лесен достъп
@@ -371,53 +371,17 @@ class PyVRPSolver:
             logger.debug(f"  - Client {idx}: ID={customer.id}, volume={delivery}, center={is_in_center}, prize={client_prize}")
 
         # 4. Създаваме профил за всеки тип бус, за да има точен service time.
-        center_discount = (
-            self.location_config.discount_center_bus
-            if self.location_config and center_priority_enabled
-            else 1.0
-        )
-        center_bus_outside_penalty = (
-            getattr(self.location_config, "center_bus_outside_center_penalty", 50000)
-            if self.location_config
-            else 50000
-        )
-        center_penalties_by_type = {}
-        if self.location_config and center_restrictions_enabled:
-            center_penalties_by_type = {
-                ConfigVehicleType.INTERNAL_BUS.value: int(getattr(self.location_config, "internal_bus_center_penalty", 50000) or 0),
-                ConfigVehicleType.EXTERNAL_BUS.value: int(getattr(self.location_config, "external_bus_center_penalty", 50000) or 0),
-                ConfigVehicleType.SPECIAL_BUS.value: int(getattr(self.location_config, "special_bus_center_penalty", 50000) or 0),
-                ConfigVehicleType.VRATZA_BUS.value: int(getattr(self.location_config, "vratza_bus_center_penalty", 50000) or 0),
-            }
-        
-        center_bus_outside_cost = self._objective_penalty_cost(center_bus_outside_penalty)
-        center_penalty_costs_by_type = {
-            v_type: self._objective_penalty_cost(value)
-            for v_type, value in center_penalties_by_type.items()
-        }
-
         def profile_signature(v_config: VehicleConfig):
             service_time_seconds = int(v_config.service_time_minutes * 60)
             vehicle_type_value = getattr(v_config.vehicle_type, "value", str(v_config.vehicle_type))
 
-            # Start/end depots are intentionally not part of this signature.
-            # PyVRP stores them on each vehicle type; the profile stores the
-            # full all-locations edge table, including arcs from every depot.
-            behavior = ("plain",)
-            if (
-                vehicle_type_value == ConfigVehicleType.CENTER_BUS.value
-                and center_priority_enabled
-                and (abs(float(center_discount) - 1.0) > 1e-9 or center_bus_outside_cost > 0)
-            ):
-                behavior = ("center_priority", round(float(center_discount), 6), center_bus_outside_cost)
-            elif vehicle_type_value != ConfigVehicleType.CENTER_BUS.value and center_restrictions_enabled:
-                penalty_cost = center_penalty_costs_by_type.get(vehicle_type_value, 0)
-                if penalty_cost > 0:
-                    behavior = ("center_penalty", penalty_cost)
-
             # Service time affects shift duration and time-window feasibility,
             # so it is part of the profile signature even in distance mode.
-            return service_time_seconds, behavior
+            return (
+                service_time_seconds,
+                vehicle_type_value,
+                center_zone_profile_signature(vehicle_type_value, self.location_config),
+            )
 
         compressed_profiles = {}
         profile_specs = []
@@ -430,7 +394,8 @@ class PyVRPSolver:
                 spec = {
                     "profile": model.add_profile(),
                     "service_time_seconds": signature[0],
-                    "behavior": signature[1],
+                    "vehicle_type": signature[1],
+                    "center_behavior": signature[2],
                     "vehicle_types": [],
                 }
                 compressed_profiles[signature] = spec
@@ -450,25 +415,11 @@ class PyVRPSolver:
         )
         for idx, spec in enumerate(profile_specs, start=1):
             logger.info(
-                "  - profile #%s: service=%s sec, behavior=%s, vehicles=%s",
+                "  - profile #%s: service=%s sec, center_rules=%s, vehicles=%s",
                 idx,
                 spec["service_time_seconds"],
-                spec["behavior"],
+                spec["center_behavior"],
                 ", ".join(spec["vehicle_types"]),
-            )
-
-        vehicle_profiles = {}
-        vehicle_service_times = {}
-        profile_vehicle_configs = {}
-        for v_config in []:
-            v_key = v_config.vehicle_type.value
-            if v_key in vehicle_profiles:
-                continue
-            vehicle_profiles[v_key] = model.add_profile()
-            vehicle_service_times[v_key] = int(v_config.service_time_minutes * 60)
-            profile_vehicle_configs[v_key] = v_config
-            logger.info(
-                f"Added profile for {v_key}: service time {v_config.service_time_minutes} мин/клиент"
             )
 
         # 5. Добавяме edges за всички профили
@@ -479,9 +430,7 @@ class PyVRPSolver:
         logger.info(f"  - Objective metric: {objective_metric}")
         if objective_metric == "time":
             logger.warning("PyVRP time objective uses duration as PyVRP distance/cost; real km are still reported and validated after extraction.")
-        logger.info(f"  - Center discount for CENTER_BUS: {center_discount}")
-        logger.info(f"  - Outside-center penalty for CENTER_BUS: {center_bus_outside_penalty}")
-        logger.info(f"  - Center penalties by bus type: {center_penalties_by_type}")
+        logger.info("  - Center zone rules are applied per independent zone and per vehicle type")
         
         # Настройки за градски трафик
         traffic_zones = get_traffic_zones(self.location_config)
@@ -546,26 +495,21 @@ class PyVRPSolver:
                 )
 
                 for profile_spec in profile_specs:
-                    behavior = profile_spec["behavior"]
+                    vehicle_type_value = profile_spec["vehicle_type"]
                     vehicle_duration = duration
                     if i >= num_depots:
                         vehicle_duration += int(profile_spec["service_time_seconds"])
                     profile_objective_cost = self._objective_arc_cost(base_distance, vehicle_duration)
 
-                    if behavior[0] == "center_priority":
-                        if is_dest_center_client and center_priority_enabled:
-                            vehicle_distance = int(profile_objective_cost * float(behavior[1]))
-                        elif is_dest_client and center_priority_enabled:
-                            vehicle_distance = profile_objective_cost + int(behavior[2])
-                        else:
-                            vehicle_distance = profile_objective_cost
-                    elif behavior[0] == "center_penalty":
-                        if is_dest_center_client and center_restrictions_enabled:
-                            vehicle_distance = profile_objective_cost + int(behavior[1])
-                        else:
-                            vehicle_distance = profile_objective_cost
-                    else:
-                        vehicle_distance = profile_objective_cost
+                    vehicle_distance = profile_objective_cost
+                    if is_dest_client:
+                        multiplier, penalty = center_zone_cost_adjustment(
+                            location_coords[j],
+                            vehicle_type_value,
+                            self.location_config,
+                            self._objective_penalty_cost,
+                        )
+                        vehicle_distance = int(round(profile_objective_cost * multiplier)) + penalty
 
                     model.add_edge(
                         frm=all_locations[i],
@@ -573,35 +517,6 @@ class PyVRPSolver:
                         distance=vehicle_distance,
                         duration=vehicle_duration,
                         profile=profile_spec["profile"]
-                    )
-
-                for v_key, v_config in profile_vehicle_configs.items():
-                    vehicle_type_value = getattr(v_config.vehicle_type, "value", str(v_config.vehicle_type))
-                    vehicle_duration = duration
-                    if i >= num_depots:
-                        vehicle_duration += vehicle_service_times.get(v_key, 15 * 60)
-                    profile_objective_cost = self._objective_arc_cost(base_distance, vehicle_duration)
-
-                    if vehicle_type_value == ConfigVehicleType.CENTER_BUS.value:
-                        if is_dest_center_client and center_priority_enabled:
-                            vehicle_distance = int(profile_objective_cost * center_discount)
-                        elif is_dest_client and center_priority_enabled:
-                            vehicle_distance = profile_objective_cost + self._objective_penalty_cost(center_bus_outside_penalty)
-                        else:
-                            vehicle_distance = profile_objective_cost
-                    else:
-                        if is_dest_center_client and center_restrictions_enabled:
-                            vehicle_penalty = center_penalties_by_type.get(vehicle_type_value, 50000)
-                            vehicle_distance = profile_objective_cost + self._objective_penalty_cost(vehicle_penalty)
-                        else:
-                            vehicle_distance = profile_objective_cost
-
-                    model.add_edge(
-                        frm=all_locations[i],
-                        to=all_locations[j],
-                        distance=vehicle_distance,
-                        duration=vehicle_duration,
-                        profile=vehicle_profiles[v_key]
                     )
 
         if traffic_zones:

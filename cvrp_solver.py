@@ -27,6 +27,7 @@ from config import (
     VehicleType,
     LocationConfig,
     is_location_in_center_zone,
+    center_zone_cost_adjustment,
     calculate_customer_drop_penalties,
     build_ordered_depots,
     get_traffic_multiplier,
@@ -312,68 +313,11 @@ class ORToolsSolver:
                     return 86400
                 return result
 
-            center_zone_customer_ids_for_cost = {c.id for c in self.center_zone_customers}
-            center_priority_enabled = bool(self.center_zone_customers and data['center_bus_vehicle_ids'])
-            center_discount = (
-                float(getattr(self.location_config, "discount_center_bus", 1.0) or 1.0)
-                if self.location_config
-                else 1.0
-            )
-            center_bus_outside_cost = self._objective_penalty_cost(
-                getattr(self.location_config, "center_bus_outside_center_penalty", 50000)
-                if self.location_config
-                else 50000
-            )
-            center_restrictions_enabled = bool(
-                self.location_config and getattr(self.location_config, "enable_center_zone_restrictions", False)
-            )
-            center_penalty_cost_by_type = {
-                VehicleType.EXTERNAL_BUS.value: self._objective_penalty_cost(
-                    getattr(self.location_config, "external_bus_center_penalty", 50000)
-                    if self.location_config
-                    else 50000
-                ),
-                VehicleType.INTERNAL_BUS.value: self._objective_penalty_cost(
-                    getattr(self.location_config, "internal_bus_center_penalty", 50000)
-                    if self.location_config
-                    else 50000
-                ),
-                VehicleType.SPECIAL_BUS.value: self._objective_penalty_cost(
-                    getattr(self.location_config, "special_bus_center_penalty", 50000)
-                    if self.location_config
-                    else 50000
-                ),
-                VehicleType.VRATZA_BUS.value: self._objective_penalty_cost(
-                    getattr(self.location_config, "vratza_bus_center_penalty", 100000)
-                    if self.location_config
-                    else 100000
-                ),
-            }
-
             def customer_for_node(node: int) -> Optional[Customer]:
                 customer_index = node - len(self.unique_depots)
                 if 0 <= customer_index < len(self.customers):
                     return self.customers[customer_index]
                 return None
-
-            def precomputed_customer_is_in_center_zone(customer: Customer) -> bool:
-                return bool(
-                    customer.id in center_zone_customer_ids_for_cost
-                    or (
-                        customer.coordinates
-                        and self.location_config
-                        and is_location_in_center_zone(customer.coordinates, self.location_config)
-                    )
-                )
-
-            center_priority_by_node = [False] * num_locations
-            center_zone_by_node = [False] * num_locations
-            for node in range(len(self.unique_depots), num_locations):
-                customer = customer_for_node(node)
-                if customer is None:
-                    continue
-                center_priority_by_node[node] = customer.id in center_zone_customer_ids_for_cost
-                center_zone_by_node[node] = precomputed_customer_is_in_center_zone(customer)
 
             vehicle_time_matrices = []
             vehicle_objective_cost_matrices = []
@@ -392,14 +336,14 @@ class ORToolsSolver:
 
                         cost = objective_arc_cost(from_node, to_node, service_time_seconds)
                         customer = customer_for_node(to_node)
-                        if customer is not None:
-                            if vehicle_type_value == VehicleType.CENTER_BUS.value and center_priority_enabled:
-                                if center_priority_by_node[to_node]:
-                                    cost = int(round(cost * center_discount))
-                                else:
-                                    cost += center_bus_outside_cost
-                            elif center_restrictions_enabled and center_zone_by_node[to_node]:
-                                cost += center_penalty_cost_by_type.get(vehicle_type_value, 0)
+                        if customer is not None and customer.coordinates:
+                            multiplier, penalty = center_zone_cost_adjustment(
+                                customer.coordinates,
+                                vehicle_type_value,
+                                self.location_config,
+                                self._objective_penalty_cost,
+                            )
+                            cost = int(round(cost * multiplier)) + penalty
 
                         objective_row.append(max(0, int(round(cost))))
                     time_matrix.append(time_row)

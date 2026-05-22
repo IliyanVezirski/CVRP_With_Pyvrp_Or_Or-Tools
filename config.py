@@ -108,6 +108,34 @@ class TrafficZoneConfig:
 
 
 @dataclass
+class CenterZoneConfig:
+    """Independent center zone with its own vehicle targeting rules."""
+    name: str
+    mode: str = "circle"  # circle or polygon
+    center_coords: Optional[Tuple[float, float]] = None
+    radius_km: float = 1.0
+    polygon: List[Tuple[float, float]] = field(default_factory=lambda: [])
+    enabled: bool = True
+    enable_priority: bool = True
+    enable_restrictions: bool = True
+    priority_vehicle_types: List[str] = field(default_factory=lambda: [VehicleType.CENTER_BUS.value])
+    restricted_vehicle_types: List[str] = field(default_factory=lambda: [
+        VehicleType.INTERNAL_BUS.value,
+        VehicleType.EXTERNAL_BUS.value,
+        VehicleType.SPECIAL_BUS.value,
+        VehicleType.VRATZA_BUS.value,
+    ])
+    discount_priority_vehicle: float = 0.9
+    priority_vehicle_outside_penalty: float = 0.0
+    vehicle_penalties: Dict[str, float] = field(default_factory=lambda: {
+        VehicleType.INTERNAL_BUS.value: 40000.0,
+        VehicleType.EXTERNAL_BUS.value: 40000.0,
+        VehicleType.SPECIAL_BUS.value: 40000.0,
+        VehicleType.VRATZA_BUS.value: 40000.0,
+    })
+
+
+@dataclass
 class LocationConfig:
     """GPS координати за важни локации в системата."""
     depot_location: Tuple[float, float] = (42.695785029219415, 23.23165887245312)  # Главно депо, от което тръгват повечето превозни средства.
@@ -158,6 +186,7 @@ class LocationConfig:
         (42.70035998, 23.2969594)
     ])  # Точки на полигона: [(lat, lon), ...]
     center_zone_radius_km: float = 1.9  # Радиус на център зоната в километри
+    center_zones: List[CenterZoneConfig] = field(default_factory=lambda: [])  # Допълнителни център зони.
     enable_center_zone_priority: bool = True  # Дали да се прилага приоритет за център зоната
     
     # Параметри за глобата на останалите бусове за влизане в центъра
@@ -211,16 +240,243 @@ def is_point_in_polygon(point: Optional[Tuple[float, float]], polygon: List[Tupl
     return inside
 
 
+def _vehicle_type_value(value: Any) -> str:
+    if isinstance(value, VehicleType):
+        return value.value
+    return str(value or "").strip().lower()
+
+
+def _normalise_vehicle_type_values(values: Optional[List[Any]]) -> List[str]:
+    normalised = []
+    for value in values or []:
+        vehicle_type = _vehicle_type_value(value)
+        if vehicle_type:
+            normalised.append(vehicle_type)
+    return normalised
+
+
+def _legacy_center_zone(location_config: LocationConfig) -> Optional[CenterZoneConfig]:
+    mode = str(getattr(location_config, "center_zone_mode", "circle") or "circle").lower()
+    polygon = list(getattr(location_config, "center_zone_polygon", []) or [])
+    center = getattr(location_config, "center_location", None)
+    radius = float(getattr(location_config, "center_zone_radius_km", 0) or 0)
+    zone_kwargs = {
+        "enable_priority": bool(getattr(location_config, "enable_center_zone_priority", True)),
+        "enable_restrictions": bool(getattr(location_config, "enable_center_zone_restrictions", True)),
+        "priority_vehicle_types": [VehicleType.CENTER_BUS.value],
+        "restricted_vehicle_types": [
+            VehicleType.INTERNAL_BUS.value,
+            VehicleType.EXTERNAL_BUS.value,
+            VehicleType.SPECIAL_BUS.value,
+            VehicleType.VRATZA_BUS.value,
+        ],
+        "discount_priority_vehicle": float(getattr(location_config, "discount_center_bus", 1.0) or 1.0),
+        "priority_vehicle_outside_penalty": float(
+            getattr(location_config, "center_bus_outside_center_penalty", 0.0) or 0.0
+        ),
+        "vehicle_penalties": {
+            VehicleType.INTERNAL_BUS.value: float(getattr(location_config, "internal_bus_center_penalty", 0.0) or 0.0),
+            VehicleType.EXTERNAL_BUS.value: float(getattr(location_config, "external_bus_center_penalty", 0.0) or 0.0),
+            VehicleType.SPECIAL_BUS.value: float(getattr(location_config, "special_bus_center_penalty", 0.0) or 0.0),
+            VehicleType.VRATZA_BUS.value: float(getattr(location_config, "vratza_bus_center_penalty", 0.0) or 0.0),
+        },
+    }
+    legacy_enabled = bool(zone_kwargs["enable_priority"] or zone_kwargs["enable_restrictions"])
+
+    if mode == "polygon" and len(polygon) >= 3:
+        return CenterZoneConfig(
+            name="Основна център зона",
+            mode="polygon",
+            center_coords=center,
+            radius_km=radius,
+            polygon=polygon,
+            enabled=legacy_enabled,
+            **zone_kwargs,
+        )
+
+    if center and radius > 0:
+        return CenterZoneConfig(
+            name="Основна център зона",
+            mode="circle",
+            center_coords=center,
+            radius_km=radius,
+            polygon=[],
+            enabled=legacy_enabled,
+            **zone_kwargs,
+        )
+
+    return None
+
+
+def get_center_zones(
+    location_config: Optional[LocationConfig],
+    include_disabled: bool = False,
+    include_legacy: bool = True,
+) -> List[CenterZoneConfig]:
+    """Returns configured center zones. Legacy single-zone settings are zone #1."""
+    if not location_config:
+        return []
+
+    zones: List[CenterZoneConfig] = []
+    if include_legacy:
+        legacy = _legacy_center_zone(location_config)
+        if legacy and (include_disabled or getattr(legacy, "enabled", True)):
+            zones.append(legacy)
+
+    for zone in getattr(location_config, "center_zones", []) or []:
+        if not isinstance(zone, CenterZoneConfig):
+            continue
+        if not include_disabled and not getattr(zone, "enabled", True):
+            continue
+        zones.append(zone)
+
+    return zones
+
+
+def _center_zone_contains(
+    coords: Optional[Tuple[float, float]],
+    zone: CenterZoneConfig,
+    fallback_center: Optional[Tuple[float, float]] = None,
+) -> bool:
+    if not coords or not getattr(zone, "enabled", True):
+        return False
+
+    mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+    polygon = list(getattr(zone, "polygon", []) or [])
+    if mode == "polygon" and len(polygon) >= 3:
+        return is_point_in_polygon(coords, polygon)
+
+    center = getattr(zone, "center_coords", None) or fallback_center
+    radius = float(getattr(zone, "radius_km", 0) or 0)
+    return bool(center and radius > 0 and _distance_km(coords, center) <= radius)
+
+
 def is_location_in_center_zone(coords: Optional[Tuple[float, float]], location_config: LocationConfig) -> bool:
     if not coords:
         return False
 
-    mode = getattr(location_config, "center_zone_mode", "circle")
-    polygon = getattr(location_config, "center_zone_polygon", [])
-    if str(mode).lower() == "polygon" and len(polygon) >= 3:
-        return is_point_in_polygon(coords, polygon)
+    fallback_center = getattr(location_config, "center_location", None)
+    return any(
+        _center_zone_contains(coords, zone, fallback_center)
+        for zone in get_center_zones(location_config)
+    )
 
-    return _distance_km(coords, location_config.center_location) <= location_config.center_zone_radius_km
+
+def get_matching_center_zones(
+    coords: Optional[Tuple[float, float]],
+    location_config: Optional[LocationConfig],
+    include_legacy: bool = True,
+) -> List[CenterZoneConfig]:
+    if not coords or not location_config:
+        return []
+
+    fallback_center = getattr(location_config, "center_location", None)
+    return [
+        zone
+        for zone in get_center_zones(location_config, include_legacy=include_legacy)
+        if _center_zone_contains(coords, zone, fallback_center)
+    ]
+
+
+def center_zone_cost_adjustment(
+    coords: Optional[Tuple[float, float]],
+    vehicle_type: Any,
+    location_config: Optional[LocationConfig],
+    penalty_converter=None,
+) -> Tuple[float, int]:
+    """Returns objective multiplier and penalty for this vehicle/destination pair.
+
+    Each configured center zone is evaluated independently. Priority vehicles get
+    the best applicable discount in zones where they are targeted. Restricted
+    vehicles receive the sum of matching zone penalties. If a priority vehicle is
+    outside all zones that target it, the largest outside penalty is used, which
+    keeps legacy one-zone behaviour without multiplying penalties for many zones.
+    """
+    if not coords or not location_config:
+        return 1.0, 0
+
+    vehicle_type_value = _vehicle_type_value(vehicle_type)
+    if not vehicle_type_value:
+        return 1.0, 0
+
+    def convert_penalty(value: float) -> int:
+        try:
+            numeric = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            numeric = 0.0
+        if penalty_converter is None:
+            return int(round(numeric))
+        return int(penalty_converter(numeric))
+
+    priority_zones = []
+    matching_priority_zones = []
+    matching_restricted_zones = []
+    fallback_center = getattr(location_config, "center_location", None)
+
+    for zone in get_center_zones(location_config):
+        contains = _center_zone_contains(coords, zone, fallback_center)
+        priority_types = _normalise_vehicle_type_values(getattr(zone, "priority_vehicle_types", []))
+        restricted_types = _normalise_vehicle_type_values(getattr(zone, "restricted_vehicle_types", []))
+
+        if getattr(zone, "enable_priority", True) and vehicle_type_value in priority_types:
+            priority_zones.append(zone)
+            if contains:
+                matching_priority_zones.append(zone)
+
+        if (
+            getattr(zone, "enable_restrictions", True)
+            and vehicle_type_value in restricted_types
+            and contains
+        ):
+            matching_restricted_zones.append(zone)
+
+    multiplier = 1.0
+    penalty = 0
+
+    if matching_priority_zones:
+        multiplier = min(
+            float(getattr(zone, "discount_priority_vehicle", 1.0) or 1.0)
+            for zone in matching_priority_zones
+        )
+    elif priority_zones:
+        penalty = max(
+            convert_penalty(getattr(zone, "priority_vehicle_outside_penalty", 0.0))
+            for zone in priority_zones
+        )
+
+    for zone in matching_restricted_zones:
+        penalties = getattr(zone, "vehicle_penalties", {}) or {}
+        penalty += convert_penalty(penalties.get(vehicle_type_value, 0.0))
+
+    return multiplier, penalty
+
+
+def center_zone_profile_signature(vehicle_type: Any, location_config: Optional[LocationConfig]) -> Tuple[Any, ...]:
+    vehicle_type_value = _vehicle_type_value(vehicle_type)
+    if not vehicle_type_value or not location_config:
+        return ("center_plain",)
+
+    priority_parts = []
+    restricted_parts = []
+    for index, zone in enumerate(get_center_zones(location_config)):
+        priority_types = _normalise_vehicle_type_values(getattr(zone, "priority_vehicle_types", []))
+        restricted_types = _normalise_vehicle_type_values(getattr(zone, "restricted_vehicle_types", []))
+        if getattr(zone, "enable_priority", True) and vehicle_type_value in priority_types:
+            priority_parts.append((
+                index,
+                round(float(getattr(zone, "discount_priority_vehicle", 1.0) or 1.0), 6),
+                round(float(getattr(zone, "priority_vehicle_outside_penalty", 0.0) or 0.0), 3),
+            ))
+        if getattr(zone, "enable_restrictions", True) and vehicle_type_value in restricted_types:
+            penalties = getattr(zone, "vehicle_penalties", {}) or {}
+            restricted_parts.append((
+                index,
+                round(float(penalties.get(vehicle_type_value, 0.0) or 0.0), 3),
+            ))
+
+    if not priority_parts and not restricted_parts:
+        return ("center_plain",)
+    return ("center_rules", tuple(priority_parts), tuple(restricted_parts))
 
 
 def get_traffic_zones(location_config: Optional[LocationConfig]) -> List[TrafficZoneConfig]:
@@ -285,11 +541,17 @@ def get_traffic_multiplier(
 
 
 def describe_center_zone(location_config: LocationConfig) -> str:
-    mode = getattr(location_config, "center_zone_mode", "circle")
-    polygon = getattr(location_config, "center_zone_polygon", [])
-    if str(mode).lower() == "polygon" and len(polygon) >= 3:
-        return f"полигон с {len(polygon)} точки"
-    return f"радиус {location_config.center_zone_radius_km} км"
+    zones = get_center_zones(location_config)
+    if len(zones) > 1:
+        return f"{len(zones)} център зони"
+
+    if zones:
+        zone = zones[0]
+        if str(getattr(zone, "mode", "circle")).lower() == "polygon" and len(getattr(zone, "polygon", []) or []) >= 3:
+            return f"полигон с {len(zone.polygon)} точки"
+        return f"радиус {zone.radius_km} км"
+
+    return "няма активна център зона"
 
 
 def get_named_depots(location_config: LocationConfig) -> Dict[str, Tuple[float, float]]:
