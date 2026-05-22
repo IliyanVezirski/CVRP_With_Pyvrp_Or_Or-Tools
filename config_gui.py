@@ -4294,19 +4294,16 @@ POST {solve_path} - клиенти + настройки в една заявка
         else:
             new_block = "field(default_factory=lambda: [])"
 
-        multiline_pattern = (
-            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
-            r'field\(default_factory=lambda:\s*\[.*?\n    \]\)'
+        pattern = (
+            r'(?ms)^(    center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*(?:\[\]|\[\n.*?^    \])\)'
+            r'(?:[^\n]*)?'
         )
-        content, count = re.subn(multiline_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        content, count = re.subn(pattern, rf'\g<1>{new_block}', content)
         if count:
             return content
 
-        empty_pattern = (
-            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
-            r'field\(default_factory=lambda:\s*\[\]\)'
-        )
-        return re.sub(empty_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        return content
 
     def _replace_list_field_value(self, content, field_name, raw_val):
         """Замества List[str] поле с field(default_factory=lambda: [...]) в config.py"""
