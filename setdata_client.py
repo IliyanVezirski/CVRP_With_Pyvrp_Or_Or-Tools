@@ -126,47 +126,99 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
 
         for stop_index, customer in enumerate(route.customers):
             stop_number = stop_index + 1
-            id_plas_doc = str(getattr(customer, "plas_doc", "") or customer.document or customer.id or "")
-            context = {
-                "bus_number": bus_number,
-                "route_number": route_number,
-                "stop_number": stop_number,
-                "vehicle_type": vehicle_type,
-                "vehicle_name": vehicle_name,
-                "customer_id": customer.id,
-                "customer_document": customer.document,
-                "id_plas_doc": id_plas_doc,
-                "id_skld": id_skld,
-                "id_grafik": getattr(set_data, "set_data_id_grafik", ""),
-                "done_flag": getattr(set_data, "set_data_done_flag", ""),
-                "volume": customer.volume,
-            }
-            id_grafik_template = str(getattr(set_data, "set_data_id_grafik_template", "") or "").strip()
-            id_grafik = (
-                _format_bukva(id_grafik_template, context)
-                if id_grafik_template
-                else str(getattr(set_data, "set_data_id_grafik", "") or "")
-            )
-            context["id_grafik"] = id_grafik
-            rows.append(
+            for doc in _customer_set_data_documents(customer):
+                id_plas_doc = _doc_id_plas_doc(customer, doc)
+                customer_document = str(doc.get("document", "") or getattr(customer, "document", "") or "")
+                context = {
+                    "bus_number": bus_number,
+                    "route_number": route_number,
+                    "stop_number": stop_number,
+                    "vehicle_type": vehicle_type,
+                    "vehicle_name": vehicle_name,
+                    "customer_id": customer.id,
+                    "customer_document": customer_document,
+                    "id_plas_doc": id_plas_doc,
+                    "id_skld": id_skld,
+                    "id_grafik": getattr(set_data, "set_data_id_grafik", ""),
+                    "done_flag": getattr(set_data, "set_data_done_flag", ""),
+                    "volume": doc.get("volume", customer.volume),
+                }
+                id_grafik_template = str(getattr(set_data, "set_data_id_grafik_template", "") or "").strip()
+                id_grafik = (
+                    _format_bukva(id_grafik_template, context)
+                    if id_grafik_template
+                    else str(getattr(set_data, "set_data_id_grafik", "") or "")
+                )
+                context["id_grafik"] = id_grafik
+                rows.append(
+                    {
+                        "cmd": str(getattr(set_data, "set_data_command", "setData") or "setData"),
+                        "IdPlasDoc": id_plas_doc,
+                        "DoneFlag": str(getattr(set_data, "set_data_done_flag", "") or ""),
+                        "IdSkld": id_skld,
+                        "Bukva": _format_bukva(getattr(set_data, "set_data_bukva_template", ""), context),
+                        "IdGrafik": id_grafik,
+                    }
+                )
+
+    return rows
+
+
+def _customer_set_data_documents(customer: Any) -> List[Dict[str, Any]]:
+    documents = list(getattr(customer, "grouped_documents", None) or [])
+    result: List[Dict[str, Any]] = []
+    seen = set()
+    if documents:
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            document = str(item.get("document", "") or "")
+            plas_doc = str(item.get("plas_doc", "") or "")
+            key = plas_doc or document
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            result.append(
                 {
-                    "cmd": str(getattr(set_data, "set_data_command", "setData") or "setData"),
-                    "IdPlasDoc": id_plas_doc,
-                    "DoneFlag": str(getattr(set_data, "set_data_done_flag", "") or ""),
-                    "IdSkld": id_skld,
-                    "Bukva": _format_bukva(getattr(set_data, "set_data_bukva_template", ""), context),
-                    "IdGrafik": id_grafik,
+                    "document": document,
+                    "plas_doc": plas_doc,
+                    "source_id_skld": str(item.get("source_id_skld", "") or ""),
+                    "volume": item.get("volume", getattr(customer, "volume", "")),
                 }
             )
 
-    return rows
+    if result:
+        return result
+
+    return [
+        {
+            "document": str(getattr(customer, "document", "") or ""),
+            "plas_doc": str(getattr(customer, "plas_doc", "") or ""),
+            "source_id_skld": str(getattr(customer, "source_id_skld", "") or ""),
+            "volume": getattr(customer, "volume", ""),
+        }
+    ]
+
+
+def _doc_id_plas_doc(customer: Any, doc: Dict[str, Any]) -> str:
+    return str(
+        doc.get("plas_doc", "")
+        or doc.get("document", "")
+        or getattr(customer, "plas_doc", "")
+        or getattr(customer, "document", "")
+        or getattr(customer, "id", "")
+        or ""
+    )
 
 
 def _unique_customers(customers: List[Any]) -> List[Any]:
     seen = set()
     result = []
     for customer in customers:
-        key = str(getattr(customer, "plas_doc", "") or getattr(customer, "document", "") or getattr(customer, "id", "") or id(customer))
+        grouped_docs = _customer_set_data_documents(customer)
+        doc_key = "|".join(_doc_id_plas_doc(customer, doc) for doc in grouped_docs)
+        key = str(doc_key or getattr(customer, "id", "") or id(customer))
         if key in seen:
             continue
         seen.add(key)
@@ -179,41 +231,49 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
     set_data = config.set_data
     rows: List[Dict[str, str]] = []
 
-    for idx, customer in enumerate(_unique_customers(customers)):
-        stop_number = idx + 1
-        id_plas_doc = str(getattr(customer, "plas_doc", "") or getattr(customer, "document", "") or getattr(customer, "id", "") or "")
-        id_skld = str(getattr(customer, "source_id_skld", "") or getattr(set_data, "set_data_id_skld", "") or "")
-        done_flag = _resolve_unserved_done_flag(set_data)
-        context = {
-            "bus_number": "",
-            "route_number": 0,
-            "stop_number": stop_number,
-            "vehicle_type": "unserved",
-            "customer_id": getattr(customer, "id", ""),
-            "customer_document": getattr(customer, "document", ""),
-            "id_plas_doc": id_plas_doc,
-            "id_skld": id_skld,
-            "id_grafik": getattr(set_data, "set_data_unserved_id_grafik", ""),
-            "done_flag": done_flag,
-            "volume": getattr(customer, "volume", ""),
-        }
-        id_grafik_template = str(getattr(set_data, "set_data_unserved_id_grafik_template", "") or "").strip()
-        id_grafik = (
-            _format_bukva(id_grafik_template, context)
-            if id_grafik_template
-            else str(getattr(set_data, "set_data_unserved_id_grafik", "") or "")
-        )
-        context["id_grafik"] = id_grafik
-        rows.append(
-            {
-                "cmd": str(getattr(set_data, "set_data_command", "setData") or "setData"),
-                "IdPlasDoc": id_plas_doc,
-                "DoneFlag": done_flag,
-                "IdSkld": id_skld,
-                "Bukva": _format_bukva(getattr(set_data, "set_data_unserved_bukva_template", ""), context),
-                "IdGrafik": id_grafik,
+    stop_number = 0
+    for customer in _unique_customers(customers):
+        for doc in _customer_set_data_documents(customer):
+            stop_number += 1
+            id_plas_doc = _doc_id_plas_doc(customer, doc)
+            id_skld = str(
+                doc.get("source_id_skld", "")
+                or getattr(customer, "source_id_skld", "")
+                or getattr(set_data, "set_data_id_skld", "")
+                or ""
+            )
+            done_flag = _resolve_unserved_done_flag(set_data)
+            customer_document = str(doc.get("document", "") or getattr(customer, "document", "") or "")
+            context = {
+                "bus_number": "",
+                "route_number": 0,
+                "stop_number": stop_number,
+                "vehicle_type": "unserved",
+                "customer_id": getattr(customer, "id", ""),
+                "customer_document": customer_document,
+                "id_plas_doc": id_plas_doc,
+                "id_skld": id_skld,
+                "id_grafik": getattr(set_data, "set_data_unserved_id_grafik", ""),
+                "done_flag": done_flag,
+                "volume": doc.get("volume", getattr(customer, "volume", "")),
             }
-        )
+            id_grafik_template = str(getattr(set_data, "set_data_unserved_id_grafik_template", "") or "").strip()
+            id_grafik = (
+                _format_bukva(id_grafik_template, context)
+                if id_grafik_template
+                else str(getattr(set_data, "set_data_unserved_id_grafik", "") or "")
+            )
+            context["id_grafik"] = id_grafik
+            rows.append(
+                {
+                    "cmd": str(getattr(set_data, "set_data_command", "setData") or "setData"),
+                    "IdPlasDoc": id_plas_doc,
+                    "DoneFlag": done_flag,
+                    "IdSkld": id_skld,
+                    "Bukva": _format_bukva(getattr(set_data, "set_data_unserved_bukva_template", ""), context),
+                    "IdGrafik": id_grafik,
+                }
+            )
 
     return rows
 

@@ -7,7 +7,7 @@ import random
 import math
 import time
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
  
 
@@ -27,6 +27,7 @@ from config import (
     VehicleType,
     LocationConfig,
     is_location_in_center_zone,
+    center_zone_cost_adjustment,
     calculate_customer_drop_penalties,
     build_ordered_depots,
     get_traffic_multiplier,
@@ -84,6 +85,7 @@ class Route:
     total_time_minutes: float = 0.0
     total_volume: float = 0.0
     is_feasible: bool = True
+    schedule_entries: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -153,6 +155,20 @@ class ORToolsSolver:
         self.center_zone_customers = center_zone_customers or []
         self.location_config = location_config
 
+    def _objective_metric(self) -> str:
+        metric = str(getattr(self.config, "objective_metric", "distance") or "distance").strip().lower()
+        if metric in {"time", "duration", "fastest", "shortest_time"}:
+            return "time"
+        return "distance"
+
+    def _objective_penalty_cost(self, penalty_value) -> int:
+        penalty = max(0.0, float(penalty_value or 0))
+        if self._objective_metric() == "time":
+            # Existing penalties are tuned as meter-like costs. In time mode we
+            # convert them with an approximate 40 km/h reference speed.
+            penalty *= 0.09
+        return max(0, int(round(penalty)))
+
     def solve(self) -> CVRPSolution:
         """
         Стартира OR-Tools търсенето и връща извлеченото решение.
@@ -177,6 +193,8 @@ class ORToolsSolver:
                 len(data['distance_matrix']), data['num_vehicles'], data['vehicle_starts'], data['vehicle_ends']
             )
             routing = pywrapcp.RoutingModel(manager)
+            objective_metric = self._objective_metric()
+            logger.info(f"Solver objective metric: {objective_metric}")
 
             # 2. ЦЕНА НА МАРШРУТА = РАЗСТОЯНИЕ
             def distance_callback(from_index, to_index):
@@ -188,7 +206,7 @@ class ORToolsSolver:
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
             for vehicle_id, fixed_cost in enumerate(data.get('vehicle_fixed_costs', [])):
-                routing.SetFixedCostOfVehicle(int(fixed_cost), vehicle_id)
+                routing.SetFixedCostOfVehicle(self._objective_penalty_cost(fixed_cost), vehicle_id)
             logger.info(f"Vehicle fixed costs: {data.get('vehicle_fixed_costs', [])}")
 
             # 3. ОГРАНИЧЕНИЯ (DIMENSIONS) - ВСИЧКИ СА АКТИВНИ
@@ -255,9 +273,105 @@ class ORToolsSolver:
                             location_coords[from_node],
                             location_coords[to_node],
                         )
-            
+
+            def objective_arc_cost(from_node: int, to_node: int, service_time_seconds: int = 0) -> int:
+                if objective_metric == "time":
+                    value = float(self.distance_matrix.durations[from_node][to_node] or 0)
+                    if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
+                        value *= float(traffic_multipliers[from_node][to_node] or 1.0)
+                    if from_node >= len(self.unique_depots):
+                        value += service_time_seconds
+                    return max(0, int(round(value)))
+                return max(0, int(round(float(self.distance_matrix.distances[from_node][to_node] or 0))))
+
+            def safe_matrix_value(matrix, from_node: int, to_node: int, default: float = 0.0) -> float:
+                try:
+                    value = matrix[from_node][to_node]
+                except (IndexError, TypeError):
+                    return default
+                if value is None:
+                    return default
+                try:
+                    return float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return default
+
+            def time_arc_seconds(from_node: int, to_node: int, service_time_seconds: int = 0) -> int:
+                travel_time = safe_matrix_value(self.distance_matrix.durations, from_node, to_node, 3600.0)
+                if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
+                    traffic_multiplier = float(traffic_multipliers[from_node][to_node] or 1.0)
+                    if traffic_multiplier > 1.0:
+                        travel_time *= traffic_multiplier
+
+                if from_node >= len(self.unique_depots):
+                    travel_time += service_time_seconds
+
+                result = int(round(travel_time))
+                if result < 0:
+                    return 0
+                if result > 86400:
+                    return 86400
+                return result
+
+            def customer_for_node(node: int) -> Optional[Customer]:
+                customer_index = node - len(self.unique_depots)
+                if 0 <= customer_index < len(self.customers):
+                    return self.customers[customer_index]
+                return None
+
+            vehicle_time_matrices = []
+            vehicle_objective_cost_matrices = []
+            for vehicle_id in range(data['num_vehicles']):
+                service_time_seconds = int(vehicle_service_times.get(vehicle_id, 15 * 60))
+                vehicle_config = self._get_vehicle_config_for_id(vehicle_id)
+                vehicle_type_value = getattr(vehicle_config.vehicle_type, "value", str(vehicle_config.vehicle_type))
+                time_matrix = []
+                objective_cost_matrix = []
+
+                for from_node in range(num_locations):
+                    time_row = []
+                    objective_row = []
+                    for to_node in range(num_locations):
+                        time_row.append(time_arc_seconds(from_node, to_node, service_time_seconds))
+
+                        cost = objective_arc_cost(from_node, to_node, service_time_seconds)
+                        customer = customer_for_node(to_node)
+                        if customer is not None and customer.coordinates:
+                            multiplier, penalty = center_zone_cost_adjustment(
+                                customer.coordinates,
+                                vehicle_type_value,
+                                self.location_config,
+                                self._objective_penalty_cost,
+                            )
+                            cost = int(round(cost * multiplier)) + penalty
+
+                        objective_row.append(max(0, int(round(cost))))
+                    time_matrix.append(time_row)
+                    objective_cost_matrix.append(objective_row)
+
+                vehicle_time_matrices.append(time_matrix)
+                vehicle_objective_cost_matrices.append(objective_cost_matrix)
+
+            logger.info(
+                "OR-Tools precomputed cost matrices ready: %s vehicles x %s locations (%s objective)",
+                data['num_vehicles'],
+                num_locations,
+                objective_metric,
+            )
+
             def make_vehicle_time_callback(vehicle_id, service_time_seconds):
+                time_matrix = vehicle_time_matrices[vehicle_id]
+
                 def vehicle_time_callback(from_index, to_index):
+                    try:
+                        from_node = manager.IndexToNode(from_index)
+                        to_node = manager.IndexToNode(to_index)
+                        return time_matrix[from_node][to_node]
+                    except (OverflowError, IndexError, ValueError):
+                        return 3600
+                    except Exception:
+                        return 3600
+
                     try:
                         if from_index < 0 or to_index < 0:
                             return 0
@@ -361,19 +475,36 @@ class ORToolsSolver:
             def base_distance_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
-                return int(self.distance_matrix.distances[from_node][to_node])
+                return objective_arc_cost(from_node, to_node)
                 
             base_callback_index = routing.RegisterTransitCallback(base_distance_callback)
             
             # Първо регистрираме базовия callback за всички превозни средства
             routing.SetArcCostEvaluatorOfAllVehicles(base_callback_index)
+            vehicle_objective_callback_indices = {}
+            for vehicle_id in range(data['num_vehicles']):
+                service_time_seconds = int(vehicle_service_times.get(vehicle_id, 15 * 60))
+
+                def make_vehicle_objective_callback(service_seconds):
+                    def vehicle_objective_callback(from_index, to_index):
+                        from_node = manager.IndexToNode(from_index)
+                        to_node = manager.IndexToNode(to_index)
+                        return objective_arc_cost(from_node, to_node, service_seconds)
+
+                    return vehicle_objective_callback
+
+                callback_index = routing.RegisterTransitCallback(
+                    make_vehicle_objective_callback(service_time_seconds)
+                )
+                vehicle_objective_callback_indices[vehicle_id] = callback_index
+                routing.SetArcCostEvaluatorOfVehicle(callback_index, vehicle_id)
             
             # 2. CALLBACK за EXTERNAL_BUS и INTERNAL_BUS - ОТСТЪПКИ ПРЕМАХНАТИ, ИЗПОЛЗВАМЕ РЕАЛНИТЕ РАЗСТОЯНИЯ
             def priority_non_center_callback(from_index, to_index):
                 # Просто връщаме реалното разстояние без никакви отстъпки
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
-                return int(self.distance_matrix.distances[from_node][to_node])
+                return objective_arc_cost(from_node, to_node)
             
             # Регистрираме callback-а (сега без отстъпки)
             priority_non_center_callback_index = routing.RegisterTransitCallback(priority_non_center_callback)
@@ -383,17 +514,17 @@ class ORToolsSolver:
             
             # Прилагаме callback-а за EXTERNAL_BUS превозни средства
             for vehicle_id in data['external_bus_vehicle_ids']:
-                routing.SetArcCostEvaluatorOfVehicle(priority_non_center_callback_index, vehicle_id)
+                routing.SetArcCostEvaluatorOfVehicle(vehicle_objective_callback_indices[vehicle_id], vehicle_id)
                 logger.debug(f"  - Приложен callback без отстъпки за EXTERNAL_BUS #{vehicle_id}")
             
             # Прилагаме callback-а за INTERNAL_BUS превозни средства
             for vehicle_id in data['internal_bus_vehicle_ids']:
-                routing.SetArcCostEvaluatorOfVehicle(priority_non_center_callback_index, vehicle_id)
+                routing.SetArcCostEvaluatorOfVehicle(vehicle_objective_callback_indices[vehicle_id], vehicle_id)
                 logger.debug(f"  - Приложен callback без отстъпки за INTERNAL_BUS #{vehicle_id}")
                 
             # Прилагаме callback-а за SPECIAL_BUS превозни средства
             for vehicle_id in data['special_bus_vehicle_ids']:
-                routing.SetArcCostEvaluatorOfVehicle(priority_non_center_callback_index, vehicle_id)
+                routing.SetArcCostEvaluatorOfVehicle(vehicle_objective_callback_indices[vehicle_id], vehicle_id)
                 logger.debug(f"  - Приложен callback без отстъпки за SPECIAL_BUS #{vehicle_id}")
                 
             logger.info(f"✅ Отстъпки за далечни клиенти са премахнати")
@@ -411,7 +542,7 @@ class ORToolsSolver:
                     # Ограничаваме до максимално допустимата стойност за int64
                     max_safe_penalty = 9223372036854775807  # Максимално допустима стойност за int64 (2^63-1)
                     customer_idx = node_idx - len(self.unique_depots)
-                    penalty = min(drop_penalties[customer_idx], max_safe_penalty)
+                    penalty = min(self._objective_penalty_cost(drop_penalties[customer_idx]), max_safe_penalty)
                     routing.AddDisjunction([manager.NodeToIndex(node_idx)], penalty)
                 logger.info(
                     "✅ Добавена възможност за пропускане на клиенти с индивидуални глоби: "
@@ -430,6 +561,7 @@ class ORToolsSolver:
                     if self.location_config
                     else 50000
                 )
+                center_bus_service_time = int(vehicle_service_times.get(data['center_bus_vehicle_ids'][0], 15 * 60))
                 
                 # Създаваме callback за приоритизиране на CENTER_BUS
                 # CENTER_BUS получава discount за клиенти в центъра и глоба за клиенти извън център зоната.
@@ -437,7 +569,7 @@ class ORToolsSolver:
                     from_node = manager.IndexToNode(from_index)
                     to_node = manager.IndexToNode(to_index)
                     
-                    base_distance = int(self.distance_matrix.distances[from_node][to_node])
+                    base_distance = objective_arc_cost(from_node, to_node, center_bus_service_time)
                     
                     # Ако това е клиент в център зоната - давам голям DISCOUNT
                     if to_node >= len(self.unique_depots):
@@ -450,7 +582,7 @@ class ORToolsSolver:
                     
                     # За клиенти извън център зоната - конфигурируема глоба.
                     if to_node >= len(self.unique_depots):
-                        return base_distance + int(center_bus_outside_penalty)
+                        return base_distance + self._objective_penalty_cost(center_bus_outside_penalty)
 
                     return base_distance
                 
@@ -477,6 +609,7 @@ class ORToolsSolver:
             # 6. ГЛОБА ЗА ОСТАНАЛИТЕ БУСОВЕ ЗА ВЛИЗАНЕ В ЦЕНТЪРА
             if data['external_bus_vehicle_ids'] and self.location_config and self.location_config.enable_center_zone_restrictions:
                 logger.info("🚫 Прилагане на глоба за EXTERNAL_BUS в център зоната")
+                external_bus_service_time = int(vehicle_service_times.get(data['external_bus_vehicle_ids'][0], 15 * 60))
                 
                 # Създаваме callback за глоба на EXTERNAL_BUS
                 def external_bus_penalty_callback(from_index, to_index):
@@ -490,9 +623,9 @@ class ORToolsSolver:
                         
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.external_bus_center_penalty if self.location_config else 50000
-                            return int(self.distance_matrix.distances[from_node][to_node] + multiplier)
+                            return objective_arc_cost(from_node, to_node, external_bus_service_time) + self._objective_penalty_cost(multiplier)
                     
-                    return int(self.distance_matrix.distances[from_node][to_node])
+                    return objective_arc_cost(from_node, to_node, external_bus_service_time)
                 
                 # Регистрираме callback-а за EXTERNAL_BUS превозните средства
                 external_bus_callback_index = routing.RegisterTransitCallback(external_bus_penalty_callback)
@@ -503,6 +636,7 @@ class ORToolsSolver:
             # 7. ГЛОБА ЗА INTERNAL_BUS ЗА ВЛИЗАНЕ В ЦЕНТЪРА
             if data['internal_bus_vehicle_ids'] and self.location_config and self.location_config.enable_center_zone_restrictions:
                 logger.info("⚠️ Прилагане на глоба за INTERNAL_BUS в център зоната")
+                internal_bus_service_time = int(vehicle_service_times.get(data['internal_bus_vehicle_ids'][0], 15 * 60))
                 
                 # Създаваме callback за глоба на INTERNAL_BUS
                 def internal_bus_penalty_callback(from_index, to_index):
@@ -516,9 +650,9 @@ class ORToolsSolver:
                         
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.internal_bus_center_penalty if self.location_config else 50000
-                            return int(self.distance_matrix.distances[from_node][to_node] + multiplier)
+                            return objective_arc_cost(from_node, to_node, internal_bus_service_time) + self._objective_penalty_cost(multiplier)
                     
-                    return int(self.distance_matrix.distances[from_node][to_node])
+                    return objective_arc_cost(from_node, to_node, internal_bus_service_time)
                 
                 # Регистрираме callback-а за INTERNAL_BUS превозните средства
                 internal_bus_callback_index = routing.RegisterTransitCallback(internal_bus_penalty_callback)
@@ -529,6 +663,7 @@ class ORToolsSolver:
             # 8. ГЛОБА ЗА SPECIAL_BUS ЗА ВЛИЗАНЕ В ЦЕНТЪРА
             if data['special_bus_vehicle_ids'] and self.location_config and self.location_config.enable_center_zone_restrictions:
                 logger.info("🔶 Прилагане на глоба за SPECIAL_BUS в център зоната")
+                special_bus_service_time = int(vehicle_service_times.get(data['special_bus_vehicle_ids'][0], 15 * 60))
                 
                 # Създаваме callback за глоба на SPECIAL_BUS
                 def special_bus_penalty_callback(from_index, to_index):
@@ -542,9 +677,9 @@ class ORToolsSolver:
                         
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.special_bus_center_penalty if self.location_config else 50000
-                            return int(self.distance_matrix.distances[from_node][to_node] + multiplier)
+                            return objective_arc_cost(from_node, to_node, special_bus_service_time) + self._objective_penalty_cost(multiplier)
                     
-                    return int(self.distance_matrix.distances[from_node][to_node])
+                    return objective_arc_cost(from_node, to_node, special_bus_service_time)
                 
                 # Регистрираме callback-а за SPECIAL_BUS превозните средства
                 special_bus_callback_index = routing.RegisterTransitCallback(special_bus_penalty_callback)
@@ -555,6 +690,7 @@ class ORToolsSolver:
             # 8.1. ГЛОБА ЗА VRATZA_BUS ЗА ВЛИЗАНЕ В ЦЕНТЪРА
             if data['vratza_bus_vehicle_ids'] and self.location_config and self.location_config.enable_center_zone_restrictions:
                 logger.info("🚫 Прилагане на глоба за VRATZA_BUS в център зоната")
+                vratza_bus_service_time = int(vehicle_service_times.get(data['vratza_bus_vehicle_ids'][0], 15 * 60))
                 
                 # Създаваме callback за глоба на VRATZA_BUS
                 def vratza_bus_penalty_callback(from_index, to_index):
@@ -568,15 +704,36 @@ class ORToolsSolver:
                         
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.vratza_bus_center_penalty if self.location_config else 100000
-                            return int(self.distance_matrix.distances[from_node][to_node] + multiplier)
+                            return objective_arc_cost(from_node, to_node, vratza_bus_service_time) + self._objective_penalty_cost(multiplier)
                     
-                    return int(self.distance_matrix.distances[from_node][to_node])
+                    return objective_arc_cost(from_node, to_node, vratza_bus_service_time)
                 
                 # Регистрираме callback-а за VRATZA_BUS превозните средства
                 vratza_bus_callback_index = routing.RegisterTransitCallback(vratza_bus_penalty_callback)
                 
                 for vehicle_id in data['vratza_bus_vehicle_ids']:
                     routing.SetArcCostEvaluatorOfVehicle(vratza_bus_callback_index, vehicle_id)
+
+            def make_precomputed_objective_callback(cost_matrix):
+                def vehicle_objective_lookup_callback(from_index, to_index):
+                    try:
+                        from_node = manager.IndexToNode(from_index)
+                        to_node = manager.IndexToNode(to_index)
+                        return cost_matrix[from_node][to_node]
+                    except (OverflowError, IndexError, ValueError):
+                        return 0
+                    except Exception:
+                        return 0
+
+                return vehicle_objective_lookup_callback
+
+            for vehicle_id, cost_matrix in enumerate(vehicle_objective_cost_matrices):
+                callback_index = routing.RegisterTransitCallback(
+                    make_precomputed_objective_callback(cost_matrix)
+                )
+                routing.SetArcCostEvaluatorOfVehicle(callback_index, vehicle_id)
+
+            logger.info("OR-Tools arc cost callbacks use precomputed vehicle cost matrices")
             
             # 9. ПАРАМЕТРИ НА ТЪРСЕНЕ (Стандартни)
             logger.info("Използват се стандартни параметри за търсене.")
@@ -816,6 +973,144 @@ class ORToolsSolver:
         fallback_index = self._get_depot_index_for_vehicle(vehicle_config) if start_index is None else start_index
         return self._get_depot_index_for_location(getattr(vehicle_config, "end_location", None), fallback_index)
 
+    def _matrix_location_coords(self) -> List[Tuple[float, float]]:
+        location_coords = []
+        num_locations = len(self.distance_matrix.distances)
+        for loc_idx in range(num_locations):
+            if loc_idx < len(self.unique_depots):
+                coords = self.unique_depots[loc_idx]
+            else:
+                client_idx = loc_idx - len(self.unique_depots)
+                if client_idx < len(self.customers):
+                    coords = self.customers[client_idx].coordinates or (0, 0)
+                else:
+                    coords = (0, 0)
+            location_coords.append(coords)
+        return location_coords
+
+    def _travel_time_seconds(
+        self,
+        from_node: int,
+        to_node: int,
+        location_coords: List[Tuple[float, float]],
+    ) -> float:
+        travel_time = float(self.distance_matrix.durations[from_node][to_node])
+        if from_node < len(location_coords) and to_node < len(location_coords):
+            traffic_multiplier = get_traffic_multiplier(
+                self.location_config,
+                location_coords[from_node],
+                location_coords[to_node],
+            )
+            if traffic_multiplier > 1.0:
+                travel_time *= traffic_multiplier
+        return max(0.0, travel_time)
+
+    def _format_schedule_time(self, total_seconds: float) -> str:
+        total_minutes = int(round(total_seconds / 60))
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        return f"{hours:02d}:{minutes:02d}"
+
+    def _format_customer_time_window_for_schedule(self, customer: Customer) -> str:
+        window = self._customer_time_window_seconds(customer)
+        if not window:
+            return ""
+        if (
+            getattr(customer, "time_window_start_minutes", None) is None
+            and getattr(customer, "time_window_end_minutes", None) is None
+        ):
+            return "Постоянно"
+        return f"{self._format_schedule_time(window[0])}-{self._format_schedule_time(window[1])}"
+
+    def _build_route_schedule_entries(
+        self,
+        customers: List[Customer],
+        depot_location: Tuple[float, float],
+        vehicle_config: Optional[VehicleConfig],
+        end_location: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[List[Dict[str, object]], float, float]:
+        if not customers:
+            return [], 0.0, 0.0
+
+        depot_index = self._get_depot_index_for_location(depot_location, 0)
+        end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
+        service_time_seconds = (
+            float(vehicle_config.service_time_minutes) * 60
+            if vehicle_config
+            else 15 * 60
+        )
+        start_time_seconds = float(self._vehicle_start_seconds(vehicle_config))
+        current_clock_seconds = start_time_seconds
+        total_time_seconds = 0.0
+        cumulative_distance_m = 0.0
+        current_node = depot_index
+        previous_stop_name = "Депо"
+        entries: List[Dict[str, object]] = []
+        location_coords = self._matrix_location_coords()
+
+        for stop_index, customer in enumerate(customers, start=1):
+            try:
+                customer_index = len(self.unique_depots) + self._get_customer_index_by_id(customer.id)
+            except ValueError:
+                logger.warning("Customer %s was not found while building route schedule", customer.id)
+                continue
+
+            distance_m = float(self.distance_matrix.distances[current_node][customer_index])
+            travel_time_seconds = self._travel_time_seconds(current_node, customer_index, location_coords)
+            cumulative_distance_m += distance_m
+
+            raw_arrival_seconds = current_clock_seconds + travel_time_seconds
+            wait_seconds = 0.0
+            time_window_status = ""
+            window = self._customer_time_window_seconds(customer)
+            if window:
+                window_start, window_end = window
+                if raw_arrival_seconds < window_start:
+                    wait_seconds = float(window_start - raw_arrival_seconds)
+                    time_window_status = "Изчакване"
+                arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
+                if arrival_after_wait_seconds > window_end:
+                    time_window_status = "След работно време"
+                elif not time_window_status:
+                    time_window_status = "OK"
+            else:
+                arrival_after_wait_seconds = raw_arrival_seconds
+
+            step_time_seconds = travel_time_seconds + wait_seconds + service_time_seconds
+            total_time_seconds += step_time_seconds
+            current_clock_seconds = arrival_after_wait_seconds + service_time_seconds
+
+            entries.append({
+                "customer": customer,
+                "index": stop_index,
+                "previous_stop_name": previous_stop_name,
+                "distance_from_previous": distance_m / 1000,
+                "cumulative_distance": cumulative_distance_m / 1000,
+                "travel_time_minutes": travel_time_seconds / 60,
+                "service_time_minutes": service_time_seconds / 60,
+                "wait_minutes": wait_seconds / 60,
+                "total_time_for_step": step_time_seconds / 60,
+                "cumulative_time": total_time_seconds / 60,
+                "start_time_minutes": start_time_seconds / 60,
+                "arrival_time_minutes": arrival_after_wait_seconds / 60,
+                "total_time_with_start": current_clock_seconds / 60,
+                "time_window_text": self._format_customer_time_window_for_schedule(customer),
+                "time_window_status": time_window_status,
+            })
+
+            current_node = customer_index
+            previous_stop_name = customer.name
+
+        if entries:
+            cumulative_distance_m += float(self.distance_matrix.distances[current_node][end_depot_index])
+            total_time_seconds += self._travel_time_seconds(
+                current_node,
+                end_depot_index,
+                location_coords,
+            )
+
+        return entries, cumulative_distance_m, total_time_seconds
+
     def _calculate_accurate_route_time(
         self,
         customers: List[Customer],
@@ -1008,7 +1303,7 @@ class ORToolsSolver:
                     ortools_time_seconds -= int(data.get('vehicle_start_times', [0] * routing.vehicles())[vehicle_id])
 
                 # НОВА ФУНКЦИОНАЛНОСТ: Изчисляваме точното време с vehicle-specific service time
-                accurate_time_seconds = self._calculate_accurate_route_time(
+                schedule_entries, _, accurate_time_seconds = self._build_route_schedule_entries(
                     route_customers, depot_location, vehicle_config, end_location
                 )
                 
@@ -1033,7 +1328,8 @@ class ORToolsSolver:
                     total_distance_km=route_distance / 1000,
                     total_time_minutes=accurate_time_seconds / 60,  # Използваме точното време!
                     total_volume=sum(c.volume for c in route_customers),
-                    is_feasible=True
+                    is_feasible=True,
+                    schedule_entries=schedule_entries
                 )
                 
                 # Връщаме валидациите, за да сме сигурни, че решението спазва правилата
@@ -1226,9 +1522,11 @@ class ORToolsSolver:
                 optimized_customers = self._optimize_route_from_depot(route.customers, tsp_depot, vehicle_config)
             
             # Изчисляваме новите разстояния и времена от TSP депото
-            new_distance_km, new_time_minutes = self._calculate_route_from_depot(
+            schedule_entries, schedule_distance_m, schedule_time_s = self._build_route_schedule_entries(
                 optimized_customers, tsp_depot, vehicle_config, end_depot
             )
+            new_distance_km = schedule_distance_m / 1000
+            new_time_minutes = schedule_time_s / 60
             
             # Създаваме нов маршрут с TSP депото като стартова точка и оптимизиран ред
             reconfigured_route = Route(
@@ -1241,7 +1539,8 @@ class ORToolsSolver:
                 total_distance_km=new_distance_km,
                 total_time_minutes=new_time_minutes,
                 total_volume=sum(c.volume for c in optimized_customers),
-                is_feasible=True
+                is_feasible=True,
+                schedule_entries=schedule_entries
             )
             
             # Валидираме новия маршрут
@@ -1563,7 +1862,7 @@ class ORToolsSolver:
                     f"max={max(drop_penalties) if drop_penalties else 0}"
                 )
                 for node in range(1, len(data['distance_matrix'])):
-                    penalty = drop_penalties[node - 1]
+                    penalty = self._objective_penalty_cost(drop_penalties[node - 1])
                     routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
                 logger.info("✅ Добавена възможност за пропускане на клиенти")
             else:
@@ -1579,7 +1878,7 @@ class ORToolsSolver:
                 """Връща разстоянието между две точки."""
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
-                return data['distance_matrix'][from_node][to_node]
+                return data.get('objective_matrix', data['distance_matrix'])[from_node][to_node]
             
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             logger.info(f"✓ Distance callback регистриран с индекс: {transit_callback_index}")
@@ -1599,7 +1898,7 @@ class ORToolsSolver:
             
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
             for vehicle_id, fixed_cost in enumerate(data.get('vehicle_fixed_costs', [])):
-                routing.SetFixedCostOfVehicle(int(fixed_cost), vehicle_id)
+                routing.SetFixedCostOfVehicle(self._objective_penalty_cost(fixed_cost), vehicle_id)
             logger.info(f"Vehicle fixed costs: {data.get('vehicle_fixed_costs', [])}")
             logger.info(f"✓ Arc cost evaluator зададен за всички превозни средства")
 
@@ -1764,6 +2063,17 @@ class ORToolsSolver:
         for row in self.distance_matrix.distances:
             distances.append([int(d) for d in row])
         data['distance_matrix'] = distances
+        if self._objective_metric() == "time":
+            location_coords = self._matrix_location_coords()
+            data['objective_matrix'] = [
+                [
+                    int(round(self._travel_time_seconds(i, j, location_coords)))
+                    for j in range(len(distances))
+                ]
+                for i in range(len(distances))
+            ]
+        else:
+            data['objective_matrix'] = distances
         
         # Дефинираме скала за превръщане на обемите в цели числа
         SCALE_FACTOR = 100  # Нов мащабен фактор - умножаваме всичко по 100
@@ -1919,6 +2229,14 @@ class ORToolsSolver:
                     end_location = depot_location
                 
                 total_volume = sum(c.volume for c in route_customers)
+                schedule_entries, schedule_distance_m, schedule_time_s = self._build_route_schedule_entries(
+                    route_customers,
+                    depot_location,
+                    vehicle_config,
+                    end_location,
+                )
+                route_distance_km = schedule_distance_m / 1000
+                route_time_minutes = schedule_time_s / 60
                 
                 route = Route(
                     vehicle_type=vehicle_type,
@@ -1933,11 +2251,12 @@ class ORToolsSolver:
                     total_distance_km=route_distance_km,
                     total_time_minutes=route_time_minutes,
                     total_volume=total_volume,
-                    is_feasible=True
+                    is_feasible=True,
+                    schedule_entries=schedule_entries
                 )
                 
                 routes.append(route)
-                total_distance += route_distance
+                total_distance += schedule_distance_m
                 
                 logger.info(f"🚌 Маршрут {len(routes)} (ID: {vehicle_id}, Тип: {vehicle_type.value}):")
                 logger.info(f"  - Клиенти: {len(route_customers)} бр.")

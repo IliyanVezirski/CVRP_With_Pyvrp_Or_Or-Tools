@@ -14,7 +14,7 @@ import ssl
 import math
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import importlib
 import config
@@ -35,6 +35,146 @@ class Customer:
     source_id_skld: str = ""
     time_window_start_minutes: Optional[int] = None
     time_window_end_minutes: Optional[int] = None
+    delivery_comment: str = ""
+    grouped_documents: List[Dict[str, object]] = field(default_factory=list)
+
+
+TIME_WINDOW_FIELD_ALIASES = (
+    "WorkTime",
+    "work_time",
+    "working_time",
+    "WorkTimeText",
+    "WorkHours",
+    "WorkingHours",
+    "BusinessHours",
+    "TimeWindow",
+    "DeliveryTime",
+    "DeliveryWindow",
+    "RabVreme",
+    "RabTime",
+    "RabotnoVreme",
+    "rabotno_vreme",
+    "RabotnoVreme",
+    "РаботноВреме",
+    "Работно време",
+)
+DELIVERY_COMMENT_FIELD_ALIASES = (
+    "DeliveryComment",
+    "DeliveryComments",
+    "DeliveryNote",
+    "DeliveryNotes",
+    "DeliveryRemark",
+    "DeliveryInfo",
+    "DeliveryInstruction",
+    "DeliveryInstructions",
+    "CommentDelivery",
+    "Comment",
+    "Comments",
+    "Note",
+    "Remark",
+    "Memo",
+    "Opisanie",
+    "Description",
+    "Komentar",
+    "Zabelezhka",
+    "Коментар",
+    "Коментар доставка",
+    "Забележка",
+    "Забележка доставка",
+)
+
+
+_INVALID_TEXT_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _is_empty_value(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip() or value.strip().lower() in ("nan", "none", "null", "-")
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, bool):
+            return missing
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _field_candidates(primary: str, aliases: Tuple[str, ...]) -> List[str]:
+    candidates: List[str] = []
+    for item in [primary, *aliases]:
+        for part in str(item or "").replace(";", ",").split(","):
+            field_name = part.strip()
+            if field_name and field_name not in candidates:
+                candidates.append(field_name)
+    return candidates
+
+
+def _record_value(record: Dict, primary_field: str, aliases: Tuple[str, ...] = ()):
+    if not isinstance(record, dict):
+        return None
+    candidates = _field_candidates(primary_field, aliases)
+    for field_name in candidates:
+        if field_name in record and not _is_empty_value(record.get(field_name)):
+            return record.get(field_name)
+
+    lowered = {str(key).strip().lower(): key for key in record.keys()}
+    for field_name in candidates:
+        original_key = lowered.get(field_name.strip().lower())
+        if original_key is not None and not _is_empty_value(record.get(original_key)):
+            return record.get(original_key)
+    return None
+
+
+def _clean_text_value(value) -> str:
+    if _is_empty_value(value):
+        return ""
+    return str(value).strip()
+
+
+def _safe_delivery_comment(value, context: str = "") -> str:
+    """Return a safe one-line delivery comment, or empty string for invalid values."""
+    if _is_empty_value(value):
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        logger.warning("Игнорирам невалиден формат на коментар за доставка%s: %r", context, value)
+        return ""
+
+    try:
+        text = str(value)
+    except Exception as exc:
+        logger.warning("Игнорирам коментар за доставка%s: не може да се прочете (%s)", context, exc)
+        return ""
+
+    if _INVALID_TEXT_CONTROL_CHARS_RE.search(text):
+        logger.warning("Игнорирам коментар за доставка%s: съдържа невалидни контролни символи", context)
+        return ""
+
+    text = re.sub(r"[\r\n\t]+", " ", text).strip()
+    if not text:
+        return ""
+
+    max_len = 500
+    if len(text) > max_len:
+        logger.warning("Съкращавам твърде дълъг коментар за доставка%s до %s символа", context, max_len)
+        text = text[:max_len].rstrip()
+    return text
+
+
+def _loads_json_tolerant(raw: str):
+    """Decode JSON, allowing raw control chars inside strings from legacy HTTP APIs."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        message = str(exc).lower()
+        if "invalid control character" not in message:
+            raise
+        logger.warning(
+            "JSON отговорът съдържа суров newline/tab в текстово поле; "
+            "опитвам tolerant JSON decode."
+        )
+        return json.loads(raw, strict=False)
 
 
 def parse_time_value_to_minutes(value) -> Optional[int]:
@@ -42,7 +182,7 @@ def parse_time_value_to_minutes(value) -> Optional[int]:
 
     Поддържа HH:MM, datetime/time, Excel fraction-of-day, часове и минути.
     """
-    if value is None or pd.isna(value):
+    if _is_empty_value(value):
         return None
 
     if isinstance(value, datetime):
@@ -75,9 +215,25 @@ def parse_time_value_to_minutes(value) -> Optional[int]:
     if lowered in ("nan", "none", "null", "-"):
         return None
 
-    # Ако е подаден прозорец като "08:00-17:00", взимаме първата стойност.
-    if "-" in text and ":" in text:
-        text = text.split("-", 1)[0].strip()
+    match = re.search(r"(\d{1,2})\s*[:.]\s*(\d{1,2})(?:\s*[:.]\s*\d{1,2})?", text)
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        if 0 <= hours <= 47 and 0 <= minutes <= 59:
+            return hours * 60 + minutes
+
+    compact_match = re.fullmatch(r"\D*(\d{3,4})\D*", text)
+    if compact_match:
+        digits = compact_match.group(1)
+        hours = int(digits[:-2])
+        minutes = int(digits[-2:])
+        if 0 <= hours <= 47 and 0 <= minutes <= 59:
+            return hours * 60 + minutes
+
+    # Ако е подаден прозорец като "8-17", взимаме първата стойност.
+    range_prefix = re.match(r"^\s*(\d{1,2}(?:[,.]\d+)?)\s*(?:-|до|to|/)\s*", text, flags=re.IGNORECASE)
+    if range_prefix:
+        text = range_prefix.group(1).strip()
 
     if re.fullmatch(r"\d+(?:[,.]\d+)?", text):
         try:
@@ -89,13 +245,6 @@ def parse_time_value_to_minutes(value) -> Optional[int]:
             return int(round(number))
         except ValueError:
             return None
-
-    match = re.search(r"(\d{1,2})\s*[:.]\s*(\d{1,2})", text)
-    if match:
-        hours = int(match.group(1))
-        minutes = int(match.group(2))
-        if 0 <= hours <= 47 and 0 <= minutes <= 59:
-            return hours * 60 + minutes
 
     try:
         number = float(text.replace(",", "."))
@@ -109,10 +258,40 @@ def parse_time_value_to_minutes(value) -> Optional[int]:
         return None
 
 
+def _time_tokens_from_text(text: str) -> List[str]:
+    tokens = re.findall(r"\b\d{1,2}\s*[:.]\s*\d{1,2}(?:\s*[:.]\s*\d{1,2})?\b", text)
+    if len(tokens) >= 2:
+        return tokens
+
+    compact_tokens = re.findall(r"\b\d{3,4}\b", text)
+    valid_compact = []
+    for token in compact_tokens:
+        hours = int(token[:-2])
+        minutes = int(token[-2:])
+        if 0 <= hours <= 47 and 0 <= minutes <= 59:
+            valid_compact.append(token)
+    return valid_compact
+
+
 def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
-    """Парсира работен прозорец във формат "08:00 - 16:00"."""
-    if value is None or pd.isna(value):
+    """Парсира работен прозорец от различни GET/Excel формати."""
+    if _is_empty_value(value):
         return None, None
+
+    if isinstance(value, dict):
+        start = _record_value(value, "start", ("begin",))
+        end = _record_value(value, "end", ("finish",))
+        if start is not None or end is not None:
+            return parse_time_value_to_minutes(start), parse_time_value_to_minutes(end)
+        value = _record_value(value, "value", TIME_WINDOW_FIELD_ALIASES)
+        if _is_empty_value(value):
+            return None, None
+
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        first_start, first_end = parse_time_window_value(value[0])
+        if first_start is not None or first_end is not None:
+            return first_start, first_end
+        return parse_time_value_to_minutes(value[0]), parse_time_value_to_minutes(value[1])
 
     text = str(value).strip()
     if not text or text.lower() in ("nan", "none", "null", "-"):
@@ -123,18 +302,72 @@ def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
         .replace("—", "-")
         .replace("−", "-")
     )
+    normalized = re.sub(r"\b(?:от|from|between)\b", "", normalized, flags=re.IGNORECASE).strip()
 
-    range_match = re.match(r"^\s*(.+?)\s*(?:-|до|to)\s*(.+?)\s*$", normalized, flags=re.IGNORECASE)
+    if re.fullmatch(r"\d{6,8}", normalized):
+        half = len(normalized) // 2
+        return parse_time_value_to_minutes(normalized[:half]), parse_time_value_to_minutes(normalized[half:])
+
+    time_tokens = _time_tokens_from_text(normalized)
+    if len(time_tokens) >= 2:
+        return parse_time_value_to_minutes(time_tokens[0]), parse_time_value_to_minutes(time_tokens[1])
+
+    range_match = re.match(r"^\s*(.+?)\s*(?:-|до|to|/|;|,)\s*(.+?)\s*$", normalized, flags=re.IGNORECASE)
     if range_match:
         start = parse_time_value_to_minutes(range_match.group(1))
         end = parse_time_value_to_minutes(range_match.group(2))
         return start, end
 
-    time_tokens = re.findall(r"\d{1,2}\s*[:.]\s*\d{1,2}", normalized)
-    if len(time_tokens) >= 2:
-        return parse_time_value_to_minutes(time_tokens[0]), parse_time_value_to_minutes(time_tokens[1])
-
     return None, None
+
+
+def safe_parse_time_window_value(value, context: str = "") -> Tuple[Optional[int], Optional[int]]:
+    """Parse and validate one customer time window. Invalid values are ignored."""
+    if _is_empty_value(value):
+        return None, None
+
+    try:
+        start, end = parse_time_window_value(value)
+    except Exception as exc:
+        logger.warning("Игнорирам невалидно работно време%s: %r (%s)", context, value, exc)
+        return None, None
+
+    if start is None and end is None:
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return None, None
+
+    if start is None or end is None:
+        logger.warning("Игнорирам непълно работно време%s: %r", context, value)
+        return None, None
+
+    try:
+        start = int(start)
+        end = int(end)
+    except (TypeError, ValueError):
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return None, None
+
+    if not (0 <= start <= 1439 and 0 <= end <= 1439):
+        logger.warning("Игнорирам работно време извън 00:00-23:59%s: %r", context, value)
+        return None, None
+
+    if start == end:
+        logger.warning("Игнорирам работно време с еднакви начало и край%s: %r", context, value)
+        return None, None
+
+    return start, end
+
+
+def _unique_join(values: List[object], separator: str = "; ") -> str:
+    result = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return separator.join(result)
 
 
 @dataclass
@@ -342,7 +575,7 @@ class InputHandler:
             # 2. GPS стойности без отваряща кавичка: "GPS": 42.676...,23.360..." → "GPS": "42.676...,23.360..."
             raw = re.sub(r'"GPS":\s*([\d.])', r'"GPS": "\1', raw)
             
-            data = json.loads(raw)
+            data = _loads_json_tolerant(raw)
             
             data = self._extract_json_records(data)
             
@@ -436,8 +669,7 @@ class InputHandler:
         plas_doc_field = getattr(self.config, "json_plas_doc_field", "IdPlasDoc")
         skld_field = getattr(self.config, "json_id_skld_field", "IdSkld")
         tw_field = getattr(self.config, "json_time_window_field", "WorkTime")
-        tw_start_field = getattr(self.config, "json_time_window_start_field", "WorkFrom")
-        tw_end_field = getattr(self.config, "json_time_window_end_field", "WorkTo")
+        comment_field = getattr(self.config, "json_delivery_comment_field", "DeliveryComment")
         
         for idx, record in enumerate(records):
             try:
@@ -448,10 +680,17 @@ class InputHandler:
                 document = str(record.get(doc_field, "")).strip()
                 plas_doc = str(record.get(plas_doc_field, "")).strip()
                 source_id_skld = str(record.get(skld_field, "")).strip()
-                tw_start, tw_end = parse_time_window_value(record.get(tw_field)) if tw_field else (None, None)
-                if tw_start is None and tw_end is None:
-                    tw_start = parse_time_value_to_minutes(record.get(tw_start_field)) if tw_start_field else None
-                    tw_end = parse_time_value_to_minutes(record.get(tw_end_field)) if tw_end_field else None
+                tw_value = _record_value(record, tw_field, TIME_WINDOW_FIELD_ALIASES)
+                record_context = f" (JSON запис {idx}, клиент {client_id})"
+                tw_start, tw_end = (
+                    safe_parse_time_window_value(tw_value, record_context)
+                    if tw_value is not None
+                    else (None, None)
+                )
+                delivery_comment = _safe_delivery_comment(
+                    _record_value(record, comment_field, DELIVERY_COMMENT_FIELD_ALIASES),
+                    record_context,
+                )
                 
                 coordinates = parser.parse_gps_string(gps_data)
                 
@@ -466,6 +705,16 @@ class InputHandler:
                     source_id_skld=source_id_skld,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    delivery_comment=delivery_comment,
+                    grouped_documents=[
+                        {
+                            "customer_id": client_id,
+                            "document": document,
+                            "plas_doc": plas_doc,
+                            "source_id_skld": source_id_skld,
+                            "volume": volume,
+                        }
+                    ],
                 )
                 customers.append(customer)
                 
@@ -473,7 +722,7 @@ class InputHandler:
                 logger.error(f"Грешка при обработка на JSON запис {idx}: {e}")
                 continue
         
-        return customers
+        return self._group_customer_documents(customers, "JSON")
 
     def _process_dataframe(self, df: pd.DataFrame) -> List[Customer]:
         """Обработва DataFrame и създава списък от клиенти"""
@@ -497,15 +746,18 @@ class InputHandler:
                 tw_start = None
                 tw_end = None
                 tw_column = getattr(self.config, "time_window_column", "")
-                tw_start_column = getattr(self.config, "time_window_start_column", "")
-                tw_end_column = getattr(self.config, "time_window_end_column", "")
                 if tw_column and tw_column in row.index:
-                    tw_start, tw_end = parse_time_window_value(row[tw_column])
-                if tw_start is None and tw_end is None:
-                    if tw_start_column and tw_start_column in row.index:
-                        tw_start = parse_time_value_to_minutes(row[tw_start_column])
-                    if tw_end_column and tw_end_column in row.index:
-                        tw_end = parse_time_value_to_minutes(row[tw_end_column])
+                    tw_start, tw_end = safe_parse_time_window_value(
+                        row[tw_column],
+                        f" (Excel ред {index}, клиент {client_id})",
+                    )
+                delivery_comment = ""
+                comment_column = getattr(self.config, "delivery_comment_column", "")
+                if comment_column and comment_column in row.index:
+                    delivery_comment = _safe_delivery_comment(
+                        row[comment_column],
+                        f" (Excel ред {index}, клиент {client_id})",
+                    )
                 
                 coordinates = parser.parse_gps_string(gps_data)
                 
@@ -518,6 +770,16 @@ class InputHandler:
                     document=document,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    delivery_comment=delivery_comment,
+                    grouped_documents=[
+                        {
+                            "customer_id": client_id,
+                            "document": document,
+                            "plas_doc": "",
+                            "source_id_skld": "",
+                            "volume": volume,
+                        }
+                    ],
                 )
                 
                 customers.append(customer)
@@ -527,7 +789,134 @@ class InputHandler:
                 logger.error(f"Грешка при обработка на ред с индекс '{index}': {e}")
                 continue
         
-        return customers
+        return self._group_customer_documents(customers, "Excel")
+
+    def _group_customer_documents(self, customers: List[Customer], source_label: str) -> List[Customer]:
+        """Group multiple documents for the same customer/location into one delivery stop."""
+        if not bool(getattr(self.config, "enable_customer_document_grouping", True)):
+            return customers
+
+        grouped: Dict[Tuple[str, float, float], Customer] = {}
+        ordered: List[Customer] = []
+        grouped_rows = 0
+
+        for customer in customers:
+            customer_id = str(getattr(customer, "id", "") or "").strip()
+            if not customer_id or not customer.coordinates:
+                ordered.append(customer)
+                continue
+
+            key = (
+                customer_id.lower(),
+                round(float(customer.coordinates[0]), 6),
+                round(float(customer.coordinates[1]), 6),
+            )
+            if key not in grouped:
+                customer.grouped_documents = self._normalise_grouped_documents(customer)
+                grouped[key] = customer
+                ordered.append(customer)
+                continue
+
+            target = grouped[key]
+            grouped_rows += 1
+            target.volume = float(target.volume or 0) + float(customer.volume or 0)
+            target.grouped_documents = self._merge_grouped_document_lists(
+                self._normalise_grouped_documents(target),
+                self._normalise_grouped_documents(customer),
+            )
+            target.document = _unique_join([doc.get("document", "") for doc in target.grouped_documents])
+            target.plas_doc = _unique_join([doc.get("plas_doc", "") for doc in target.grouped_documents])
+            target.source_id_skld = _unique_join(
+                [doc.get("source_id_skld", "") for doc in target.grouped_documents]
+            )
+            target.delivery_comment = _unique_join(
+                [target.delivery_comment, customer.delivery_comment],
+                separator=" | ",
+            )
+
+            if target.time_window_start_minutes is None and target.time_window_end_minutes is None:
+                target.time_window_start_minutes = customer.time_window_start_minutes
+                target.time_window_end_minutes = customer.time_window_end_minutes
+            elif (
+                (customer.time_window_start_minutes is not None or customer.time_window_end_minutes is not None)
+                and (
+                    target.time_window_start_minutes != customer.time_window_start_minutes
+                    or target.time_window_end_minutes != customer.time_window_end_minutes
+                )
+            ):
+                logger.warning(
+                    "Клиент %s има различно работно време в няколко документа; "
+                    "запазвам първото за общото посещение.",
+                    customer.id,
+                )
+
+        if grouped_rows:
+            logger.info(
+                "Групирани %s %s документа/реда към вече съществуващи клиентски посещения.",
+                grouped_rows,
+                source_label,
+            )
+        return ordered
+
+    def _normalise_grouped_documents(self, customer: Customer) -> List[Dict[str, object]]:
+        documents = list(getattr(customer, "grouped_documents", None) or [])
+        if not documents:
+            documents = [
+                {
+                    "customer_id": getattr(customer, "id", ""),
+                    "document": getattr(customer, "document", ""),
+                    "plas_doc": getattr(customer, "plas_doc", ""),
+                    "source_id_skld": getattr(customer, "source_id_skld", ""),
+                    "volume": getattr(customer, "volume", 0),
+                }
+            ]
+        normalised = []
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            normalised.append(
+                {
+                    "customer_id": str(item.get("customer_id", getattr(customer, "id", "")) or ""),
+                    "document": str(item.get("document", "") or ""),
+                    "plas_doc": str(item.get("plas_doc", "") or ""),
+                    "source_id_skld": str(item.get("source_id_skld", "") or ""),
+                    "volume": float(item.get("volume", 0) or 0),
+                }
+            )
+        return normalised
+
+    def _merge_grouped_document_lists(
+        self,
+        left: List[Dict[str, object]],
+        right: List[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        merged: List[Dict[str, object]] = []
+        positions: Dict[str, Dict[str, object]] = {}
+
+        for item in [*left, *right]:
+            document = str(item.get("document", "") or "")
+            plas_doc = str(item.get("plas_doc", "") or "")
+            key = plas_doc or document
+            if not key:
+                key = f"__row_{len(merged)}"
+
+            if key in positions:
+                existing = positions[key]
+                existing["volume"] = float(existing.get("volume", 0) or 0) + float(item.get("volume", 0) or 0)
+                if not existing.get("document") and document:
+                    existing["document"] = document
+                if not existing.get("plas_doc") and plas_doc:
+                    existing["plas_doc"] = plas_doc
+                if not existing.get("source_id_skld") and item.get("source_id_skld"):
+                    existing["source_id_skld"] = str(item.get("source_id_skld", ""))
+                continue
+
+            copied = dict(item)
+            copied["volume"] = float(copied.get("volume", 0) or 0)
+            positions[key] = copied
+            merged.append(copied)
+
+        return merged
 
 
 # Функция за лесно използване

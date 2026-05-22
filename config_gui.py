@@ -53,6 +53,9 @@ class ConfigGUI:
         self.vehicle_next_index = 0
         self.depot_choice_widgets = []
         self.traffic_zone_listbox = None
+        self.center_zone_listbox = None
+        self.center_zone_priority_vars = {}
+        self.center_zone_restricted_vars = {}
 
         self._build_ui()
 
@@ -260,6 +263,15 @@ class ConfigGUI:
 
         var.set(text.strip())
 
+    def _paste_to_text_widget(self, widget):
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showinfo("Няма текст", "Clipboard-ът е празен.")
+            return
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text.strip())
+
     def _add_field(self, parent, row, key, label, value, field_type="str", options=None, tooltip=""):
         parent.columnconfigure(1, weight=1)
         display_value = "" if value is None else str(value)
@@ -410,6 +422,8 @@ cmd / command / action:
                 "Бързи aliases:",
                 """
 solver / solver_type                  -> cvrp.solver_type
+objective / objective_metric          -> cvrp.objective_metric
+optimize_by                           -> cvrp.objective_metric
 time_limit / time_limit_seconds       -> cvrp.time_limit_seconds
 parallel                              -> cvrp.enable_parallel_solving
 workers / num_workers                 -> cvrp.num_workers
@@ -423,13 +437,15 @@ osrm_chunk_size                       -> osrm.chunk_size
 date / json_override_date             -> input.json_override_date
 sklad / json_sklad                    -> input.json_sklad
 done_flag / json_done_flag            -> input.json_done_flag
+group_customer_documents              -> input.enable_customer_document_grouping
                 """,
-                16,
+                17,
             ),
             (
                 "Solver настройки:",
                 """
 cvrp.solver_type                       pyvrp или or_tools
+cvrp.objective_metric                  distance = най-къси км, time = най-кратко време
 cvrp.time_limit_seconds                време за решаване
 cvrp.enable_parallel_solving           паралелно решаване
 cvrp.num_workers                       брой процеси (-1 = автоматично)
@@ -487,14 +503,15 @@ input.json_sklad                       складове, напр. 106,128
 input.json_done_flag                   DoneFlag
 input.json_override_date               дата DD/MM/YYYY
 input.json_timeout_seconds             timeout
+input.enable_customer_document_grouping групира един клиент/GPS с няколко документа в един стоп
 
 JSON mapping:
 input.json_gps_field, input.json_client_id_field, input.json_client_name_field
 input.json_volume_field, input.json_document_field, input.json_plas_doc_field
 input.json_id_skld_field, input.json_time_window_field
-input.json_time_window_start_field, input.json_time_window_end_field
+input.json_delivery_comment_field
                 """,
-                19,
+                21,
             ),
             (
                 "Изходни файлове:",
@@ -502,6 +519,12 @@ input.json_time_window_start_field, input.json_time_window_end_field
 output.enable_interactive_map           генерира основна HTML карта
 output.map_output_file                  път до interactive_map.html
 output.routes_output_dir                папка за HTML маршрутите
+output.route_maps_upload_mode           disabled, legacy или effect_upload
+output.route_maps_upload_url            URL за качване на индивидуалните HTML карти
+output.route_maps_upload_token_field    име на token POST поле, обикновено pData
+output.route_maps_upload_token          token стойност за upload endpoint-а
+output.route_maps_upload_file_field     multipart поле, обикновено files[]
+output.route_maps_upload_timeout_seconds timeout за качване
 output.map_provider                     osm или google
 output.folium_tiles                     слой за OSM/Folium
 output.google_maps_api_key              Google Maps key
@@ -598,7 +621,7 @@ replace_vehicles:
   max_customers_per_route, start_time_minutes, tsp_depot_location
 
 center_zone:
-  Управлява център зоната и глобите за нея.
+  Управлява старата основна център зона и глобите за нея.
   "center_zone": {
     "mode": "circle",
     "center": [42.6977, 23.3219],
@@ -608,6 +631,27 @@ center_zone:
     "vratza_bus_penalty": 40000,
     "center_bus_outside_penalty": 0
   }
+
+center_zones:
+  Допълнителни независими център зони. Всяка зона има собствени правила за кои бусове да важи.
+  "center_zones": [
+    {
+      "name": "Център 2",
+      "mode": "circle",
+      "center": [42.7093, 23.3137],
+      "radius_km": 1.2,
+      "priority_vehicle_types": ["center_bus"],
+      "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+      "discount_priority_vehicle": 0.9,
+      "priority_vehicle_outside_penalty": 0,
+      "vehicle_penalties": {
+        "internal_bus": 40000,
+        "external_bus": 40000,
+        "vratza_bus": 40000
+      },
+      "enabled": true
+    }
+  ]
 
 traffic_zones:
   Допълнителни зони с multiplier за време.
@@ -627,7 +671,7 @@ city_traffic:
 locations.*:
   Можеш да подадеш и директните вътрешни полета:
   locations.depot_location, locations.center_location, locations.vratza_depot_location
-  locations.center_zone_polygon, locations.depot_locations, locations.traffic_zones
+  locations.center_zone_polygon, locations.center_zones, locations.depot_locations, locations.traffic_zones
                 """,
                 48,
             ),
@@ -757,6 +801,36 @@ locations.*:
             lines.append(f"{name}: {float(center[0])}, {float(center[1])}, {radius}, {multiplier}, {enabled}")
         return "\n".join(lines)
 
+    def _format_center_zones_text(self, zones):
+        lines = []
+        for zone in zones or []:
+            name = getattr(zone, "name", "Център зона")
+            mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+            if mode == "polygon":
+                points = getattr(zone, "polygon", []) or []
+                geometry = "; ".join(f"{float(lat)}, {float(lon)}" for lat, lon in points)
+                radius = ""
+            else:
+                center = getattr(zone, "center_coords", None)
+                if not center:
+                    continue
+                geometry = f"{float(center[0])}, {float(center[1])}"
+                radius = f"{float(getattr(zone, 'radius_km', 0) or 0):g}"
+            priority = ",".join(getattr(zone, "priority_vehicle_types", []) or [])
+            restricted = ",".join(getattr(zone, "restricted_vehicle_types", []) or [])
+            enabled = "true" if getattr(zone, "enabled", True) else "false"
+            discount = f"{float(getattr(zone, 'discount_priority_vehicle', 1.0) or 1.0):g}"
+            outside = f"{float(getattr(zone, 'priority_vehicle_outside_penalty', 0.0) or 0.0):g}"
+            penalties = ",".join(
+                f"{bus}={float(value):g}"
+                for bus, value in (getattr(zone, "vehicle_penalties", {}) or {}).items()
+            )
+            lines.append(
+                f"{name}: {mode} | {geometry} | {radius} | {priority} | {restricted} | "
+                f"{enabled} | {discount} | {outside} | {penalties}"
+            )
+        return "\n".join(lines)
+
     def _parse_depots_text(self, raw):
         depots = {}
         for line in (raw or "").splitlines():
@@ -800,6 +874,72 @@ locations.*:
                 continue
         return zones
 
+    def _parse_center_zones_text(self, raw):
+        zones = []
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            name, zone_raw = line.split(":", 1)
+            parts = [part.strip() for part in zone_raw.split("|")]
+            if len(parts) < 5:
+                continue
+            try:
+                mode = (parts[0] or "circle").lower()
+                geometry = parts[1]
+                radius = float(parts[2] or 0)
+                priority_types = [item.strip() for item in parts[3].replace(";", ",").split(",") if item.strip()]
+                restricted_types = [item.strip() for item in parts[4].replace(";", ",").split(",") if item.strip()]
+                enabled = True
+                if len(parts) >= 6 and parts[5]:
+                    enabled = parts[5].lower() not in ("0", "false", "no", "off", "не")
+                discount = float(parts[6]) if len(parts) >= 7 and parts[6] else 0.9
+                outside_penalty = float(parts[7]) if len(parts) >= 8 and parts[7] else 0.0
+                penalties = {}
+                if len(parts) >= 9 and parts[8]:
+                    for item in parts[8].replace(";", ",").split(","):
+                        if "=" not in item:
+                            continue
+                        bus, value = item.split("=", 1)
+                        penalties[bus.strip()] = float(value.strip())
+                if not penalties:
+                    penalties = {bus: 40000.0 for bus in restricted_types}
+
+                if mode == "polygon":
+                    polygon = []
+                    for point_raw in geometry.split(";"):
+                        point_parts = [float(part.strip()) for part in point_raw.split(",") if part.strip()]
+                        if len(point_parts) == 2:
+                            polygon.append((point_parts[0], point_parts[1]))
+                    if len(polygon) < 3:
+                        continue
+                    center_coords = polygon[0]
+                else:
+                    coord_parts = [float(part.strip()) for part in geometry.split(",") if part.strip()]
+                    if len(coord_parts) != 2:
+                        continue
+                    center_coords = (coord_parts[0], coord_parts[1])
+                    polygon = []
+
+                zones.append(
+                    config.CenterZoneConfig(
+                        name=name.strip(),
+                        mode=mode,
+                        center_coords=center_coords,
+                        radius_km=radius,
+                        polygon=polygon,
+                        enabled=enabled,
+                        priority_vehicle_types=priority_types,
+                        restricted_vehicle_types=restricted_types,
+                        discount_priority_vehicle=discount,
+                        priority_vehicle_outside_penalty=outside_penalty,
+                        vehicle_penalties=penalties,
+                    )
+                )
+            except ValueError:
+                continue
+        return zones
+
     def _traffic_zone_display_label(self, zone):
         center = getattr(zone, "center_coords", (0, 0))
         radius = float(getattr(zone, "radius_km", 0) or 0)
@@ -812,12 +952,36 @@ locations.*:
             f"{radius:g} км | +{delay_percent}%{status}"
         )
 
+    def _center_zone_display_label(self, zone):
+        mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+        if mode == "polygon":
+            polygon = getattr(zone, "polygon", []) or []
+            geometry = f"полигон {len(polygon)} точки"
+        else:
+            center = getattr(zone, "center_coords", (0, 0))
+            radius = float(getattr(zone, "radius_km", 0) or 0)
+            geometry = f"кръг {float(center[0]):.5f}, {float(center[1]):.5f} | {radius:g} км"
+        priority = ", ".join(getattr(zone, "priority_vehicle_types", []) or []) or "-"
+        restricted = ", ".join(getattr(zone, "restricted_vehicle_types", []) or []) or "-"
+        status = "" if getattr(zone, "enabled", True) else " (изключена)"
+        return (
+            f"{getattr(zone, 'name', 'Център зона')}: {geometry} | "
+            f"приоритет: {priority} | глоба: {restricted}{status}"
+        )
+
     def _next_traffic_zone_name(self, zones):
         used = {getattr(zone, "name", "") for zone in zones}
         index = len(zones) + 1
         while f"Трафик зона {index}" in used:
             index += 1
         return f"Трафик зона {index}"
+
+    def _next_center_zone_name(self, zones):
+        used = {getattr(zone, "name", "") for zone in zones}
+        index = len(zones) + 1
+        while f"Център зона {index}" in used:
+            index += 1
+        return f"Център зона {index}"
 
     def _sync_traffic_zone_widgets(self, zones):
         zones_text = self._format_traffic_zones_text(zones)
@@ -831,6 +995,18 @@ locations.*:
             for zone in zones:
                 self.traffic_zone_listbox.insert("end", self._traffic_zone_display_label(zone))
 
+    def _sync_center_zone_widgets(self, zones):
+        zones_text = self._format_center_zones_text(zones)
+        zones_widget = self.widgets.get("locations.center_zones")
+        if isinstance(zones_widget, tk.Text):
+            zones_widget.delete("1.0", "end")
+            zones_widget.insert("1.0", zones_text)
+
+        if self.center_zone_listbox is not None:
+            self.center_zone_listbox.delete(0, "end")
+            for zone in zones:
+                self.center_zone_listbox.insert("end", self._center_zone_display_label(zone))
+
     def _parse_coords_text(self, raw):
         parts = [part.strip() for part in str(raw or "").replace(";", ",").split(",")]
         if len(parts) != 2:
@@ -839,6 +1015,15 @@ locations.*:
             return (float(parts[0]), float(parts[1]))
         except ValueError:
             return None
+
+    def _parse_polygon_points_text(self, raw):
+        points = []
+        text = str(raw or "").replace(";", "\n")
+        for line in text.splitlines():
+            coords = self._parse_coords_text(line)
+            if coords is not None:
+                points.append(coords)
+        return points
 
     def _append_depot_from_fields(self):
         name_widget = self.widgets.get("locations.new_depot_name")
@@ -909,6 +1094,94 @@ locations.*:
         coords_widget.set("")
         self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
 
+    def _append_center_zone_from_fields(self):
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        penalty_widget = self.widgets.get("locations.new_center_zone_penalty")
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not all((name_widget, mode_widget, coords_widget, radius_widget, discount_widget, outside_widget, penalty_widget)):
+            return
+        if not isinstance(zones_widget, tk.Text):
+            return
+
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        name = name_widget.get().strip() or self._next_center_zone_name(zones)
+        mode = str(mode_widget.get() or "circle").strip().lower()
+        if mode not in ("circle", "polygon"):
+            mode = "circle"
+
+        try:
+            radius = float(radius_widget.get() or 0)
+            discount = float(discount_widget.get() or 0.9)
+            outside_penalty = float(outside_widget.get() or 0)
+            penalty = float(penalty_widget.get() or 0)
+        except ValueError:
+            messagebox.showwarning("Грешна център зона", "Радиусът, отстъпката и глобите трябва да са числа.")
+            return
+
+        raw_coords = (
+            coords_widget.get("1.0", "end-1c")
+            if isinstance(coords_widget, tk.Text)
+            else coords_widget.get()
+        )
+        polygon = []
+        if mode == "polygon":
+            polygon = self._parse_polygon_points_text(raw_coords)
+            if len(polygon) < 3:
+                messagebox.showwarning("Грешен полигон", "За polygon въведи поне 3 точки. Може всяка точка на нов ред.")
+                return
+            center_coords = polygon[0]
+            radius = 0.0
+        else:
+            center_coords = self._parse_coords_text(raw_coords)
+            if center_coords is None:
+                messagebox.showwarning("Грешни координати", "Въведи координати във формат lat, lon.")
+                return
+            if radius <= 0:
+                messagebox.showwarning("Грешен радиус", "Радиусът трябва да е по-голям от 0.")
+                return
+
+        priority_types = [
+            vehicle_type
+            for vehicle_type, var in self.center_zone_priority_vars.items()
+            if var.get()
+        ]
+        restricted_types = [
+            vehicle_type
+            for vehicle_type, var in self.center_zone_restricted_vars.items()
+            if var.get()
+        ]
+        if not priority_types and not restricted_types:
+            messagebox.showwarning("Няма правила", "Избери поне един тип бус за приоритет или глоба.")
+            return
+
+        zones.append(
+            config.CenterZoneConfig(
+                name=name,
+                mode=mode,
+                center_coords=center_coords,
+                radius_km=radius,
+                polygon=polygon,
+                enabled=True,
+                priority_vehicle_types=priority_types,
+                restricted_vehicle_types=restricted_types,
+                discount_priority_vehicle=discount,
+                priority_vehicle_outside_penalty=outside_penalty,
+                vehicle_penalties={vehicle_type: penalty for vehicle_type in restricted_types},
+            )
+        )
+        self._sync_center_zone_widgets(zones)
+        name_widget.set("")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+        else:
+            coords_widget.set("")
+        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+
     def _remove_selected_traffic_zone(self):
         zones_widget = self.widgets.get("locations.traffic_zones")
         if not isinstance(zones_widget, tk.Text) or self.traffic_zone_listbox is None:
@@ -924,6 +1197,23 @@ locations.*:
             return
         removed = zones.pop(index)
         self._sync_traffic_zone_widgets(zones)
+        self.status_var.set(f"Премахната е {removed.name}. Натисни Запази, за да се махне от config.py.")
+
+    def _remove_selected_center_zone(self):
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not isinstance(zones_widget, tk.Text) or self.center_zone_listbox is None:
+            return
+        selection = self.center_zone_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Няма избрана зона", "Избери център зона от списъка.")
+            return
+
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        index = selection[0]
+        if index >= len(zones):
+            return
+        removed = zones.pop(index)
+        self._sync_center_zone_widgets(zones)
         self.status_var.set(f"Премахната е {removed.name}. Натисни Запази, за да се махне от config.py.")
 
     def _add_depot_choice_field(self, parent, row, key, label, value, options, tooltip=""):
@@ -1000,6 +1290,17 @@ locations.*:
         if mode_widget is not None:
             mode_widget.set("polygon")
 
+    def _set_new_center_zone_polygon(self, polygon):
+        widget = self.widgets.get("locations.new_center_zone_coords")
+        if not isinstance(widget, tk.Text):
+            return
+        widget.delete("1.0", "end")
+        widget.insert("1.0", self._format_polygon_text(polygon))
+
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        if mode_widget is not None:
+            mode_widget.set("polygon")
+
     def _open_center_zone_editor(self):
         center_raw = self.widgets.get("locations.center_location").get()
         try:
@@ -1011,6 +1312,27 @@ locations.*:
         polygon_raw = polygon_widget.get("1.0", "end-1c") if isinstance(polygon_widget, tk.Text) else ""
         polygon = self._parse_polygon_text(polygon_raw)
 
+        self._open_polygon_editor(center, polygon, self._set_center_zone_polygon)
+
+    def _open_new_center_zone_editor(self):
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        raw_coords = coords_widget.get("1.0", "end-1c") if isinstance(coords_widget, tk.Text) else ""
+        polygon = self._parse_polygon_points_text(raw_coords)
+        center_coords = self._parse_coords_text(raw_coords)
+        if polygon:
+            center = [polygon[0][0], polygon[0][1]]
+        elif center_coords:
+            center = [center_coords[0], center_coords[1]]
+        else:
+            center_raw = self.widgets.get("locations.center_location").get()
+            try:
+                center = [float(part.strip()) for part in center_raw.split(",")[:2]]
+            except Exception:
+                center = [42.69735652560932, 23.323809998750914]
+
+        self._open_polygon_editor(center, polygon, self._set_new_center_zone_polygon)
+
+    def _open_polygon_editor(self, center, polygon, on_save_callback):
         gui = self
         server_box = {}
 
@@ -1039,7 +1361,7 @@ locations.*:
                         (float(point[0]), float(point[1]))
                         for point in data.get("polygon", [])
                     ]
-                    gui.root.after(0, lambda: gui._set_center_zone_polygon(saved_polygon))
+                    gui.root.after(0, lambda: on_save_callback(saved_polygon))
                     self._send(200, "OK", "text/plain; charset=utf-8")
                     threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
                 except Exception as exc:
@@ -1172,6 +1494,11 @@ locations.*:
   4. Пускай POST /run, ако програмата сама зарежда клиентите от input_source.
   5. Подай settings за бусове, депа, зони, output и setData в същия JSON.
 
+Ако един клиент има няколко документа:
+  По подразбиране програмата групира редове със същия IdCust и същия GPS в един стоп.
+  Обемът се събира, solver-ът посещава клиента веднъж, а setData връща отделна заявка за всеки оригинален документ.
+  Изключва се от Входни данни -> Групирай документи или през API с input.enable_customer_document_grouping=false.
+
 Ако търсиш защо резултатът е лош:
   1. Провери дали депата са правилни.
   2. Провери OSRM матрицата.
@@ -1182,7 +1509,7 @@ locations.*:
 Правило:
   Не започвай с фините solver настройки, ако има съмнение в данните, депата или матрицата.
                 """,
-                28,
+                33,
             ),
             (
                 "Карта на GUI-то",
@@ -1452,8 +1779,12 @@ JSON/Excel field mapping:
 
 Работно време:
   WorkTime: "08:00 - 16:00"
-  WorkFrom + WorkTo също се поддържат.
+  Поддържа и "08:00-13:00". Ако са подадени два реда, напр. 08:00-13:00 и 16:00-18:00,
+  програмата използва първия прозорец, защото solver-ите са настроени за един прозорец на клиент.
   Ако липсва, клиентът се приема постоянно отворен.
+
+Коментар доставка:
+  DeliveryComment / DeliveryNote / Comment се запазва към клиента и се показва в route картите и отчетите.
 
 Клиент без GPS:
   Не се дава на solver-а, защото би разместил matrix indices.
@@ -1581,6 +1912,16 @@ API пример:
   center_bus_outside_penalty:
     Глоба за center bus извън центъра.
 
+Допълнителни център зони:
+  center_zones:
+    Списък от независими зони. Всяка има собствен radius/polygon и собствени правила по тип бус.
+  priority_vehicle_types:
+    Кои бусове получават отстъпка вътре в тази зона.
+  restricted_vehicle_types:
+    Кои бусове получават глоба вътре в тази зона.
+  vehicle_penalties:
+    Глоба по тип бус, напр. {"internal_bus": 40000, "external_bus": 40000}.
+
 Трафик:
   city_traffic:
     Общ градски multiplier.
@@ -1598,6 +1939,12 @@ solver_type:
     Добър при повече време и различни seed-ове.
   or_tools:
     Стабилен solver за сравнение и контрол.
+
+objective_metric:
+  distance:
+    Solver-ът търси най-къси километри.
+  time:
+    Solver-ът търси най-кратко време по OSRM/Valhalla duration матрицата.
 
 time_limit_seconds:
   Колко секунди solver-ът търси решение.
@@ -1713,6 +2060,14 @@ HTML карти:
     Файл за общата карта.
   routes_output_dir:
     Папка за отделни route HTML файлове.
+  route_maps_upload_mode:
+    disabled = не качва, legacy = старото поведение, effect_upload = качва HTML маршрутите към upload endpoint.
+  route_maps_upload_url:
+    URL за качване, напр. https://effect.bg/dragon/hellbizante/upload-files.php
+  route_maps_upload_token:
+    Token за pData. За Effect endpoint-а е Effect-Bizante-Token.
+  route_maps_upload_file_field:
+    Обикновено files[], за да стигне до PHP като $_FILES['files'].
   map_provider:
     osm или google.
   google_maps_api_key:
@@ -1946,7 +2301,7 @@ POST /solve с клиенти, настройки, депа, бусове, outpu
     }
   },
   "customers": [
-    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00 - 16:00" }
+    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00-13:00", "DeliveryComment": "Обади се 10 мин преди доставка" }
   ]
 }
                 """,
@@ -2064,6 +2419,8 @@ setData не трябва да се пуска:
                          tooltip="http_json = зарежда от Bizant/API. excel = зарежда от файл."); gr += 1
         self._add_field(source, gr, "input.excel_file_path", "Excel файл:", inp.excel_file_path,
                         tooltip="Използва се само когато активният източник е excel."); gr += 1
+        self._add_field(source, gr, "input.enable_customer_document_grouping", "Групирай документи:", getattr(inp, "enable_customer_document_grouping", True), "bool",
+                        tooltip="Ако един и същ клиент/GPS има няколко документа, solver-ът го посещава веднъж със сборен обем. Изключи, ако искаш всеки документ да е отделен стоп."); gr += 1
 
         http, gr = self._add_grid_group(
             f,
@@ -2099,10 +2456,8 @@ setData не трябва да се пуска:
         self._add_field(json_fields, gr, "input.json_id_skld_field", "IdSkld:", getattr(inp, "json_id_skld_field", "IdSkld")); gr += 1
         self._add_field(json_fields, gr, "input.json_time_window_field", "Работно време:", getattr(inp, "json_time_window_field", "WorkTime"),
                         tooltip="JSON поле за GET/POST отговор във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
-        self._add_field(json_fields, gr, "input.json_time_window_start_field", "Работи от:", getattr(inp, "json_time_window_start_field", "WorkFrom"),
-                        tooltip="Опционално старо поле само за начало. Използва се ако няма поле 'Работно време'."); gr += 1
-        self._add_field(json_fields, gr, "input.json_time_window_end_field", "Работи до:", getattr(inp, "json_time_window_end_field", "WorkTo"),
-                        tooltip="Опционално старо поле само за край. Използва се ако няма поле 'Работно време'."); gr += 1
+        self._add_field(json_fields, gr, "input.json_delivery_comment_field", "Коментар доставка:", getattr(inp, "json_delivery_comment_field", "DeliveryComment"),
+                        tooltip="JSON поле с коментар/инструкция към шофьора. Поддържат се и DeliveryNote, Comment, Note като fallback."); gr += 1
 
         excel_fields, gr = self._add_grid_group(
             f,
@@ -2117,10 +2472,8 @@ setData не трябва да се пуска:
         self._add_field(excel_fields, gr, "input.document_column", "Документ:", inp.document_column); gr += 1
         self._add_field(excel_fields, gr, "input.time_window_column", "Работно време:", getattr(inp, "time_window_column", "Работно време"),
                         tooltip="Excel колона във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
-        self._add_field(excel_fields, gr, "input.time_window_start_column", "Работи от:", getattr(inp, "time_window_start_column", "Работи от"),
-                        tooltip="Опционална стара колона само за начало. Използва се ако няма колона 'Работно време'."); gr += 1
-        self._add_field(excel_fields, gr, "input.time_window_end_column", "Работи до:", getattr(inp, "time_window_end_column", "Работи до"),
-                        tooltip="Опционална стара колона само за край. Използва се ако няма колона 'Работно време'."); gr += 1
+        self._add_field(excel_fields, gr, "input.delivery_comment_column", "Коментар доставка:", getattr(inp, "delivery_comment_column", "Коментар доставка"),
+                        tooltip="Excel колона с коментар/инструкция към шофьора."); gr += 1
 
     # ── Tab: Превозни средства ───────────────────────────────
 
@@ -2411,6 +2764,9 @@ setData не трябва да се пуска:
         )
         self._add_field(basic, r, "cvrp.solver_type", "Тип солвър:", c.solver_type,
                          "combo", ["pyvrp", "or_tools"]); r += 1
+        self._add_field(basic, r, "cvrp.objective_metric", "Цел на оптимизацията:", getattr(c, "objective_metric", "distance"),
+                         "combo", ["distance", "time"],
+                         tooltip="distance = най-къси километри. time = най-кратко време по OSRM/Valhalla duration матрицата."); r += 1
         self._add_field(basic, r, "cvrp.time_limit_seconds", "Време за решение (сек):", c.time_limit_seconds); r += 1
 
         pyvrp_quality, r = self._add_group(
@@ -2538,6 +2894,129 @@ setData не трябва да се пуска:
 
     # ── Tab: Локации ─────────────────────────────────────────
 
+    def _add_center_zones_editor(self, parent, row, loc):
+        box = ttk.LabelFrame(parent, text="Допълнителни център зони", padding=(14, 12))
+        box.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(6, 14))
+        box.columnconfigure(0, weight=0)
+        box.columnconfigure(1, weight=1)
+        box.columnconfigure(2, weight=0)
+        box.columnconfigure(3, weight=0)
+
+        ttk.Label(
+            box,
+            text=(
+                "Добави отделна център зона. Избери кои бусове са приоритетни за нея "
+                "и кои бусове да получават глоба, ако влязат вътре."
+            ),
+            style="Hint.TLabel",
+            wraplength=900,
+        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+
+        ttk.Label(box, text="Име:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        name_var = tk.StringVar(value="")
+        name_entry = ttk.Entry(box, textvariable=name_var, width=34)
+        name_entry.grid(row=1, column=1, sticky="we", padx=(0, 8), pady=6)
+        self._bind_text_editing(name_entry)
+        self.widgets["locations.new_center_zone_name"] = name_var
+        ttk.Label(box, text="Празно = автоматично име.", style="Hint.TLabel").grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Label(box, text="Тип:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        mode_var = tk.StringVar(value="circle")
+        mode_combo = ttk.Combobox(box, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
+        mode_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        self.widgets["locations.new_center_zone_mode"] = mode_var
+
+        ttk.Label(box, text="Координати:", style="Surface.TLabel").grid(row=3, column=0, sticky="nw", padx=(8, 8), pady=6)
+        coords_text = tk.Text(box, height=3, width=54, font=("Segoe UI", 9), wrap="none")
+        coords_text.grid(row=3, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        self._bind_text_editing(coords_text)
+        self._bind_text_scrolling(coords_text)
+        self.widgets["locations.new_center_zone_coords"] = coords_text
+        ttk.Button(box, text="Постави", command=lambda: self._paste_to_text_widget(coords_text)).grid(
+            row=3, column=3, sticky="nw", padx=(0, 8), pady=(6, 0)
+        )
+        ttk.Button(box, text="Чертай", command=self._open_new_center_zone_editor).grid(
+            row=3, column=3, sticky="sw", padx=(0, 8), pady=(0, 6)
+        )
+        ttk.Label(
+            box,
+            text="За circle: 42.6977, 23.3219. За polygon натисни Чертай или постави точки на нов ред.",
+            style="Hint.TLabel",
+            wraplength=850,
+        ).grid(row=4, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(0, 6))
+
+        ttk.Label(box, text="Радиус:", style="Surface.TLabel").grid(row=5, column=0, sticky="w", padx=(8, 8), pady=6)
+        radius_var = tk.StringVar(value="1.5")
+        radius_combo = ttk.Combobox(box, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
+        radius_combo.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(radius_combo)
+        self.widgets["locations.new_center_zone_radius"] = radius_var
+        ttk.Label(box, text="км; при polygon не се използва", style="Hint.TLabel").grid(row=5, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        rules = ttk.Frame(box, style="Surface.TFrame")
+        rules.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(8, 6))
+        ttk.Label(rules, text="Тип бус", style="Surface.TLabel", width=18).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 4))
+        ttk.Label(rules, text="Приоритет в зоната", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
+        ttk.Label(rules, text="Глоба в зоната", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
+        vehicle_labels = [
+            ("center_bus", "Център бус"),
+            ("internal_bus", "Вътрешен бус"),
+            ("external_bus", "Външен бус"),
+            ("special_bus", "Специален бус"),
+            ("vratza_bus", "Враца бус"),
+        ]
+        self.center_zone_priority_vars = {}
+        self.center_zone_restricted_vars = {}
+        for idx, (vehicle_type, label) in enumerate(vehicle_labels, start=1):
+            ttk.Label(rules, text=label, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", padx=(0, 12), pady=2)
+            priority_var = tk.BooleanVar(value=(vehicle_type == "center_bus"))
+            restricted_var = tk.BooleanVar(value=(vehicle_type != "center_bus"))
+            ttk.Checkbutton(rules, variable=priority_var).grid(row=idx, column=1, sticky="w", padx=(0, 22), pady=2)
+            ttk.Checkbutton(rules, variable=restricted_var).grid(row=idx, column=2, sticky="w", padx=(0, 8), pady=2)
+            self.center_zone_priority_vars[vehicle_type] = priority_var
+            self.center_zone_restricted_vars[vehicle_type] = restricted_var
+
+        ttk.Label(box, text="Отстъпка:", style="Surface.TLabel").grid(row=7, column=0, sticky="w", padx=(8, 8), pady=6)
+        discount_var = tk.StringVar(value="0.9")
+        discount_combo = ttk.Combobox(box, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
+        discount_combo.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(discount_combo)
+        self.widgets["locations.new_center_zone_discount"] = discount_var
+        ttk.Label(box, text="0.9 = 10% по-ниска цена за приоритетен бус.", style="Hint.TLabel").grid(row=7, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Label(box, text="Глоба навън:", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(8, 8), pady=6)
+        outside_var = tk.StringVar(value="0")
+        outside_entry = ttk.Entry(box, textvariable=outside_var, width=12)
+        outside_entry.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(outside_entry)
+        self.widgets["locations.new_center_zone_outside_penalty"] = outside_var
+
+        ttk.Label(box, text="Глоба вътре:", style="Surface.TLabel").grid(row=9, column=0, sticky="w", padx=(8, 8), pady=6)
+        default_penalty = float(getattr(loc, "internal_bus_center_penalty", 40000.0) or 40000.0)
+        penalty_var = tk.StringVar(value=f"{default_penalty:g}")
+        penalty_entry = ttk.Entry(box, textvariable=penalty_var, width=12)
+        penalty_entry.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=6)
+        self._bind_text_editing(penalty_entry)
+        self.widgets["locations.new_center_zone_penalty"] = penalty_var
+        ttk.Label(box, text="Прилага се на всички маркирани в колоната 'Глоба в зоната'.", style="Hint.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+
+        ttk.Button(box, text="Добави център зона", command=self._append_center_zone_from_fields).grid(
+            row=10, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
+        )
+        ttk.Button(box, text="Премахни избраната", command=self._remove_selected_center_zone).grid(
+            row=10, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
+        )
+
+        ttk.Label(box, text="Добавени център зони:", style="Surface.TLabel").grid(
+            row=11, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4)
+        )
+        self.center_zone_listbox = tk.Listbox(box, height=5, font=("Segoe UI", 9), exportselection=False)
+        self.center_zone_listbox.grid(row=12, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
+
+        hidden_zones = tk.Text(box, width=1, height=1)
+        self.widgets["locations.center_zones"] = hidden_zones
+        self._sync_center_zone_widgets(getattr(loc, "center_zones", []) or [])
+
     def _add_locations_tab(self, nb):
         tab = ttk.Frame(nb)
         nb.add(tab, text=" 📍 Локации ")
@@ -2601,6 +3080,7 @@ setData не трябва да се пуска:
                          tooltip="0.5 = плаща 50% от разстоянието"); gr += 1
         self._add_field(center_zone, gr, "locations.center_bus_outside_center_penalty", "Глоба CENTER_BUS навън:", getattr(loc, "center_bus_outside_center_penalty", 50000.0),
                          tooltip="Добавя се към цената, когато CENTER_BUS обслужва клиент извън център зоната."); gr += 1
+        self._add_center_zones_editor(center_zone, gr, loc); gr += 1
 
         center_penalties, gr = self._add_grid_group(
             f,
@@ -2706,6 +3186,25 @@ setData не трябва да се пуска:
         self._add_field(maps, gr, "output.map_output_file", "Файл карта:", out.map_output_file); gr += 1
         self._add_field(maps, gr, "output.routes_output_dir", "HTML маршрути:", out.routes_output_dir,
                          tooltip="Отделни HTML файлове за всеки маршрут"); gr += 1
+        self._add_field(
+            maps,
+            gr,
+            "output.route_maps_upload_mode",
+            "Качване маршрути:",
+            getattr(out, "route_maps_upload_mode", "disabled"),
+            "combo",
+            ["disabled", "legacy", "effect_upload"],
+            tooltip="disabled = не качва. legacy = старото поведение. effect_upload = качва индивидуалните HTML карти към upload endpoint.",
+        ); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_url", "Upload URL:", getattr(out, "route_maps_upload_url", ""),
+                         tooltip="Endpoint за индивидуалните route HTML файлове."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_token", "Upload token:", getattr(out, "route_maps_upload_token", ""),
+                         tooltip="Стойност за pData. За Effect endpoint-а е Effect-Bizante-Token."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_token_field", "Token поле:", getattr(out, "route_maps_upload_token_field", "pData"),
+                         tooltip="Име на POST полето за token-а."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_file_field", "File поле:", getattr(out, "route_maps_upload_file_field", "files[]"),
+                         tooltip="За PHP $_FILES['files'] с много файлове използвай files[]."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_timeout_seconds", "Upload timeout:", getattr(out, "route_maps_upload_timeout_seconds", 60), "int"); gr += 1
         self._add_field(maps, gr, "output.map_provider", "Map provider:", out.map_provider,
                          tooltip='google за Google Maps визуализация или osm за Folium/OpenStreetMap.'); gr += 1
         self._add_field(maps, gr, "output.folium_tiles", "Folium tiles:", out.folium_tiles,
@@ -2791,14 +3290,14 @@ setData не трябва да се пуска:
             quick,
             r,
             "Run + настройки:",
-            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\",\\"routes_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
+            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\",\\"routes_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
             "Стартира /run, но само за тази заявка сменя solver, OSRM, бусове, изходни пътища и setData настройки.",
         )
         r = self._add_copyable_command(
             quick,
             r,
             "Run + JSON резултат:",
-            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"return_result\\":true,\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"time_limit_seconds\\":180,\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
+            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"return_result\\":true,\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
             "Заявката чака програмата да завърши и връща директно JSON резултата от решението.",
         )
         r = self._add_copyable_command(
@@ -2915,8 +3414,8 @@ POST {trigger_path}
   Връща:
     202 started за background, 200 с JSON решение за return_result, 409 ако вече има активен run.
   Примери:
-    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"settings\":{{\"solver_type\":\"pyvrp\"}}}}"
-    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"return_result\":true,\"settings\":{{\"time_limit_seconds\":180}}}}"
+    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"settings\":{{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\"}}}}"
+    curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"return_result\":true,\"settings\":{{\"objective_metric\":\"time\",\"time_limit_seconds\":180}}}}"
     curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"callback_url\":\"https://example.com/cvrp-finished\"}}"
 
 POST {solve_path}
@@ -2942,7 +3441,7 @@ POST {solve_path}?cmd=run
     Същото работи и с query имена command=... или action=...
   Примери:
     curl -X POST "{base_url}{solve_path}?cmd=run"
-    curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"cmd\":\"run\",\"settings\":{{\"solver_type\":\"or_tools\"}}}}"
+    curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"cmd\":\"run\",\"settings\":{{\"solver_type\":\"or_tools\",\"objective_metric\":\"distance\"}}}}"
 
 Временни settings:
   Могат да се подават като вложени секции:
@@ -2968,6 +3467,7 @@ POST {trigger_path} - run с временни настройки, без да п
 {{
   "settings": {{
     "solver_type": "pyvrp",
+    "objective_metric": "time",
     "time_limit_seconds": 180,
     "routing": {{"engine": "osrm"}},
     "osrm": {{"base_url": "http://localhost:5000", "chunk_size": 80, "timeout_seconds": 45}},
@@ -2977,7 +3477,11 @@ POST {trigger_path} - run с временни настройки, без да п
       "excel_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza",
       "routes_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\Routes",
       "enable_csv_output": true,
-      "csv_output_file": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\routes.csv"
+      "csv_output_file": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\routes.csv",
+      "route_maps_upload_mode": "effect_upload",
+      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
+      "route_maps_upload_token": "Effect-Bizante-Token",
+      "route_maps_upload_file_field": "files[]"
     }},
     "set_data": {{
       "enable_set_data_upload": false,
@@ -2996,6 +3500,7 @@ POST {trigger_path} - run, който връща директно JSON резу�
   "return_result": true,
   "settings": {{
     "solver_type": "pyvrp",
+    "objective_metric": "time",
     "time_limit_seconds": 180,
     "set_data": {{"enable_set_data_upload": false}}
   }}
@@ -3019,6 +3524,7 @@ POST {solve_path} - клиенти + настройки в една заявка
 {{
   "settings": {{
     "solver_type": "or_tools",
+    "objective_metric": "time",
     "output.map_provider": "google",
     "set_data.enable_set_data_upload": false
   }},
@@ -3048,6 +3554,20 @@ POST {solve_path} - клиенти + настройки в една заявка
       "vratza_bus_penalty": 40000,
       "center_bus_outside_penalty": 0
     }},
+    "center_zones": [
+      {{
+        "name": "Център 2",
+        "mode": "circle",
+        "center": [42.7093, 23.3137],
+        "radius_km": 1.2,
+        "priority_vehicle_types": ["center_bus"],
+        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+        "discount_priority_vehicle": 0.9,
+        "priority_vehicle_outside_penalty": 0,
+        "vehicle_penalties": {{"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000}},
+        "enabled": true
+      }}
+    ],
     "traffic_zones": [
       {{"name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true}}
     ]
@@ -3394,16 +3914,15 @@ POST {solve_path} - клиенти + настройки в една заявка
             "input.json_plas_doc_field": ("json_plas_doc_field", "str"),
             "input.json_id_skld_field": ("json_id_skld_field", "str"),
             "input.json_time_window_field": ("json_time_window_field", "str"),
-            "input.json_time_window_start_field": ("json_time_window_start_field", "str"),
-            "input.json_time_window_end_field": ("json_time_window_end_field", "str"),
+            "input.json_delivery_comment_field": ("json_delivery_comment_field", "str"),
             "input.gps_column": ("gps_column", "str"),
             "input.client_id_column": ("client_id_column", "str"),
             "input.client_name_column": ("client_name_column", "str"),
             "input.volume_column": ("volume_column", "str"),
             "input.document_column": ("document_column", "str"),
             "input.time_window_column": ("time_window_column", "str"),
-            "input.time_window_start_column": ("time_window_start_column", "str"),
-            "input.time_window_end_column": ("time_window_end_column", "str"),
+            "input.delivery_comment_column": ("delivery_comment_column", "str"),
+            "input.enable_customer_document_grouping": ("enable_customer_document_grouping", "bool"),
             # Routing
             "routing.engine": ("engine", "routing_engine"),
             "routing.enable_time_dependent": ("enable_time_dependent", "bool"),
@@ -3419,6 +3938,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "warehouse.capacity_toleranse": ("capacity_toleranse", "float"),
             # CVRP
             "cvrp.solver_type": ("solver_type", "str"),
+            "cvrp.objective_metric": ("objective_metric", "str"),
             "cvrp.time_limit_seconds": ("time_limit_seconds", "int"),
             "cvrp.allow_customer_skipping": ("allow_customer_skipping", "bool"),
             "cvrp.distance_penalty_disjunction": ("distance_penalty_disjunction", "int"),
@@ -3469,6 +3989,12 @@ POST {solve_path} - клиенти + настройки в една заявка
             "output.enable_interactive_map": ("enable_interactive_map", "bool"),
             "output.map_output_file": ("map_output_file", "path"),
             "output.routes_output_dir": ("routes_output_dir", "path"),
+            "output.route_maps_upload_mode": ("route_maps_upload_mode", "str"),
+            "output.route_maps_upload_url": ("route_maps_upload_url", "str"),
+            "output.route_maps_upload_token_field": ("route_maps_upload_token_field", "str"),
+            "output.route_maps_upload_token": ("route_maps_upload_token", "str"),
+            "output.route_maps_upload_file_field": ("route_maps_upload_file_field", "str"),
+            "output.route_maps_upload_timeout_seconds": ("route_maps_upload_timeout_seconds", "int"),
             "output.map_provider": ("map_provider", "str"),
             "output.folium_tiles": ("folium_tiles", "str"),
             "output.google_maps_api_key": ("google_maps_api_key", "str"),
@@ -3574,6 +4100,12 @@ POST {solve_path} - клиенти + настройки в една заявка
             content = self._replace_traffic_zones_value(
                 content,
                 values["locations.traffic_zones"],
+            )
+
+        if "locations.center_zones" in values:
+            content = self._replace_center_zones_value(
+                content,
+                values["locations.center_zones"],
             )
 
         # ─── Vehicle fields ───
@@ -3721,6 +4253,60 @@ POST {solve_path} - клиенти + настройки в една заявка
             r'field\(default_factory=lambda:\s*\[.*?\]\)'
         )
         return re.sub(pattern, rf'\g<1>{new_block}', content, flags=re.S)
+
+    def _replace_center_zones_value(self, content, raw_val):
+        import re
+
+        zones = self._parse_center_zones_text(raw_val)
+        if zones:
+            zone_blocks = []
+            for zone in zones:
+                polygon = getattr(zone, "polygon", []) or []
+                polygon_block = "[" + ", ".join(f"({float(lat)}, {float(lon)})" for lat, lon in polygon) + "]"
+                center = getattr(zone, "center_coords", None)
+                center_block = f"({float(center[0])}, {float(center[1])})" if center else "None"
+                priority = "[" + ", ".join(f'"{item}"' for item in (zone.priority_vehicle_types or [])) + "]"
+                restricted = "[" + ", ".join(f'"{item}"' for item in (zone.restricted_vehicle_types or [])) + "]"
+                penalties = "{" + ", ".join(
+                    f'"{bus}": {float(value)}'
+                    for bus, value in (zone.vehicle_penalties or {}).items()
+                ) + "}"
+                safe_name = zone.name.replace(chr(34), chr(92) + chr(34))
+                zone_blocks.append(
+                    "\n        ".join([
+                        "CenterZoneConfig(",
+                        f'    name="{safe_name}",',
+                        f'    mode="{zone.mode}",',
+                        f"    center_coords={center_block},",
+                        f"    radius_km={float(zone.radius_km)},",
+                        f"    polygon={polygon_block},",
+                        f"    enabled={'True' if zone.enabled else 'False'},",
+                        f"    priority_vehicle_types={priority},",
+                        f"    restricted_vehicle_types={restricted},",
+                        f"    discount_priority_vehicle={float(zone.discount_priority_vehicle)},",
+                        f"    priority_vehicle_outside_penalty={float(zone.priority_vehicle_outside_penalty)},",
+                        f"    vehicle_penalties={penalties},",
+                        ")",
+                    ])
+                )
+            joined_blocks = ",\n        ".join(zone_blocks)
+            new_block = f"field(default_factory=lambda: [\n        {joined_blocks}\n    ])"
+        else:
+            new_block = "field(default_factory=lambda: [])"
+
+        multiline_pattern = (
+            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*\[.*?\n    \]\)'
+        )
+        content, count = re.subn(multiline_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        if count:
+            return content
+
+        empty_pattern = (
+            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*\[\]\)'
+        )
+        return re.sub(empty_pattern, rf'\g<1>{new_block}', content, flags=re.S)
 
     def _replace_list_field_value(self, content, field_name, raw_val):
         """Замества List[str] поле с field(default_factory=lambda: [...]) в config.py"""

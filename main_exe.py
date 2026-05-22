@@ -5,11 +5,38 @@ EXE входна точка за CVRP програма
 
 import sys
 import os
+import io
 import logging
 import shutil
 import argparse
 from pathlib import Path
 import importlib.util
+
+
+def _configure_stdio():
+    """Make EXE console/log redirection tolerant to Unicode output."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+            continue
+        except Exception:
+            pass
+
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            continue
+
+        try:
+            setattr(sys, stream_name, io.TextIOWrapper(buffer, encoding="utf-8", errors="replace"))
+        except Exception:
+            pass
+
+
+_configure_stdio()
 
 
 def _resolve_runtime_path(base_dir: Path, configured_path: str, default_relative_path: str) -> str:
@@ -81,13 +108,14 @@ def setup_exe_environment():
         Path(directory).mkdir(parents=True, exist_ok=True)
     
     # Настройваме logging за EXE
+    log_handlers = [logging.FileHandler('logs/cvrp_exe.log', encoding='utf-8')]
+    if sys.stdout is not None:
+        log_handlers.append(logging.StreamHandler(sys.stdout))
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('logs/cvrp_exe.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=log_handlers,
     )
 
 # Забележка: Функцията copy_output_files е премахната, тъй като сега файловете

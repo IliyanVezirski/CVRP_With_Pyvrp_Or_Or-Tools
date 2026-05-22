@@ -11,12 +11,15 @@
 - Разделя заявките между бусове и складова обработка.
 - Изчислява матрица с разстояния и времена през OSRM или Valhalla.
 - Поддържа два решителя: OR-Tools и PyVRP.
+- Позволява solver-ът да оптимизира по километри или по време чрез `objective_metric`.
 - Поддържа индивидуално време за обслужване по тип бус.
 - Поддържа различни начални депа по тип бус.
-- Поддържа център зона като кръг или начертан полигон през GUI.
+- Поддържа различна крайна точка на бус; ако няма крайна точка, маршрутът завършва в стартовото депо.
+- Поддържа основна център зона и допълнителни независими център зони. Всяка допълнителна зона може да има собствени правила за кои типове бусове важат приоритетите и глобите.
 - Позволява при нужда solver-ът да пропуска заявки, като приоритетно по-лесни за пропускане са големи и близки до депото заявки.
 - Генерира обща HTML карта, отделни HTML карти за всеки маршрут, Excel отчет, CSV файл и графики.
-- В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, popup с обем и бутон за навигация.
+- В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане, popup с обем и бутон за навигация.
+- В общата карта има GPS търсачка за временни пинове по координати, с име и обем, ако са подадени.
 - Показва посока на движение по маршрутите с разредени стрелки.
 - Добавя дата на стартиране към имената на общата карта, Excel файловете и отделните route карти. CSV файлът остава без дата.
 - Има GUI за настройки и Windows Task Scheduler интеграция.
@@ -149,6 +152,8 @@ GPS стойностите се очакват като latitude/longitude, на
 
 HTTP JSON режимът поддържа URL с дата, декодиране на `utf-8`, `windows-1251`, `latin-1` и mapping на полетата в `InputConfig`.
 
+Ако един и същ клиентски номер (`IdCust`) идва повече от веднъж със същите GPS координати, програмата по подразбиране групира тези редове като едно посещение. Обемът се събира, solver-ът вижда един стоп, а оригиналните документи се пазят за отчетите и `setData`. Това може да се изключи от GUI: `Входни данни -> Групирай документи`, или през API/settings с `input.enable_customer_document_grouping=false`.
+
 ## Бусове, депа и сервизно време
 
 Всеки `VehicleConfig` има:
@@ -160,16 +165,19 @@ HTTP JSON режимът поддържа URL с дата, декодиране 
 - `max_time_hours`
 - `service_time_minutes`
 - `max_customers_per_route`
+- `name`
 - `start_location`
+- `end_location`
 - `tsp_depot_location`
 - `start_time_minutes`
 
 Важна текуща логика:
 
 - OR-Tools използва vehicle-specific transit callbacks за време.
-- PyVRP използва отделни профили по тип бус и добавя service time в edge duration.
+- PyVRP използва споделени профили за еднакви vehicle правила и добавя service time в edge duration.
 - Времето за обслужване вече не е средна стойност за всички бусове.
 - При избор на депо през GUI се записва както `start_location`, така и `tsp_depot_location`.
+- Ако `end_location` е празна, крайната точка автоматично е стартовото депо.
 
 ## Център зона
 
@@ -191,6 +199,26 @@ center_zone_mode = "polygon"
 
 GUI бутонът `Чертай на карта` отваря локален Leaflet редактор, в който зоната може да се начертае и запише като полигон.
 
+Допълнителните център зони се настройват през `locations.center_zones`. Те са независими от старата основна зона:
+
+```python
+center_zones = [
+    CenterZoneConfig(
+        name="Център 2",
+        mode="circle",
+        center_coords=(42.7093, 23.3137),
+        radius_km=1.2,
+        priority_vehicle_types=["center_bus"],
+        restricted_vehicle_types=["internal_bus", "external_bus", "vratza_bus"],
+        discount_priority_vehicle=0.9,
+        priority_vehicle_outside_penalty=0,
+        vehicle_penalties={"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000},
+    )
+]
+```
+
+При клиент в няколко зони отстъпката за приоритетен бус взема най-добрата приложима отстъпка, а глобите за ограничени бусове се събират. Ако приоритетен бус е извън всички зони, които го таргетират, се прилага най-голямата `priority_vehicle_outside_penalty`.
+
 Зоната влияе върху:
 
 - приоритети на center bus;
@@ -211,6 +239,8 @@ OR-Tools режимът поддържа:
 
 - capacity dimension;
 - time dimension с vehicle-specific service time;
+- оптимизация по `distance` или `time`;
+- предварително сметнати vehicle cost матрици, така че solver-ът да чете готова цена вместо да пресмята всяка дъга многократно през Python callback;
 - индивидуални депа;
 - пропускане на клиенти чрез `AddDisjunction`;
 - индивидуални penalties при priority dropping;
@@ -227,12 +257,25 @@ cvrp.solver_type = "pyvrp"
 В `requirements.txt` PyVRP е pin-нат към:
 
 ```text
-pyvrp>=0.5.0,<0.6.0
+pyvrp>=0.13.3
 ```
 
-PyVRP използва същата входна матрица, същите клиенти и същата output структура. Поддържа vehicle-specific service time и priority dropping чрез prize/penalty логика.
+PyVRP използва същата входна матрица, същите клиенти и същата output структура. Поддържа vehicle-specific service time, различни начални/крайни депа, objective по време или километри и priority dropping чрез prize/penalty логика.
+
+PyVRP профилите се компресират: ако няколко типа бусове имат еднакви правила за цена/център зона/service time, те споделят един edge profile. Началното и крайното депо остават настройка на vehicle type, така че различни депа не се губят при компресията.
 
 Забележка: нито OR-Tools, нито PyVRP в този проект използват видеокарта. По-добрият резултат идва от настройки, време за търсене, матрица с по-точни времена и коректни ограничения, не от GPU.
+
+## Цел на оптимизацията
+
+Настройката е:
+
+```python
+cvrp.objective_metric = "distance"
+cvrp.objective_metric = "time"
+```
+
+`distance` означава, че solver-ът търси по-малко километри. `time` означава, че solver-ът търси по-кратко време по duration матрицата от OSRM/Valhalla. При `time` глобите и fixed cost стойностите се преобразуват към същия мащаб, за да може solver-ът да сравнява пътно време, пропуснати клиенти и center zone penalties в една обща цена.
 
 ## Приоритетно пропускане на заявки
 
@@ -271,6 +314,8 @@ OSRM е основният режим. Използва:
 - fallback логика при липсващи данни.
 
 Важно: междублоковите връзки вече не се приемат за симетрични. A->B и B->A се попълват отделно, защото еднопосочни улици, забрани и завои могат да правят двете посоки различни.
+
+При Valhalla липсващи клетки в матрицата вече не спират целия run. Програмата ги попълва с приблизителна fallback стойност по права линия с road factor и записва предупреждение в лога.
 
 ## Изходни файлове
 
@@ -317,6 +362,8 @@ CSV файлът не се променя по име, за да остане с
 - разредени стрелки за посока на движение;
 - popup-и с информация за клиенти;
 - Google Maps navigation link.
+- очакван час на пристигане при клиентите, изчислен от същата матрица и service time, които ползва solver-ът.
+- GPS търсачка в общата карта за ръчно поставяне на един или много пинове.
 
 В отделните route карти има сгъваем списък:
 
@@ -410,9 +457,13 @@ http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&Don
 - `IdDoc`
 - `IdPlasDoc`
 - `IdSkld`
+- `WorkTime` във формат `08:00-13:00` или `08:00 - 16:00`
+- `DeliveryComment` за коментар/инструкция към доставката
 - `DoneFlag`
 
 `IdPlasDoc` се пази за връщане към `setData`, а `IdSkld` се пази като оригинален склад на клиента и се използва при необслужени клиенти.
+Ако `WorkTime` е подадено на два реда, например `08:00-13:00` и `16:00-18:00`, програмата използва първия прозорец, защото solver-ите работят с един прозорец на клиент. Работното време и коментарът се виждат в индивидуалните route карти; клиентите с работно време са оцветени леко в червено в списъка.
+При няколко документа за един и същ `IdCust` и същ GPS, настройката `enable_customer_document_grouping` определя поведението. Включена стойност означава едно посещение със сборен обем и отделни `setData` заявки за всеки `IdPlasDoc`. Изключена стойност означава всеки документ да остане отделен стоп.
 
 ### API сървър
 
@@ -441,7 +492,7 @@ cmd=start_program
 Пример:
 
 ```cmd
-curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\"}]}"
+curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
 curl "http://10.10.100.134:8088/run"
 ```
 
@@ -508,15 +559,48 @@ Build-ът включва основната програма, Settings GUI, API
 - Всеки бус може да има отделна начална и крайна GPS точка. Ако крайна точка не е зададена, маршрутът завършва в стартовото депо.
 - Могат да се добавят допълнителни депа и трафик зони през опростени GUI полета.
 - Работно време на клиентите може да се чете от Excel/JSON и да се включва или изключва от GUI.
+- Клиенти с няколко документа могат да се групират по `IdCust + GPS` в един стоп; настройката може да се изключи от GUI или API.
 - API режимът поддържа `/run`, `/solve`, callback URL, JSON резултат и временни настройки само за конкретната заявка.
-- През API могат да се подават бусове, депа, трафик зони, OSRM настройки, solver настройки, output пътища и `setData` настройки.
+- През API могат да се подават бусове, депа, трафик зони, независими център зони с правила по тип бус, OSRM настройки, solver настройки, output пътища и `setData` настройки.
 - `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
 - Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
+- `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
+- Индивидуалните route HTML карти по подразбиране се качват към `https://effect.bg/dragon/hellbizante/upload-files.php` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
+- OR-Tools използва предварително сметнати vehicle cost матрици за по-малко Python callback overhead.
+- PyVRP компресира еднаквите профили, без да губи различните депа на бусовете.
+- При Excel вход Враца бусовете не се изключват автоматично само защото липсва `IdSkld`; тази автоматична филтрация важи само за HTTP JSON вход.
 
 ### Пример `/run` с настройки
 
 ```powershell
-curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\"}}}"
+curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
+```
+
+### Пример API center_zones
+
+```json
+{
+  "settings": {
+    "center_zones": [
+      {
+        "name": "Център 2",
+        "mode": "circle",
+        "center": [42.7093, 23.3137],
+        "radius_km": 1.2,
+        "priority_vehicle_types": ["center_bus"],
+        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
+        "discount_priority_vehicle": 0.9,
+        "priority_vehicle_outside_penalty": 0,
+        "vehicle_penalties": {
+          "internal_bus": 40000,
+          "external_bus": 40000,
+          "vratza_bus": 40000
+        },
+        "enabled": true
+      }
+    ]
+  }
+}
 ```
 
 ### Пример vehicle с крайна точка

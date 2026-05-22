@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, urlparse
 from config import (
     MainConfig,
     RoutingEngine,
+    CenterZoneConfig,
     TrafficZoneConfig,
     VehicleConfig,
     VehicleType,
@@ -85,6 +86,7 @@ _SPECIAL_SETTING_KEYS = {
     "depot_location",
     "center_location",
     "center_zone",
+    "center_zones",
     "traffic_zones",
     "city_traffic",
     "vratza_depot",
@@ -93,6 +95,10 @@ _SPECIAL_SETTING_KEYS = {
 _TOP_LEVEL_SETTING_ALIASES = {
     "solver": ("cvrp", "solver_type"),
     "solver_type": ("cvrp", "solver_type"),
+    "objective": ("cvrp", "objective_metric"),
+    "objective_metric": ("cvrp", "objective_metric"),
+    "optimize_by": ("cvrp", "objective_metric"),
+    "optimization_objective": ("cvrp", "objective_metric"),
     "time_limit": ("cvrp", "time_limit_seconds"),
     "time_limit_seconds": ("cvrp", "time_limit_seconds"),
     "parallel": ("cvrp", "enable_parallel_solving"),
@@ -118,8 +124,20 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "json_sklad": ("input", "json_sklad"),
     "done_flag": ("input", "json_done_flag"),
     "json_done_flag": ("input", "json_done_flag"),
+    "json_delivery_comment_field": ("input", "json_delivery_comment_field"),
+    "delivery_comment_field": ("input", "json_delivery_comment_field"),
+    "enable_customer_document_grouping": ("input", "enable_customer_document_grouping"),
+    "group_customer_documents": ("input", "enable_customer_document_grouping"),
     "map_output_file": ("output", "map_output_file"),
     "routes_output_dir": ("output", "routes_output_dir"),
+    "route_maps_upload_mode": ("output", "route_maps_upload_mode"),
+    "route_maps_upload_url": ("output", "route_maps_upload_url"),
+    "route_maps_upload_token": ("output", "route_maps_upload_token"),
+    "route_maps_upload_token_field": ("output", "route_maps_upload_token_field"),
+    "route_maps_upload_file_field": ("output", "route_maps_upload_file_field"),
+    "route_maps_upload_timeout": ("output", "route_maps_upload_timeout_seconds"),
+    "route_maps_upload_timeout_seconds": ("output", "route_maps_upload_timeout_seconds"),
+    "upload_route_maps": ("output", "route_maps_upload_mode"),
     "excel_output_dir": ("output", "excel_output_dir"),
     "csv_output_file": ("output", "csv_output_file"),
     "charts_output_dir": ("output", "charts_output_dir"),
@@ -146,6 +164,7 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "center_zone_mode": ("locations", "center_zone_mode"),
     "center_zone_radius": ("locations", "center_zone_radius_km"),
     "center_zone_radius_km": ("locations", "center_zone_radius_km"),
+    "center_zones": ("locations", "center_zones"),
     "city_traffic_center": ("locations", "city_center_coords"),
     "city_traffic_radius": ("locations", "city_traffic_radius_km"),
     "city_traffic_radius_km": ("locations", "city_traffic_radius_km"),
@@ -155,6 +174,10 @@ _TOP_LEVEL_SETTING_ALIASES = {
 _QUERY_SETTING_ALIASES = {
     "solver": "solver",
     "solver_type": "solver_type",
+    "objective": "objective",
+    "objective_metric": "objective_metric",
+    "optimize_by": "optimize_by",
+    "optimization_objective": "optimization_objective",
     "time_limit": "time_limit",
     "time_limit_seconds": "time_limit_seconds",
     "parallel": "parallel",
@@ -175,8 +198,20 @@ _QUERY_SETTING_ALIASES = {
     "json_sklad": "json_sklad",
     "done_flag": "done_flag",
     "json_done_flag": "json_done_flag",
+    "json_delivery_comment_field": "json_delivery_comment_field",
+    "delivery_comment_field": "delivery_comment_field",
+    "enable_customer_document_grouping": "enable_customer_document_grouping",
+    "group_customer_documents": "group_customer_documents",
     "map_output_file": "map_output_file",
     "routes_output_dir": "routes_output_dir",
+    "route_maps_upload_mode": "route_maps_upload_mode",
+    "route_maps_upload_url": "route_maps_upload_url",
+    "route_maps_upload_token": "route_maps_upload_token",
+    "route_maps_upload_token_field": "route_maps_upload_token_field",
+    "route_maps_upload_file_field": "route_maps_upload_file_field",
+    "route_maps_upload_timeout": "route_maps_upload_timeout",
+    "route_maps_upload_timeout_seconds": "route_maps_upload_timeout_seconds",
+    "upload_route_maps": "upload_route_maps",
     "excel_output_dir": "excel_output_dir",
     "csv_output_file": "csv_output_file",
     "charts_output_dir": "charts_output_dir",
@@ -203,6 +238,7 @@ _QUERY_SETTING_ALIASES = {
     "center_zone_mode": "center_zone_mode",
     "center_zone_radius": "center_zone_radius",
     "center_zone_radius_km": "center_zone_radius_km",
+    "center_zones": "center_zones",
     "city_traffic_center": "city_traffic_center",
     "city_traffic_radius": "city_traffic_radius",
     "city_traffic_radius_km": "city_traffic_radius_km",
@@ -317,6 +353,19 @@ def _run_status_result_for_process(exit_code: Optional[int], command: list[str])
     }
 
 
+def _hidden_process_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoint: str, health_endpoint: str) -> Dict[str, Any]:
     return {
         "health": {
@@ -329,8 +378,9 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
             "url": f"{public_url}{trigger_endpoint}",
             "description": "Стартира оптимизацията с текущия input_source и config.",
             "query_examples": [
-                f"{public_url}{trigger_endpoint}?solver=pyvrp&time_limit=180",
+                f"{public_url}{trigger_endpoint}?solver=pyvrp&objective=time&time_limit=180",
                 f"{public_url}{trigger_endpoint}?output.enable_excel_output=true&set_data.enable_set_data_upload=false",
+                f"{public_url}{trigger_endpoint}?route_maps_upload_mode=effect_upload",
                 f"{public_url}{trigger_endpoint}?callback_url=https://example.com/cvrp-finished",
             ],
         },
@@ -343,10 +393,14 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
                 "callback_url": "https://example.com/cvrp-finished",
                 "settings": {
                     "solver_type": "pyvrp",
+                    "objective_metric": "time",
                     "time_limit_seconds": 180,
                     "output": {
                         "enable_excel_output": True,
                         "excel_output_dir": r"H:\Hell_Bizant_files\Bizant_with_vratza",
+                        "route_maps_upload_mode": "effect_upload",
+                        "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
+                        "route_maps_upload_token": "Effect-Bizante-Token",
                     },
                     "vehicles": [
                         {
@@ -368,14 +422,15 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
             "url": f"{public_url}{solve_endpoint}",
             "description": "Приема клиенти като JSON array или wrapper с customers/clients/orders/data/items/records.",
             "body_example": {
-                "settings": {"solver_type": "or_tools", "output.map_provider": "google"},
+                "settings": {"solver_type": "or_tools", "objective_metric": "distance", "output.map_provider": "google"},
                 "customers": [
                     {
                         "IdCust": "1",
                         "CustName": "Клиент",
                         "GPS": "42.6977,23.3219",
                         "Volume": 10,
-                        "WorkTime": "08:00 - 16:00",
+                        "WorkTime": "08:00-13:00",
+                        "DeliveryComment": "Обади се 10 мин преди доставка",
                     }
                 ],
             },
@@ -590,12 +645,25 @@ def _coerce_setting_value(section_name: str, field_name: str, value: Any, curren
         return _parse_routing_engine(value)
     if section_name == "vehicles" and field_name == "vehicle_type":
         return _parse_vehicle_type(value)
+    if section_name == "output" and field_name == "route_maps_upload_mode":
+        if isinstance(value, bool):
+            return "effect_upload" if value else "disabled"
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "enabled"}:
+            return "effect_upload"
+        if text in {"0", "false", "no", "off", "none"}:
+            return "disabled"
+        return text or "disabled"
     if field_name in {"start_location", "end_location", "tsp_depot_location", "depot_location", "center_location", "vratza_depot_location", "city_center_coords", "center_coords"}:
         return _parse_coords(value)
     if field_name == "center_zone_polygon":
         return _parse_coords_list(value)
     if field_name in {"parallel_first_solution_strategies", "parallel_local_search_metaheuristics"}:
         return _parse_string_list(value)
+    if field_name == "center_zones":
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else []
+        return [_center_zone_from_payload(item) for item in (value or [])]
     if field_name == "traffic_zones":
         return [_traffic_zone_from_payload(item) for item in (value or [])]
     if field_name == "depot_locations" and isinstance(value, dict):
@@ -642,6 +710,77 @@ def _traffic_zone_from_payload(payload: Any) -> TrafficZoneConfig:
         radius_km=float(payload.get("radius_km", payload.get("radius", 0)) or 0),
         duration_multiplier=float(payload.get("duration_multiplier", payload.get("multiplier", payload.get("delay_multiplier", 1.0))) or 1.0),
         enabled=_parse_bool(payload.get("enabled", True)),
+    )
+
+
+def _vehicle_type_list_from_payload(value: Any) -> list[str]:
+    vehicle_types = []
+    for item in _parse_string_list(value):
+        text = item.strip().lower()
+        matched = False
+        for vehicle_type in VehicleType:
+            if text in {vehicle_type.value.lower(), vehicle_type.name.lower()}:
+                vehicle_types.append(vehicle_type.value)
+                matched = True
+                break
+        if not matched and text:
+            vehicle_types.append(text)
+    return vehicle_types
+
+
+def _center_zone_from_payload(payload: Any) -> CenterZoneConfig:
+    if isinstance(payload, CenterZoneConfig):
+        return payload
+    if not isinstance(payload, dict):
+        raise ValueError(f"center_zones трябва да съдържа JSON обекти: {payload!r}")
+
+    raw_penalties = payload.get("vehicle_penalties", payload.get("penalties", {})) or {}
+    vehicle_penalties: dict[str, float] = {}
+    if isinstance(raw_penalties, dict):
+        for key, raw_value in raw_penalties.items():
+            vehicle_key = _vehicle_type_list_from_payload([key])
+            if vehicle_key:
+                vehicle_penalties[vehicle_key[0]] = float(raw_value or 0)
+
+    priority_types = _vehicle_type_list_from_payload(
+        payload.get("priority_vehicle_types", payload.get("priority_buses", payload.get("priority", ["center_bus"])))
+    )
+    restricted_types = _vehicle_type_list_from_payload(
+        payload.get(
+            "restricted_vehicle_types",
+            payload.get("restricted_buses", payload.get("restricted", ["internal_bus", "external_bus", "special_bus", "vratza_bus"])),
+        )
+    )
+    if not vehicle_penalties:
+        vehicle_penalties = {vehicle_type: 40000.0 for vehicle_type in restricted_types}
+    center_payload = payload.get("center_coords", payload.get("center", payload.get("location", None)))
+    if center_payload is None and any(key in payload for key in ("lat", "latitude", "lon", "lng", "longitude")):
+        center_payload = payload
+    polygon_payload = payload.get("polygon", payload.get("path", []))
+    if isinstance(polygon_payload, str) and ";" in polygon_payload:
+        polygon_payload = [part.strip() for part in polygon_payload.split(";") if part.strip()]
+
+    return CenterZoneConfig(
+        name=str(payload.get("name", payload.get("label", "Center zone"))),
+        mode=str(payload.get("mode", "circle") or "circle").strip().lower(),
+        center_coords=_parse_coords(center_payload),
+        radius_km=float(payload.get("radius_km", payload.get("radius", 1.0)) or 0),
+        polygon=_parse_coords_list(polygon_payload),
+        enabled=_parse_bool(payload.get("enabled", True)),
+        enable_priority=_parse_bool(payload.get("enable_priority", True)),
+        enable_restrictions=_parse_bool(payload.get("enable_restrictions", True)),
+        priority_vehicle_types=priority_types,
+        restricted_vehicle_types=restricted_types,
+        discount_priority_vehicle=float(
+            payload.get("discount_priority_vehicle", payload.get("discount", payload.get("discount_center_bus", 0.9))) or 1.0
+        ),
+        priority_vehicle_outside_penalty=float(
+            payload.get(
+                "priority_vehicle_outside_penalty",
+                payload.get("outside_penalty", payload.get("center_bus_outside_penalty", 0.0)),
+            ) or 0.0
+        ),
+        vehicle_penalties=vehicle_penalties,
     )
 
 
@@ -756,6 +895,13 @@ def _apply_center_zone(config: MainConfig, value: Any) -> list[str]:
     if not isinstance(value, dict):
         raise ValueError("center_zone трябва да е JSON обект")
     locations = config.locations
+    applied: list[str] = []
+    if "zones" in value:
+        locations.center_zones = [_center_zone_from_payload(item) for item in (value.get("zones") or [])]
+        applied.append("locations.center_zones")
+    if "center_zones" in value:
+        locations.center_zones = [_center_zone_from_payload(item) for item in (value.get("center_zones") or [])]
+        applied.append("locations.center_zones")
     mapping = {
         "mode": "center_zone_mode",
         "radius": "center_zone_radius_km",
@@ -773,8 +919,9 @@ def _apply_center_zone(config: MainConfig, value: Any) -> list[str]:
         "vratza_bus_penalty": "vratza_bus_center_penalty",
         "discount_center_bus": "discount_center_bus",
     }
-    applied: list[str] = []
     for key, raw_value in value.items():
+        if key in {"zones", "center_zones"}:
+            continue
         field_name = mapping.get(key, key if hasattr(locations, key) else "")
         if not field_name or not hasattr(locations, field_name):
             continue
@@ -813,6 +960,9 @@ def _apply_special_location_setting(config: MainConfig, key: str, value: Any) ->
         return _apply_depots(config, value)
     if key == "center_zone":
         return _apply_center_zone(config, value)
+    if key == "center_zones":
+        config.locations.center_zones = [_center_zone_from_payload(item) for item in (value or [])]
+        return ["locations.center_zones"]
     if key == "traffic_zones":
         config.locations.traffic_zones = [_traffic_zone_from_payload(item) for item in (value or [])]
         return ["locations.traffic_zones"]
@@ -1172,6 +1322,7 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
                 env=env,
                 stdout=stdout_log,
                 stderr=subprocess.STDOUT,
+                **_hidden_process_kwargs(),
             )
             with _RUN_LOCK:
                 _RUN_STATUS.update(

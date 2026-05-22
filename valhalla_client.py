@@ -17,6 +17,10 @@ from osrm_client import DistanceMatrix  # Използваме същия Distan
 
 logger = logging.getLogger(__name__)
 
+FALLBACK_SPEED_KMH = 40.0
+FALLBACK_ROAD_FACTOR = 1.3
+VALHALLA_CLIENT_FIX_VERSION = "2026-05-14-null-cell-v2"
+
 
 class ValhallaClient:
     """Клиент за Valhalla API"""
@@ -24,6 +28,7 @@ class ValhallaClient:
     def __init__(self, config: Optional[ValhallaConfig] = None):
         self.config = config or get_config().valhalla
         self.routing_config = get_config().routing
+        logger.info("Valhalla client loaded from %s (%s)", __file__, VALHALLA_CLIENT_FIX_VERSION)
         
         # HTTP session за по-бързи заявки
         self.session = requests.Session()
@@ -87,6 +92,47 @@ class ValhallaClient:
         if getattr(self.routing_config, "enable_curbside_approach", False):
             location["preferred_side"] = getattr(self.routing_config, "valhalla_preferred_side", "same")
         return location
+
+    def _fallback_cell_values(
+        self,
+        origin: Tuple[float, float],
+        destination: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        if origin == destination:
+            return 0.0, 0.0
+
+        distance_m = self._haversine_distance(origin, destination) * FALLBACK_ROAD_FACTOR
+        duration_s = distance_m / 1000 / FALLBACK_SPEED_KMH * 3600
+        return distance_m, duration_s
+
+    def _normalise_matrix_cell(
+        self,
+        cell: Optional[dict],
+        origin: Tuple[float, float],
+        destination: Tuple[float, float],
+    ) -> Tuple[float, float, bool]:
+        fallback_distance_m, fallback_duration_s = self._fallback_cell_values(origin, destination)
+
+        if not cell:
+            return fallback_distance_m, fallback_duration_s, True
+
+        distance_km = cell.get("distance")
+        duration_s = cell.get("time")
+        used_fallback = distance_km is None or duration_s is None
+
+        try:
+            distance_m = float(distance_km) * 1000 if distance_km is not None else fallback_distance_m
+        except (TypeError, ValueError):
+            distance_m = fallback_distance_m
+            used_fallback = True
+
+        try:
+            duration = float(duration_s) if duration_s is not None else fallback_duration_s
+        except (TypeError, ValueError):
+            duration = fallback_duration_s
+            used_fallback = True
+
+        return max(0.0, distance_m), max(0.0, duration), used_fallback
     
     def get_distance_matrix(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Получава матрица с разстояния и времена от Valhalla"""
@@ -166,13 +212,26 @@ class ValhallaClient:
             # Valhalla връща sources_to_targets като list of lists
             if "sources_to_targets" in data:
                 total_cells = 0
+                fallback_cells = 0
                 for i, row in enumerate(data["sources_to_targets"]):
                     for j, cell in enumerate(row):
-                        if cell:
-                            distances[i][j] = cell.get("distance", 0) * 1000  # km -> m
-                            durations[i][j] = cell.get("time", 0)  # вече в секунди
-                            total_cells += 1
+                        distance_m, duration_s, used_fallback = self._normalise_matrix_cell(
+                            cell,
+                            locations[i],
+                            locations[j],
+                        )
+                        distances[i][j] = distance_m
+                        durations[i][j] = duration_s
+                        total_cells += 1
+                        if used_fallback:
+                            fallback_cells += 1
                 print(f"✅ Парсирани {total_cells} клетки от матрицата")
+                if fallback_cells:
+                    logger.warning(
+                        "Valhalla върна липсващи стойности за %s/%s клетки; използвам приблизителни стойности.",
+                        fallback_cells,
+                        total_cells,
+                    )
             
             # Статистика
             max_dist = max(max(row) for row in distances) / 1000
@@ -243,17 +302,25 @@ class ValhallaClient:
                         successful_batches += 1
                         
                     except Exception as e:
-                        logger.warning(f"Batch {i}-{end_i} x {j}-{end_j} неуспешен: {e}")
+                        logger.warning(
+                            "Batch %s-%s x %s-%s неуспешен: %s",
+                            i,
+                            end_i,
+                            j,
+                            end_j,
+                            e,
+                            exc_info=True,
+                        )
                         failed_batches += 1
                         # Fallback към приблизителни стойности
                         for si, src_idx in enumerate(range(i, end_i)):
                             for ti, tgt_idx in enumerate(range(j, end_j)):
-                                if src_idx != tgt_idx:
-                                    approx = self._haversine_distance(
-                                        locations[src_idx], locations[tgt_idx]
-                                    ) * 1.3
-                                    distances[src_idx][tgt_idx] = approx
-                                    durations[src_idx][tgt_idx] = approx / 1000 / 40 * 3600
+                                approx_distance, approx_duration = self._fallback_cell_values(
+                                    locations[src_idx],
+                                    locations[tgt_idx],
+                                )
+                                distances[src_idx][tgt_idx] = approx_distance
+                                durations[src_idx][tgt_idx] = approx_duration
                     
                     pbar.update(1)
                     pbar.set_postfix({'✅': successful_batches, '❌': failed_batches})
@@ -314,13 +381,26 @@ class ValhallaClient:
         nt = len(targets)
         distances = [[0.0 for _ in range(nt)] for _ in range(ns)]
         durations = [[0.0 for _ in range(nt)] for _ in range(ns)]
+        fallback_cells = 0
         
         if "sources_to_targets" in data:
             for i, row in enumerate(data["sources_to_targets"]):
                 for j, cell in enumerate(row):
-                    if cell:
-                        distances[i][j] = cell.get("distance", 0) * 1000
-                        durations[i][j] = cell.get("time", 0)
+                    distance_m, duration_s, used_fallback = self._normalise_matrix_cell(
+                        cell,
+                        sources[i],
+                        targets[j],
+                    )
+                    distances[i][j] = distance_m
+                    durations[i][j] = duration_s
+                    if used_fallback:
+                        fallback_cells += 1
+
+        if fallback_cells:
+            logger.warning(
+                "Valhalla submatrix съдържа %s липсващи клетки; използвам приблизителни стойности.",
+                fallback_cells,
+            )
         
         return {"distances": distances, "durations": durations}
     
@@ -351,9 +431,17 @@ class ValhallaClient:
         
         if "trip" in data and "legs" in data["trip"]:
             leg = data["trip"]["legs"][0]["summary"]
+            distance_m, duration_s, _ = self._normalise_matrix_cell(
+                {
+                    "distance": leg.get("length"),
+                    "time": leg.get("time"),
+                },
+                origin,
+                destination,
+            )
             return {
-                "distance": leg.get("length", 0) * 1000,  # km -> m
-                "duration": leg.get("time", 0)  # seconds
+                "distance": distance_m,
+                "duration": duration_s,
             }
         
         return {"distance": 0, "duration": 0}

@@ -148,13 +148,13 @@ cd "C:\Programming\Bizant 2.0\dist"
 В `requirements.txt` PyVRP е pin-нат към:
 
 ```text
-pyvrp>=0.5.0,<0.6.0
+pyvrp>=0.13.3
 ```
 
-Ако се инсталира по-нова несъвместима версия, върни правилната:
+Ако се инсталира несъвместима версия, върни правилната:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install "pyvrp>=0.5.0,<0.6.0"
+.\.venv\Scripts\python.exe -m pip install "pyvrp>=0.13.3"
 ```
 
 ### Грешка от pandas/numpy/protobuf
@@ -238,7 +238,7 @@ Build-ът включва:
 - API server модул за POST заявки към `/solve` и trigger заявки към `/run`;
 - `start_api_server.bat` за видим старт на API сървъра;
 - `start_api_server_hidden.bat` за скрит старт на API сървъра без отворен CMD прозорец;
-- настройки за PyVRP, OR-Tools fallback, OSRM/Valhalla, `setData` и `makeGroup`.
+- настройки за PyVRP, OR-Tools fallback, OSRM/Valhalla, групиране на документи, `setData` и `makeGroup`.
 
 API сървърът работи и в build режим. След като приеме една POST заявка, връща резултата и остава активен за следваща заявка. `GET/POST /run` стартира програмата с текущата конфигурация без входен payload и връща веднага `202 started`.
 
@@ -289,6 +289,12 @@ Build-ът включва и последните runtime възможности
 - `/run` и `/solve` могат да приемат временни `settings`, без да променят постоянно `config.py`.
 - `return_result=true` връща пълния JSON резултат в отговора.
 - `callback_url`, `notify_url` или `webhook_url` изпращат POST известие след успешен или неуспешен background run.
+- `objective_metric` може да избира между оптимизация по километри (`distance`) и по време (`time`).
+- `center_zones` позволява допълнителни независими център зони с отделни правила по тип бус през GUI или API.
+- OR-Tools използва предварително сметнати vehicle cost матрици, а PyVRP компресира еднакви профили.
+- Route картите и Excel отчетът могат да показват ETA пристигане, очаквано тръгване, чакане и time-window статус.
+- Общата карта има GPS търсачка за временни пинове по координати.
+- Индивидуалните route HTML карти могат по избор да се качват към Effect upload endpoint чрез `output.route_maps_upload_mode = "effect_upload"`.
 
 ## PyInstaller бележки
 

@@ -9,7 +9,7 @@ if exist "%APP_DIR%CVRP_Optimizer.exe" (
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%.venv\Scripts\python.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%APP_DIR%logs\api_server_stdout.log' -RedirectStandardError '%APP_DIR%logs\api_server_stderr.log'"
 ) else if exist "%APP_DIR%.venv\Scripts\pythonw.exe" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%APP_DIR%.venv\Scripts\pythonw.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%.venv\Scripts\pythonw.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden"
 ) else (
     where python.exe >nul 2>nul
     if not errorlevel 1 (
