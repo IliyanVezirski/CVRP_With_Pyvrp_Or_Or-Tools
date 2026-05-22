@@ -1290,6 +1290,17 @@ locations.*:
         if mode_widget is not None:
             mode_widget.set("polygon")
 
+    def _set_new_center_zone_polygon(self, polygon):
+        widget = self.widgets.get("locations.new_center_zone_coords")
+        if not isinstance(widget, tk.Text):
+            return
+        widget.delete("1.0", "end")
+        widget.insert("1.0", self._format_polygon_text(polygon))
+
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        if mode_widget is not None:
+            mode_widget.set("polygon")
+
     def _open_center_zone_editor(self):
         center_raw = self.widgets.get("locations.center_location").get()
         try:
@@ -1301,6 +1312,27 @@ locations.*:
         polygon_raw = polygon_widget.get("1.0", "end-1c") if isinstance(polygon_widget, tk.Text) else ""
         polygon = self._parse_polygon_text(polygon_raw)
 
+        self._open_polygon_editor(center, polygon, self._set_center_zone_polygon)
+
+    def _open_new_center_zone_editor(self):
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        raw_coords = coords_widget.get("1.0", "end-1c") if isinstance(coords_widget, tk.Text) else ""
+        polygon = self._parse_polygon_points_text(raw_coords)
+        center_coords = self._parse_coords_text(raw_coords)
+        if polygon:
+            center = [polygon[0][0], polygon[0][1]]
+        elif center_coords:
+            center = [center_coords[0], center_coords[1]]
+        else:
+            center_raw = self.widgets.get("locations.center_location").get()
+            try:
+                center = [float(part.strip()) for part in center_raw.split(",")[:2]]
+            except Exception:
+                center = [42.69735652560932, 23.323809998750914]
+
+        self._open_polygon_editor(center, polygon, self._set_new_center_zone_polygon)
+
+    def _open_polygon_editor(self, center, polygon, on_save_callback):
         gui = self
         server_box = {}
 
@@ -1329,7 +1361,7 @@ locations.*:
                         (float(point[0]), float(point[1]))
                         for point in data.get("polygon", [])
                     ]
-                    gui.root.after(0, lambda: gui._set_center_zone_polygon(saved_polygon))
+                    gui.root.after(0, lambda: on_save_callback(saved_polygon))
                     self._send(200, "OK", "text/plain; charset=utf-8")
                     threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
                 except Exception as exc:
@@ -2901,11 +2933,14 @@ setData не трябва да се пуска:
         self._bind_text_scrolling(coords_text)
         self.widgets["locations.new_center_zone_coords"] = coords_text
         ttk.Button(box, text="Постави", command=lambda: self._paste_to_text_widget(coords_text)).grid(
-            row=3, column=3, sticky="nw", padx=(0, 8), pady=6
+            row=3, column=3, sticky="nw", padx=(0, 8), pady=(6, 0)
+        )
+        ttk.Button(box, text="Чертай", command=self._open_new_center_zone_editor).grid(
+            row=3, column=3, sticky="sw", padx=(0, 8), pady=(0, 6)
         )
         ttk.Label(
             box,
-            text="За circle: 42.6977, 23.3219. За polygon: постави точки на нов ред или разделени с ;",
+            text="За circle: 42.6977, 23.3219. За polygon натисни Чертай или постави точки на нов ред.",
             style="Hint.TLabel",
             wraplength=850,
         ).grid(row=4, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(0, 6))
