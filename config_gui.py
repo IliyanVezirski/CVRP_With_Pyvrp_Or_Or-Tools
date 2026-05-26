@@ -52,6 +52,7 @@ class ConfigGUI:
         self.vehicle_container = None
         self.vehicle_next_index = 0
         self.depot_choice_widgets = []
+        self.depot_listbox = None
         self.traffic_zone_listbox = None
         self.center_zone_listbox = None
         self.center_zone_priority_vars = {}
@@ -788,6 +789,29 @@ locations.*:
             for name, coords in (depots or {}).items()
         )
 
+    def _depot_display_label(self, name, coords):
+        return f"{name}: {float(coords[0]):.5f}, {float(coords[1]):.5f}"
+
+    def _sync_depot_widgets(self, depots):
+        depots = depots or {}
+        depot_widget = self.widgets.get("locations.depot_locations")
+        if isinstance(depot_widget, tk.Text):
+            depot_widget.delete("1.0", "end")
+            depot_widget.insert("1.0", self._format_depots_text(depots))
+
+        if self.depot_listbox is not None:
+            self.depot_listbox.delete(0, "end")
+            for name, coords in depots.items():
+                self.depot_listbox.insert("end", self._depot_display_label(name, coords))
+
+        depot_options = ["Главно депо", "Център", "Враца"]
+        for name in depots:
+            if name not in depot_options:
+                depot_options.append(name)
+        self.vehicle_depot_options = depot_options
+        for combo in getattr(self, "depot_choice_widgets", []):
+            combo.configure(values=depot_options)
+
     def _format_traffic_zones_text(self, zones):
         lines = []
         for zone in zones or []:
@@ -1042,20 +1066,68 @@ locations.*:
             return
 
         depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        was_existing = name in depots
         depots[name] = coords
-        depot_widget.delete("1.0", "end")
-        depot_widget.insert("1.0", self._format_depots_text(depots))
-        depot_options = getattr(self, "vehicle_depot_options", list(self._named_depots().keys()))
-        if name not in depot_options:
-            depot_options.append(name)
-        self.vehicle_depot_options = depot_options
-        for combo in getattr(self, "depot_choice_widgets", []):
-            combo.configure(values=depot_options)
+        self._sync_depot_widgets(depots)
         name_widget.set("")
         coords_widget.set("")
-        self.status_var.set(f"Депо '{name}' е добавено в списъка. Натисни Запази, за да влезе в config.py.")
+        action = "обновено" if was_existing else "добавено"
+        self.status_var.set(f"Депо '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _remove_selected_depot(self):
+        depot_widget = self.widgets.get("locations.depot_locations")
+        if not isinstance(depot_widget, tk.Text) or self.depot_listbox is None:
+            return
+        selection = self.depot_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Няма избрано депо", "Избери депо от списъка.")
+            return
+
+        depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        names = list(depots.keys())
+        index = selection[0]
+        if index >= len(names):
+            return
+        name = names[index]
+        depots.pop(name, None)
+        self._sync_depot_widgets(depots)
+        self.status_var.set(f"Депо '{name}' е премахнато. Натисни Запази, за да се махне от config.py.")
+
+    def _load_selected_depot(self, event=None):
+        depot_widget = self.widgets.get("locations.depot_locations")
+        name_widget = self.widgets.get("locations.new_depot_name")
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        if not isinstance(depot_widget, tk.Text) or self.depot_listbox is None:
+            return
+        if not name_widget or not coords_widget:
+            return
+        selection = self.depot_listbox.curselection()
+        if not selection:
+            return
+
+        depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        items = list(depots.items())
+        index = selection[0]
+        if index >= len(items):
+            return
+        name, coords = items[index]
+        name_widget.set(name)
+        coords_widget.set(f"{float(coords[0])}, {float(coords[1])}")
+        self.status_var.set(f"Заредено е депо '{name}' за редакция.")
+
+    def _clear_depot_form(self):
+        name_widget = self.widgets.get("locations.new_depot_name")
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        if name_widget:
+            name_widget.set("")
+        if coords_widget:
+            coords_widget.set("")
+        if self.depot_listbox is not None:
+            self.depot_listbox.selection_clear(0, "end")
+        self.status_var.set("Формата за депо е изчистена.")
 
     def _append_traffic_zone_from_fields(self):
+        name_widget = self.widgets.get("locations.new_traffic_zone_name")
         coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
         radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
         delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
@@ -1079,20 +1151,77 @@ locations.*:
             return
 
         zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
-        name = self._next_traffic_zone_name(zones)
+        name = name_widget.get().strip() if name_widget else ""
+        if not name:
+            name = self._next_traffic_zone_name(zones)
         multiplier = 1.0 + (delay_percent / 100.0)
-        zones.append(
-            config.TrafficZoneConfig(
-                name=name,
-                center_coords=coords,
-                radius_km=radius,
-                duration_multiplier=multiplier,
-                enabled=True,
-            )
+        zone = config.TrafficZoneConfig(
+            name=name,
+            center_coords=coords,
+            radius_km=radius,
+            duration_multiplier=multiplier,
+            enabled=True,
         )
+        existing_index = next((idx for idx, item in enumerate(zones) if item.name == name), None)
+        if existing_index is None:
+            zones.append(zone)
+            action = "добавена"
+        else:
+            zones[existing_index] = zone
+            action = "обновена"
         self._sync_traffic_zone_widgets(zones)
+        if name_widget:
+            name_widget.set("")
         coords_widget.set("")
-        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+        self.status_var.set(f"Трафик зона '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _load_selected_traffic_zone(self, event=None):
+        zones_widget = self.widgets.get("locations.traffic_zones")
+        if not isinstance(zones_widget, tk.Text) or self.traffic_zone_listbox is None:
+            return
+        selection = self.traffic_zone_listbox.curselection()
+        if not selection:
+            return
+        zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
+        index = selection[0]
+        if index >= len(zones):
+            return
+        zone = zones[index]
+        name_widget = self.widgets.get("locations.new_traffic_zone_name")
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
+        center = getattr(zone, "center_coords", (0, 0))
+        if name_widget:
+            name_widget.set(getattr(zone, "name", ""))
+        if coords_widget:
+            coords_widget.set(f"{float(center[0])}, {float(center[1])}")
+        if radius_widget:
+            radius_widget.set(f"{float(getattr(zone, 'radius_km', 0) or 0):g}")
+        if delay_widget:
+            delay_percent = max(0, (float(getattr(zone, "duration_multiplier", 1.0) or 1.0) - 1.0) * 100)
+            delay_widget.set(f"{delay_percent:g}")
+        self.status_var.set(f"Заредена е трафик зона '{getattr(zone, 'name', '')}' за редакция.")
+
+    def _clear_traffic_zone_form(self):
+        for key in (
+            "locations.new_traffic_zone_name",
+            "locations.new_traffic_zone_coords",
+            "locations.new_traffic_zone_radius",
+            "locations.new_traffic_zone_delay",
+        ):
+            widget = self.widgets.get(key)
+            if widget:
+                widget.set("")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
+        if radius_widget:
+            radius_widget.set("3")
+        if delay_widget:
+            delay_widget.set("30")
+        if self.traffic_zone_listbox is not None:
+            self.traffic_zone_listbox.selection_clear(0, "end")
+        self.status_var.set("Формата за трафик зона е изчистена.")
 
     def _append_center_zone_from_fields(self):
         name_widget = self.widgets.get("locations.new_center_zone_name")
@@ -1159,28 +1288,117 @@ locations.*:
             messagebox.showwarning("Няма правила", "Избери поне един тип бус за приоритет или глоба.")
             return
 
-        zones.append(
-            config.CenterZoneConfig(
-                name=name,
-                mode=mode,
-                center_coords=center_coords,
-                radius_km=radius,
-                polygon=polygon,
-                enabled=True,
-                priority_vehicle_types=priority_types,
-                restricted_vehicle_types=restricted_types,
-                discount_priority_vehicle=discount,
-                priority_vehicle_outside_penalty=outside_penalty,
-                vehicle_penalties={vehicle_type: penalty for vehicle_type in restricted_types},
-            )
+        zone = config.CenterZoneConfig(
+            name=name,
+            mode=mode,
+            center_coords=center_coords,
+            radius_km=radius,
+            polygon=polygon,
+            enabled=True,
+            priority_vehicle_types=priority_types,
+            restricted_vehicle_types=restricted_types,
+            discount_priority_vehicle=discount,
+            priority_vehicle_outside_penalty=outside_penalty,
+            vehicle_penalties={vehicle_type: penalty for vehicle_type in restricted_types},
         )
+        existing_index = next((idx for idx, item in enumerate(zones) if item.name == name), None)
+        if existing_index is None:
+            zones.append(zone)
+            action = "добавена"
+        else:
+            zones[existing_index] = zone
+            action = "обновена"
         self._sync_center_zone_widgets(zones)
         name_widget.set("")
         if isinstance(coords_widget, tk.Text):
             coords_widget.delete("1.0", "end")
         else:
             coords_widget.set("")
-        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+        self.status_var.set(f"Център зона '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _load_selected_center_zone(self, event=None):
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not isinstance(zones_widget, tk.Text) or self.center_zone_listbox is None:
+            return
+        selection = self.center_zone_listbox.curselection()
+        if not selection:
+            return
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        index = selection[0]
+        if index >= len(zones):
+            return
+        zone = zones[index]
+
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        penalty_widget = self.widgets.get("locations.new_center_zone_penalty")
+        mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+
+        if name_widget:
+            name_widget.set(getattr(zone, "name", ""))
+        if mode_widget:
+            mode_widget.set(mode)
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+            if mode == "polygon":
+                coords_widget.insert("1.0", self._format_polygon_text(getattr(zone, "polygon", []) or []))
+            else:
+                center = getattr(zone, "center_coords", (0, 0))
+                coords_widget.insert("1.0", f"{float(center[0])}, {float(center[1])}")
+        if radius_widget:
+            radius_widget.set(f"{float(getattr(zone, 'radius_km', 0) or 0):g}")
+        if discount_widget:
+            discount_widget.set(f"{float(getattr(zone, 'discount_priority_vehicle', 0.9) or 0.9):g}")
+        if outside_widget:
+            outside_widget.set(f"{float(getattr(zone, 'priority_vehicle_outside_penalty', 0.0) or 0.0):g}")
+
+        penalties = getattr(zone, "vehicle_penalties", {}) or {}
+        if penalty_widget:
+            penalty = next(iter(penalties.values()), 0.0)
+            penalty_widget.set(f"{float(penalty):g}")
+
+        priority_types = set(getattr(zone, "priority_vehicle_types", []) or [])
+        restricted_types = set(getattr(zone, "restricted_vehicle_types", []) or [])
+        for vehicle_type, var in self.center_zone_priority_vars.items():
+            var.set(vehicle_type in priority_types)
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(vehicle_type in restricted_types)
+
+        self.status_var.set(f"Заредена е център зона '{getattr(zone, 'name', '')}' за редакция.")
+
+    def _clear_center_zone_form(self):
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        penalty_widget = self.widgets.get("locations.new_center_zone_penalty")
+        if name_widget:
+            name_widget.set("")
+        if mode_widget:
+            mode_widget.set("circle")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+        if radius_widget:
+            radius_widget.set("1.5")
+        if discount_widget:
+            discount_widget.set("0.9")
+        if outside_widget:
+            outside_widget.set("0")
+        if penalty_widget:
+            penalty_widget.set("40000")
+        for vehicle_type, var in self.center_zone_priority_vars.items():
+            var.set(vehicle_type == "center_bus")
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(vehicle_type != "center_bus")
+        if self.center_zone_listbox is not None:
+            self.center_zone_listbox.selection_clear(0, "end")
+        self.status_var.set("Формата за център зона е изчистена.")
 
     def _remove_selected_traffic_zone(self):
         zones_widget = self.widgets.get("locations.traffic_zones")
@@ -1301,12 +1519,44 @@ locations.*:
         if mode_widget is not None:
             mode_widget.set("polygon")
 
+    def _set_new_depot_coords(self, coords):
+        widget = self.widgets.get("locations.new_depot_coords")
+        if widget is not None:
+            widget.set(f"{float(coords[0])}, {float(coords[1])}")
+
+    def _set_new_traffic_zone_circle(self, center, radius):
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        if coords_widget is not None:
+            coords_widget.set(f"{float(center[0])}, {float(center[1])}")
+        if radius_widget is not None:
+            radius_widget.set(f"{float(radius):g}")
+
+    def _set_new_center_zone_circle(self, center, radius):
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+            coords_widget.insert("1.0", f"{float(center[0])}, {float(center[1])}")
+        if radius_widget is not None:
+            radius_widget.set(f"{float(radius):g}")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        if mode_widget is not None:
+            mode_widget.set("circle")
+
+    def _default_map_center(self):
+        center_widget = self.widgets.get("locations.center_location")
+        if center_widget is not None:
+            try:
+                parts = [float(part.strip()) for part in center_widget.get().split(",")[:2]]
+                if len(parts) == 2:
+                    return [parts[0], parts[1]]
+            except Exception:
+                pass
+        return [42.69735652560932, 23.323809998750914]
+
     def _open_center_zone_editor(self):
-        center_raw = self.widgets.get("locations.center_location").get()
-        try:
-            center = [float(part.strip()) for part in center_raw.split(",")[:2]]
-        except Exception:
-            center = [42.69735652560932, 23.323809998750914]
+        center = self._default_map_center()
 
         polygon_widget = self.widgets.get("locations.center_zone_polygon")
         polygon_raw = polygon_widget.get("1.0", "end-1c") if isinstance(polygon_widget, tk.Text) else ""
@@ -1314,23 +1564,285 @@ locations.*:
 
         self._open_polygon_editor(center, polygon, self._set_center_zone_polygon)
 
+    def _open_new_depot_editor(self):
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        center = [coords[0], coords[1]] if coords else self._default_map_center()
+        self._open_point_editor(center, self._set_new_depot_coords, "Избор на депо")
+
+    def _open_new_traffic_zone_editor(self):
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        center = [coords[0], coords[1]] if coords else self._default_map_center()
+        try:
+            radius = float(radius_widget.get() or 3) if radius_widget is not None else 3.0
+        except ValueError:
+            radius = 3.0
+        self._open_circle_editor(center, radius, self._set_new_traffic_zone_circle, "Трафик зона")
+
     def _open_new_center_zone_editor(self):
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        mode = str(mode_widget.get() if mode_widget is not None else "circle").strip().lower()
         coords_widget = self.widgets.get("locations.new_center_zone_coords")
         raw_coords = coords_widget.get("1.0", "end-1c") if isinstance(coords_widget, tk.Text) else ""
-        polygon = self._parse_polygon_points_text(raw_coords)
         center_coords = self._parse_coords_text(raw_coords)
+        center = [center_coords[0], center_coords[1]] if center_coords else self._default_map_center()
+        if mode == "circle":
+            radius_widget = self.widgets.get("locations.new_center_zone_radius")
+            try:
+                radius = float(radius_widget.get() or 1.5) if radius_widget is not None else 1.5
+            except ValueError:
+                radius = 1.5
+            self._open_circle_editor(center, radius, self._set_new_center_zone_circle, "Център зона")
+            return
+
+        polygon = self._parse_polygon_points_text(raw_coords)
         if polygon:
             center = [polygon[0][0], polygon[0][1]]
         elif center_coords:
             center = [center_coords[0], center_coords[1]]
         else:
-            center_raw = self.widgets.get("locations.center_location").get()
-            try:
-                center = [float(part.strip()) for part in center_raw.split(",")[:2]]
-            except Exception:
-                center = [42.69735652560932, 23.323809998750914]
+            center = self._default_map_center()
 
         self._open_polygon_editor(center, polygon, self._set_new_center_zone_polygon)
+
+    def _open_point_editor(self, center, on_save_callback, title):
+        gui = self
+        server_box = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, status, body, content_type="text/html; charset=utf-8"):
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._send(200, gui._point_editor_html(center, title))
+
+            def do_POST(self):
+                if self.path != "/save":
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = self.rfile.read(length).decode("utf-8")
+                try:
+                    data = json.loads(payload)
+                    point = data.get("point", [])
+                    saved_point = (float(point[0]), float(point[1]))
+                    gui.root.after(0, lambda: on_save_callback(saved_point))
+                    self._send(200, "OK", "text/plain; charset=utf-8")
+                    threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
+                except Exception as exc:
+                    self._send(400, str(exc), "text/plain; charset=utf-8")
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_box["server"] = server
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+
+    def _point_editor_html(self, center, title):
+        center_json = json.dumps(center)
+        title_json = json.dumps(title, ensure_ascii=False)
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; }}
+    body {{ font-family: Arial, sans-serif; }}
+    #panel {{
+      position: absolute; top: 10px; left: 50px; z-index: 1000;
+      background: white; border: 1px solid #777; border-radius: 4px;
+      padding: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+    }}
+    button {{ padding: 6px 10px; cursor: pointer; }}
+    #coords {{ margin-left: 8px; color: #255; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <button onclick="savePoint()">Запази точката</button>
+    <span id="coords"></span>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const center = {center_json};
+    const title = {title_json};
+    const map = L.map("map").setView(center, 13);
+    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }}).addTo(map);
+
+    const marker = L.marker(center, {{ draggable: true }}).addTo(map).bindPopup(title).openPopup();
+
+    function updateLabel() {{
+      const p = marker.getLatLng();
+      document.getElementById("coords").textContent = `${{p.lat.toFixed(6)}}, ${{p.lng.toFixed(6)}}`;
+    }}
+
+    marker.on("drag", updateLabel);
+    map.on("click", function(event) {{
+      marker.setLatLng(event.latlng);
+      updateLabel();
+    }});
+    updateLabel();
+
+    async function savePoint() {{
+      const p = marker.getLatLng();
+      const point = [Number(p.lat.toFixed(8)), Number(p.lng.toFixed(8))];
+      const response = await fetch("/save", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ point }})
+      }});
+      document.getElementById("coords").textContent = response.ok
+        ? "Запазено в GUI. Можеш да затвориш този прозорец."
+        : "Грешка при запис.";
+    }}
+  </script>
+</body>
+</html>"""
+
+    def _open_circle_editor(self, center, radius_km, on_save_callback, title):
+        gui = self
+        server_box = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, status, body, content_type="text/html; charset=utf-8"):
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._send(200, gui._circle_editor_html(center, radius_km, title))
+
+            def do_POST(self):
+                if self.path != "/save":
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = self.rfile.read(length).decode("utf-8")
+                try:
+                    data = json.loads(payload)
+                    center_point = data.get("center", [])
+                    saved_center = (float(center_point[0]), float(center_point[1]))
+                    saved_radius = float(data.get("radius_km", 0))
+                    gui.root.after(0, lambda: on_save_callback(saved_center, saved_radius))
+                    self._send(200, "OK", "text/plain; charset=utf-8")
+                    threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
+                except Exception as exc:
+                    self._send(400, str(exc), "text/plain; charset=utf-8")
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_box["server"] = server
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+
+    def _circle_editor_html(self, center, radius_km, title):
+        center_json = json.dumps(center)
+        radius = max(0.1, float(radius_km or 1.0))
+        title_json = json.dumps(title, ensure_ascii=False)
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; }}
+    body {{ font-family: Arial, sans-serif; }}
+    #panel {{
+      position: absolute; top: 10px; left: 50px; z-index: 1000;
+      background: white; border: 1px solid #777; border-radius: 4px;
+      padding: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+      display: flex; align-items: center; gap: 8px;
+    }}
+    input {{ width: 80px; padding: 5px; }}
+    button {{ padding: 6px 10px; cursor: pointer; }}
+    #status {{ color: #255; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <button onclick="saveCircle()">Запази зоната</button>
+    <label>Радиус км <input id="radius" type="number" min="0.1" step="0.1" value="{radius:g}"></label>
+    <span id="status"></span>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const center = {center_json};
+    const title = {title_json};
+    const map = L.map("map").setView(center, 13);
+    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }}).addTo(map);
+
+    const marker = L.marker(center, {{ draggable: true }}).addTo(map).bindPopup(title).openPopup();
+    const circle = L.circle(center, {{
+      radius: Number(document.getElementById("radius").value) * 1000,
+      color: "#2563eb",
+      fillColor: "#2563eb",
+      fillOpacity: 0.14
+    }}).addTo(map);
+
+    function updateCircle() {{
+      const p = marker.getLatLng();
+      const radiusKm = Number(document.getElementById("radius").value || 0);
+      circle.setLatLng(p);
+      circle.setRadius(Math.max(0.1, radiusKm) * 1000);
+      document.getElementById("status").textContent = `${{p.lat.toFixed(6)}}, ${{p.lng.toFixed(6)}}`;
+    }}
+
+    marker.on("drag", updateCircle);
+    document.getElementById("radius").addEventListener("input", updateCircle);
+    map.on("click", function(event) {{
+      marker.setLatLng(event.latlng);
+      updateCircle();
+    }});
+    updateCircle();
+    try {{ map.fitBounds(circle.getBounds(), {{ padding: [20, 20] }}); }} catch (err) {{}}
+
+    async function saveCircle() {{
+      const p = marker.getLatLng();
+      const radiusKm = Math.max(0.1, Number(document.getElementById("radius").value || 0));
+      const centerPoint = [Number(p.lat.toFixed(8)), Number(p.lng.toFixed(8))];
+      const response = await fetch("/save", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ center: centerPoint, radius_km: radiusKm }})
+      }});
+      document.getElementById("status").textContent = response.ok
+        ? "Запазено в GUI. Можеш да затвориш този прозорец."
+        : "Грешка при запис.";
+    }}
+  </script>
+</body>
+</html>"""
 
     def _open_polygon_editor(self, center, polygon, on_save_callback):
         gui = self
@@ -2897,67 +3409,58 @@ setData не трябва да се пуска:
     def _add_center_zones_editor(self, parent, row, loc):
         box = ttk.LabelFrame(parent, text="Допълнителни център зони", padding=(14, 12))
         box.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(6, 14))
-        box.columnconfigure(0, weight=0)
+        box.columnconfigure(0, weight=1)
         box.columnconfigure(1, weight=1)
-        box.columnconfigure(2, weight=0)
-        box.columnconfigure(3, weight=0)
 
-        ttk.Label(
-            box,
-            text=(
-                "Добави отделна център зона. Избери кои бусове са приоритетни за нея "
-                "и кои бусове да получават глоба, ако влязат вътре."
-            ),
-            style="Hint.TLabel",
-            wraplength=900,
-        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+        form = ttk.LabelFrame(box, text="Нова или редакция", padding=(12, 10))
+        form.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=2)
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(2, weight=0)
 
-        ttk.Label(box, text="Име:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        list_frame = ttk.LabelFrame(box, text="Създадени зони", padding=(12, 10))
+        list_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=2)
+        list_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
         name_var = tk.StringVar(value="")
-        name_entry = ttk.Entry(box, textvariable=name_var, width=34)
-        name_entry.grid(row=1, column=1, sticky="we", padx=(0, 8), pady=6)
+        name_entry = ttk.Entry(form, textvariable=name_var, width=28)
+        name_entry.grid(row=0, column=1, columnspan=2, sticky="we", padx=(0, 0), pady=5)
         self._bind_text_editing(name_entry)
         self.widgets["locations.new_center_zone_name"] = name_var
-        ttk.Label(box, text="Празно = автоматично име.", style="Hint.TLabel").grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Label(box, text="Тип:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Тип", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         mode_var = tk.StringVar(value="circle")
-        mode_combo = ttk.Combobox(box, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
-        mode_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        mode_combo = ttk.Combobox(form, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
+        mode_combo.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=5)
         self.widgets["locations.new_center_zone_mode"] = mode_var
+        ttk.Label(form, text="circle = радиус, polygon = начертана зона", style="Hint.TLabel").grid(
+            row=1, column=2, sticky="w", padx=(0, 0), pady=5
+        )
 
-        ttk.Label(box, text="Координати:", style="Surface.TLabel").grid(row=3, column=0, sticky="nw", padx=(8, 8), pady=6)
-        coords_text = tk.Text(box, height=3, width=54, font=("Segoe UI", 9), wrap="none")
-        coords_text.grid(row=3, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        ttk.Label(form, text="Координати", style="Surface.TLabel").grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=5)
+        coords_text = tk.Text(form, height=4, width=46, font=("Segoe UI", 9), wrap="none", relief="solid", borderwidth=1)
+        coords_text.grid(row=2, column=1, columnspan=2, sticky="we", padx=(0, 0), pady=5)
         self._bind_text_editing(coords_text)
         self._bind_text_scrolling(coords_text)
         self.widgets["locations.new_center_zone_coords"] = coords_text
-        ttk.Button(box, text="Постави", command=lambda: self._paste_to_text_widget(coords_text)).grid(
-            row=3, column=3, sticky="nw", padx=(0, 8), pady=(6, 0)
-        )
-        ttk.Button(box, text="Чертай", command=self._open_new_center_zone_editor).grid(
-            row=3, column=3, sticky="sw", padx=(0, 8), pady=(0, 6)
-        )
-        ttk.Label(
-            box,
-            text="За circle: 42.6977, 23.3219. За polygon натисни Чертай или постави точки на нов ред.",
-            style="Hint.TLabel",
-            wraplength=850,
-        ).grid(row=4, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(0, 6))
+        coord_actions = ttk.Frame(form, style="Surface.TFrame")
+        coord_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Button(coord_actions, text="Постави координати", command=lambda: self._paste_to_text_widget(coords_text)).pack(side="left", padx=(0, 6))
+        ttk.Button(coord_actions, text="Избери/начертай на карта", command=self._open_new_center_zone_editor).pack(side="left")
 
-        ttk.Label(box, text="Радиус:", style="Surface.TLabel").grid(row=5, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Радиус км", style="Surface.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=5)
         radius_var = tk.StringVar(value="1.5")
-        radius_combo = ttk.Combobox(box, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
-        radius_combo.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=6)
+        radius_combo = ttk.Combobox(form, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
+        radius_combo.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(radius_combo)
         self.widgets["locations.new_center_zone_radius"] = radius_var
-        ttk.Label(box, text="км; при polygon не се използва", style="Hint.TLabel").grid(row=5, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(form, text="ползва се само при circle", style="Hint.TLabel").grid(row=4, column=2, sticky="w", pady=5)
 
-        rules = ttk.Frame(box, style="Surface.TFrame")
-        rules.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(8, 6))
+        rules = ttk.Frame(form, style="Surface.TFrame")
+        rules.grid(row=5, column=0, columnspan=3, sticky="we", pady=(8, 6))
         ttk.Label(rules, text="Тип бус", style="Surface.TLabel", width=18).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 4))
-        ttk.Label(rules, text="Приоритет в зоната", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
-        ttk.Label(rules, text="Глоба в зоната", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Label(rules, text="Приоритет", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
+        ttk.Label(rules, text="Глоба", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
         vehicle_labels = [
             ("center_bus", "Център бус"),
             ("internal_bus", "Вътрешен бус"),
@@ -2976,42 +3479,49 @@ setData не трябва да се пуска:
             self.center_zone_priority_vars[vehicle_type] = priority_var
             self.center_zone_restricted_vars[vehicle_type] = restricted_var
 
-        ttk.Label(box, text="Отстъпка:", style="Surface.TLabel").grid(row=7, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Отстъпка", style="Surface.TLabel").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=5)
         discount_var = tk.StringVar(value="0.9")
-        discount_combo = ttk.Combobox(box, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
-        discount_combo.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=6)
+        discount_combo = ttk.Combobox(form, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
+        discount_combo.grid(row=6, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(discount_combo)
         self.widgets["locations.new_center_zone_discount"] = discount_var
-        ttk.Label(box, text="0.9 = 10% по-ниска цена за приоритетен бус.", style="Hint.TLabel").grid(row=7, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(form, text="0.9 = 10% по-ниска цена", style="Hint.TLabel").grid(row=6, column=2, sticky="w", pady=5)
 
-        ttk.Label(box, text="Глоба навън:", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Глоба навън", style="Surface.TLabel").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=5)
         outside_var = tk.StringVar(value="0")
-        outside_entry = ttk.Entry(box, textvariable=outside_var, width=12)
-        outside_entry.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=6)
+        outside_entry = ttk.Entry(form, textvariable=outside_var, width=12)
+        outside_entry.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(outside_entry)
         self.widgets["locations.new_center_zone_outside_penalty"] = outside_var
 
-        ttk.Label(box, text="Глоба вътре:", style="Surface.TLabel").grid(row=9, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Глоба вътре", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=5)
         default_penalty = float(getattr(loc, "internal_bus_center_penalty", 40000.0) or 40000.0)
         penalty_var = tk.StringVar(value=f"{default_penalty:g}")
-        penalty_entry = ttk.Entry(box, textvariable=penalty_var, width=12)
-        penalty_entry.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=6)
+        penalty_entry = ttk.Entry(form, textvariable=penalty_var, width=12)
+        penalty_entry.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(penalty_entry)
         self.widgets["locations.new_center_zone_penalty"] = penalty_var
-        ttk.Label(box, text="Прилага се на всички маркирани в колоната 'Глоба в зоната'.", style="Hint.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Button(box, text="Добави център зона", command=self._append_center_zone_from_fields).grid(
-            row=10, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
-        ttk.Button(box, text="Премахни избраната", command=self._remove_selected_center_zone).grid(
-            row=10, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
+        buttons = ttk.Frame(form, style="Surface.TFrame")
+        buttons.grid(row=9, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(buttons, text="Добави / обнови", command=self._append_center_zone_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Нова празна форма", command=self._clear_center_zone_form).pack(side="left")
 
-        ttk.Label(box, text="Добавени център зони:", style="Surface.TLabel").grid(
-            row=11, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4)
+        ttk.Label(
+            list_frame,
+            text="Избери зона, за да я заредиш във формата. После можеш да я обновиш или премахнеш.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        self.center_zone_listbox = tk.Listbox(list_frame, height=12, font=("Segoe UI", 9), exportselection=False)
+        self.center_zone_listbox.grid(row=1, column=0, sticky="nsew")
+        center_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.center_zone_listbox.yview)
+        center_scroll.grid(row=1, column=1, sticky="ns")
+        self.center_zone_listbox.configure(yscrollcommand=center_scroll.set)
+        self.center_zone_listbox.bind("<<ListboxSelect>>", self._load_selected_center_zone)
+        ttk.Button(list_frame, text="Премахни избраната", command=self._remove_selected_center_zone).grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
         )
-        self.center_zone_listbox = tk.Listbox(box, height=5, font=("Segoe UI", 9), exportselection=False)
-        self.center_zone_listbox.grid(row=12, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
 
         hidden_zones = tk.Text(box, width=1, height=1)
         self.widgets["locations.center_zones"] = hidden_zones
@@ -3043,26 +3553,58 @@ setData не трябва да се пуска:
             "Депа",
             "Добави депо с име и координати. След Запази депото може да се избира при бусове.",
         ); r += 1
-        self._add_field(depot_add, gr, "locations.new_depot_name", "Име:", ""); gr += 1
-        self._add_field(
-            depot_add,
-            gr,
-            "locations.new_depot_coords",
-            "Координати:",
-            "",
-            tooltip="Формат: lat, lon. Пример: 43.22104, 23.53440.",
-        ); gr += 1
-        ttk.Button(depot_add, text="Добави / обнови депо", command=self._append_depot_from_fields).grid(
-            row=gr, column=1, sticky="w", padx=6, pady=(4, 8)
+        depot_add.columnconfigure(0, weight=1)
+        depot_add.columnconfigure(1, weight=1)
+        depot_form = ttk.LabelFrame(depot_add, text="Ново или редакция", padding=(12, 10))
+        depot_form.grid(row=gr, column=0, sticky="nsew", padx=(0, 8), pady=2)
+        depot_form.columnconfigure(1, weight=1)
+        depot_list_frame = ttk.LabelFrame(depot_add, text="Допълнителни депа", padding=(12, 10))
+        depot_list_frame.grid(row=gr, column=1, columnspan=2, sticky="nsew", padx=(8, 0), pady=2)
+        depot_list_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(depot_form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        depot_name_var = tk.StringVar(value="")
+        depot_name_entry = ttk.Entry(depot_form, textvariable=depot_name_var, width=28)
+        depot_name_entry.grid(row=0, column=1, sticky="we", pady=5)
+        self._bind_text_editing(depot_name_entry)
+        self.widgets["locations.new_depot_name"] = depot_name_var
+
+        ttk.Label(depot_form, text="Координати", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        depot_coords_var = tk.StringVar(value="")
+        depot_coords_entry = ttk.Entry(depot_form, textvariable=depot_coords_var, width=28)
+        depot_coords_entry.grid(row=1, column=1, sticky="we", pady=5)
+        self._bind_text_editing(depot_coords_entry)
+        self.widgets["locations.new_depot_coords"] = depot_coords_var
+
+        depot_buttons = ttk.Frame(depot_form, style="Surface.TFrame")
+        depot_buttons.grid(row=2, column=1, sticky="w", pady=(2, 8))
+        ttk.Button(depot_buttons, text="Постави", command=lambda: self._paste_to_var(depot_coords_var)).pack(side="left", padx=(0, 6))
+        ttk.Button(depot_buttons, text="Избери на карта", command=self._open_new_depot_editor).pack(side="left")
+
+        depot_actions = ttk.Frame(depot_form, style="Surface.TFrame")
+        depot_actions.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(depot_actions, text="Добави / обнови", command=self._append_depot_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(depot_actions, text="Нова празна форма", command=self._clear_depot_form).pack(side="left")
+
+        ttk.Label(
+            depot_list_frame,
+            text="Избери депо, за да го заредиш във формата. Главно депо, Център и Враца се настройват горе.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        self.depot_listbox = tk.Listbox(depot_list_frame, height=6, font=("Segoe UI", 9), exportselection=False)
+        self.depot_listbox.grid(row=1, column=0, sticky="nsew")
+        depot_scroll = ttk.Scrollbar(depot_list_frame, orient="vertical", command=self.depot_listbox.yview)
+        depot_scroll.grid(row=1, column=1, sticky="ns")
+        self.depot_listbox.configure(yscrollcommand=depot_scroll.set)
+        self.depot_listbox.bind("<<ListboxSelect>>", self._load_selected_depot)
+        ttk.Button(depot_list_frame, text="Премахни избраното", command=self._remove_selected_depot).grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
         )
-        self._add_list_field(
-            depot_add,
-            gr + 1,
-            "locations.depot_locations",
-            "Списък депа:",
-            self._format_depots_text(getattr(loc, "depot_locations", {}) or {}).splitlines(),
-            tooltip="Формат: Име: lat, lon. След запис/презареждане депото ще е налично за избор при бусове.",
-        )
+
+        hidden_depots = tk.Text(depot_add, width=1, height=1)
+        self.widgets["locations.depot_locations"] = hidden_depots
+        self._sync_depot_widgets(getattr(loc, "depot_locations", {}) or {})
 
         center_zone, gr = self._add_grid_group(
             f,
@@ -3113,53 +3655,69 @@ setData не трябва да се пуска:
         traffic_add.columnconfigure(2, weight=0)
         traffic_add.columnconfigure(3, weight=0)
 
-        ttk.Label(
-            traffic_add,
-            text="Добави зона с център, радиус и забавяне. Пример координати: 42.6977, 23.3219",
-            style="Hint.TLabel",
-            wraplength=820,
-        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+        traffic_add.columnconfigure(0, weight=1)
+        traffic_add.columnconfigure(1, weight=1)
+        traffic_form = ttk.LabelFrame(traffic_add, text="Нова или редакция", padding=(12, 10))
+        traffic_form.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=2)
+        traffic_form.columnconfigure(1, weight=1)
+        traffic_list_frame = ttk.LabelFrame(traffic_add, text="Създадени трафик зони", padding=(12, 10))
+        traffic_list_frame.grid(row=0, column=1, columnspan=3, sticky="nsew", padx=(8, 0), pady=2)
+        traffic_list_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(traffic_add, text="Координати:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(traffic_form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        traffic_name_var = tk.StringVar(value="")
+        traffic_name_entry = ttk.Entry(traffic_form, textvariable=traffic_name_var, width=28)
+        traffic_name_entry.grid(row=0, column=1, sticky="we", pady=5)
+        self._bind_text_editing(traffic_name_entry)
+        self.widgets["locations.new_traffic_zone_name"] = traffic_name_var
+
+        ttk.Label(traffic_form, text="Център", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         coords_var = tk.StringVar(value="")
-        coords_entry = ttk.Entry(traffic_add, textvariable=coords_var, width=38)
-        coords_entry.grid(row=1, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        coords_entry = ttk.Entry(traffic_form, textvariable=coords_var, width=28)
+        coords_entry.grid(row=1, column=1, sticky="we", pady=5)
         self._bind_text_editing(coords_entry)
         self.widgets["locations.new_traffic_zone_coords"] = coords_var
-        ttk.Button(traffic_add, text="Постави", command=lambda: self._paste_to_var(coords_var)).grid(
-            row=1, column=3, sticky="w", padx=(0, 8), pady=6
-        )
 
-        ttk.Label(traffic_add, text="Радиус:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        traffic_coord_buttons = ttk.Frame(traffic_form, style="Surface.TFrame")
+        traffic_coord_buttons.grid(row=2, column=1, sticky="w", pady=(2, 8))
+        ttk.Button(traffic_coord_buttons, text="Постави", command=lambda: self._paste_to_var(coords_var)).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_coord_buttons, text="Избери кръг на карта", command=self._open_new_traffic_zone_editor).pack(side="left")
+
+        ttk.Label(traffic_form, text="Радиус км", style="Surface.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=5)
         radius_var = tk.StringVar(value="3")
-        radius_combo = ttk.Combobox(traffic_add, textvariable=radius_var, values=["1", "2", "3", "5", "8", "10"], width=10, state="normal")
-        radius_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        radius_combo = ttk.Combobox(traffic_form, textvariable=radius_var, values=["1", "2", "3", "5", "8", "10"], width=10, state="normal")
+        radius_combo.grid(row=3, column=1, sticky="w", pady=5)
         self._bind_text_editing(radius_combo)
         self.widgets["locations.new_traffic_zone_radius"] = radius_var
-        ttk.Label(traffic_add, text="км", style="Hint.TLabel").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Label(traffic_add, text="Забавяне:", style="Surface.TLabel").grid(row=3, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(traffic_form, text="Забавяне %", style="Surface.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=5)
         delay_var = tk.StringVar(value="30")
-        delay_combo = ttk.Combobox(traffic_add, textvariable=delay_var, values=["10", "20", "30", "40", "50"], width=10, state="normal")
-        delay_combo.grid(row=3, column=1, sticky="w", padx=(0, 8), pady=6)
+        delay_combo = ttk.Combobox(traffic_form, textvariable=delay_var, values=["10", "20", "30", "40", "50"], width=10, state="normal")
+        delay_combo.grid(row=4, column=1, sticky="w", pady=5)
         self._bind_text_editing(delay_combo)
         self.widgets["locations.new_traffic_zone_delay"] = delay_var
-        ttk.Label(traffic_add, text="%", style="Hint.TLabel").grid(row=3, column=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Button(traffic_add, text="Добави зона", command=self._append_traffic_zone_from_fields).grid(
-            row=4, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
-        ttk.Button(traffic_add, text="Премахни избраната", command=self._remove_selected_traffic_zone).grid(
-            row=4, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
+        traffic_buttons = ttk.Frame(traffic_form, style="Surface.TFrame")
+        traffic_buttons.grid(row=5, column=1, sticky="w", pady=(10, 0))
+        ttk.Button(traffic_buttons, text="Добави / обнови", command=self._append_traffic_zone_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_buttons, text="Нова празна форма", command=self._clear_traffic_zone_form).pack(side="left")
+
         ttk.Label(
-            traffic_add,
-            text="Добавени зони:",
-            style="Surface.TLabel",
-        ).grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4))
+            traffic_list_frame,
+            text="Избери зона, за да я заредиш във формата. Забавянето се записва като множител на времето.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
-        self.traffic_zone_listbox = tk.Listbox(traffic_add, height=4, font=("Segoe UI", 9), exportselection=False)
-        self.traffic_zone_listbox.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
+        self.traffic_zone_listbox = tk.Listbox(traffic_list_frame, height=8, font=("Segoe UI", 9), exportselection=False)
+        self.traffic_zone_listbox.grid(row=1, column=0, sticky="nsew")
+        traffic_scroll = ttk.Scrollbar(traffic_list_frame, orient="vertical", command=self.traffic_zone_listbox.yview)
+        traffic_scroll.grid(row=1, column=1, sticky="ns")
+        self.traffic_zone_listbox.configure(yscrollcommand=traffic_scroll.set)
+        self.traffic_zone_listbox.bind("<<ListboxSelect>>", self._load_selected_traffic_zone)
+        ttk.Button(traffic_list_frame, text="Премахни избраната", command=self._remove_selected_traffic_zone).grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
 
         hidden_zones = tk.Text(traffic_add, width=1, height=1)
         self.widgets["locations.traffic_zones"] = hidden_zones

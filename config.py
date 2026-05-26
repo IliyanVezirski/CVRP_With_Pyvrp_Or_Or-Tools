@@ -186,7 +186,7 @@ class LocationConfig:
         (42.70035998, 23.2969594)
     ])  # Точки на полигона: [(lat, lon), ...]
     center_zone_radius_km: float = 1.9  # Радиус на център зоната в километри
-    center_zones: List[CenterZoneConfig] = field(default_factory=lambda: [])  # Допълнителни център зони.
+    center_zones: List[CenterZoneConfig] = field(default_factory=lambda: [])
     enable_center_zone_priority: bool = True  # Дали да се прилага приоритет за център зоната
     
     # Параметри за глобата на останалите бусове за влизане в центъра
@@ -700,22 +700,22 @@ class InputConfig:
     json_done_flag: str = "1974"  # Стойност за DoneFlag параметъра.
     json_extra_query: str = ""  # Допълнителни GET параметри във формат key=value&key2=value2.
     json_date_field: str = "Date"  # Име на полето/параметъра за датата при HTTP JSON заявка.
-    json_gps_field: str = "GPS"          # Име на JSON полето с GPS координати.
-    json_client_id_field: str = "IdCust"  # Име на JSON полето с клиентски номер.
-    json_client_name_field: str = "CustName"  # Име на JSON полето с име на клиента.
-    json_volume_field: str = "Volume"     # Име на JSON полето с брой стекове.
-    json_document_field: str = "IdDoc"  # Име на JSON полето с номер на документа.
+    json_gps_field: str = "GpsData"          # Име на JSON полето с GPS координати.
+    json_client_id_field: str = "Клиент"  # Име на JSON полето с клиентски номер.
+    json_client_name_field: str = "Име Клиент"  # Име на JSON полето с име на клиента.
+    json_volume_field: str = "Ст-ст Блок"     # Име на JSON полето с брой стекове.
+    json_document_field: str = "Фактура"  # Име на JSON полето с номер на документа.
     json_plas_doc_field: str = "IdPlasDoc"  # Име на JSON полето за IdPlasDoc, което се връща към setData.
     json_id_skld_field: str = "IdSkld"  # Име на JSON полето с оригиналния склад на заявката.
     json_time_window_field: str = "WorkTime"  # Име на JSON полето с работно време във формат "08:00 - 16:00".
     json_delivery_comment_field: str = "DeliveryComment"  # Име на JSON полето с коментар/инструкция за доставката.
     json_override_date: str = "21/05/2026"  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
-    gps_column: str = "GPS"         # Име на колоната с GPS координатите на клиентите.
-    client_id_column: str = "IdCust"      # Име на колоната с ID на клиента.
-    client_name_column: str = "Клиент" # Име на колоната с името на клиента.
-    volume_column: str = "Брой стекове"           # Име на колоната с обема/теглото на заявката.
-    document_column: str = "Документ"  # Име на колоната с номер на документа/поръчката.
+    gps_column: str = "GpsData"         # Име на колоната с GPS координатите на клиентите.
+    client_id_column: str = "Клиент"      # Име на колоната с ID на клиента.
+    client_name_column: str = "Име Клиент" # Име на колоната с името на клиента.
+    volume_column: str = "Ст-ст Блок"           # Име на колоната с обема/теглото на заявката.
+    document_column: str = "Фактура"  # Име на колоната с номер на документа/поръчката.
     time_window_column: str = "Работно време"  # Excel колона с работно време във формат "08:00 - 16:00".
     delivery_comment_column: str = "Коментар доставка"  # Excel колона с коментар/инструкция за доставката.
     enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
@@ -852,11 +852,15 @@ class CVRPConfig:
     parallel_first_solution_strategies: List[str] = field(default_factory=lambda: [
         "PARALLEL_CHEAPEST_INSERTION",
         "SAVINGS",
-        "PARALLEL_CHEAPEST_INSERTION",
+        "LOCAL_CHEAPEST_INSERTION",
+        "GLOBAL_CHEAPEST_ARC",
+        "PARALLEL_SAVINGS",
+        "LOCAL_CHEAPEST_COST_INSERTION",
+        "BEST_INSERTION",
         "PATH_CHEAPEST_ARC",
-        "SAVINGS",
         "PARALLEL_CHEAPEST_INSERTION",
-        "PARALLEL_CHEAPEST_INSERTION"
+        "SAVINGS",
+        "PATH_MOST_CONSTRAINED_ARC"
     ])
     # Описание: Списък с "First Solution" стратегии, които да се състезават в паралелен режим.
 
@@ -865,9 +869,13 @@ class CVRPConfig:
         "GUIDED_LOCAL_SEARCH",
         "GUIDED_LOCAL_SEARCH",
         "GUIDED_LOCAL_SEARCH",
-        "SIMULATED_ANNEALING",
         "GUIDED_LOCAL_SEARCH",
-        "TABU_SEARCH"
+        "GUIDED_LOCAL_SEARCH",
+        "GUIDED_LOCAL_SEARCH",
+        "TABU_SEARCH",
+        "TABU_SEARCH",
+        "SIMULATED_ANNEALING",
+        "GUIDED_LOCAL_SEARCH"
     ])
     # Описание: Списък с "Local Search" метаевристики, които да се състезават в паралелен режим.
 
@@ -879,7 +887,7 @@ class OutputConfig:
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
     routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
-    route_maps_upload_mode: str = "effect_upload" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
+    route_maps_upload_mode: str = "legacy" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizante/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
     route_maps_upload_token: str = "Effect-Bizante-Token" # Token стойност за upload endpoint-а.
@@ -1037,9 +1045,9 @@ class MainConfig:
                 enabled=True,
                 max_customers_per_route=None,
                 start_location=(42.695785029219415, 23.23165887245312),
-                start_time_minutes=480,
-                tsp_depot_location=(42.695785029219415, 23.23165887245312),
                 end_location=None,
+                start_time_minutes=480,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312)
             ),
             VehicleConfig(
                 vehicle_type=VehicleType.CENTER_BUS,
@@ -1053,57 +1061,9 @@ class MainConfig:
                 enabled=True,
                 max_customers_per_route=None,
                 start_location=(42.695785029219415, 23.23165887245312),
+                end_location=None,
                 start_time_minutes=510,
-                tsp_depot_location=(42.695785029219415, 23.23165887245312),
-                end_location=None,
-            ),
-            VehicleConfig(
-                vehicle_type=VehicleType.EXTERNAL_BUS,
-                capacity=320,
-                count=1,
-                name="Доп. бус",
-                fixed_cost=0,
-                max_distance_km=None,
-                max_time_hours=8,
-                service_time_minutes=8,
-                enabled=False,
-                max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),
-                start_time_minutes=450,
-                tsp_depot_location=(42.695785029219415, 23.23165887245312),
-                end_location=None,
-            ),
-            VehicleConfig(
-                vehicle_type=VehicleType.SPECIAL_BUS,
-                capacity=300,
-                count=2,
-                name="",
-                fixed_cost=40000,
-                max_distance_km=None,
-                max_time_hours=8,
-                service_time_minutes=6,
-                enabled=False,
-                max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),
-                start_time_minutes=480,
-                tsp_depot_location=(42.695785029219415, 23.23165887245312),
-                end_location=None,
-            ),
-            VehicleConfig(
-                vehicle_type=VehicleType.VRATZA_BUS,
-                capacity=385,
-                count=3,
-                name="Враца",
-                fixed_cost=0,
-                max_distance_km=None,
-                max_time_hours=8,
-                service_time_minutes=8,
-                enabled=False,
-                max_customers_per_route=None,
-                start_location=(43.221042895146915, 23.5344026186417),
-                start_time_minutes=480,
-                tsp_depot_location=(43.221042895146915, 23.5344026186417),
-                end_location=None,
+                tsp_depot_location=(42.695785029219415, 23.23165887245312)
             ),
         ]
 
