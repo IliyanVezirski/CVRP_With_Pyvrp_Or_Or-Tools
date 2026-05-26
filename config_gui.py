@@ -525,6 +525,7 @@ output.route_maps_upload_url            URL за качване на индив�
 output.route_maps_upload_token_field    име на token POST поле, обикновено pData
 output.route_maps_upload_token          token стойност за upload endpoint-а
 output.route_maps_upload_file_field     multipart поле, обикновено files[]
+output.route_maps_upload_bus_id_field   multipart POST поле за ID-та на бусовете, обикновено pData2[]
 output.route_maps_upload_timeout_seconds timeout за качване
 output.map_provider                     osm или google
 output.folium_tiles                     слой за OSM/Folium
@@ -2580,6 +2581,8 @@ HTML карти:
     Token за pData. За Effect endpoint-а е Effect-Bizante-Token.
   route_maps_upload_file_field:
     Обикновено files[], за да стигне до PHP като $_FILES['files'].
+  route_maps_upload_bus_id_field:
+    Обикновено pData2[], за да стигне до PHP като $_POST['pData2'] масив. Редът съвпада с files[].
   map_provider:
     osm или google.
   google_maps_api_key:
@@ -3762,6 +3765,8 @@ setData не трябва да се пуска:
                          tooltip="Име на POST полето за token-а."); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_file_field", "File поле:", getattr(out, "route_maps_upload_file_field", "files[]"),
                          tooltip="За PHP $_FILES['files'] с много файлове използвай files[]."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_bus_id_field", "Bus ID поле:", getattr(out, "route_maps_upload_bus_id_field", "pData2[]"),
+                         tooltip="За PHP масив с ID-та на бусовете използвай pData2[]. Редът съвпада с files[]."); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_timeout_seconds", "Upload timeout:", getattr(out, "route_maps_upload_timeout_seconds", 60), "int"); gr += 1
         self._add_field(maps, gr, "output.map_provider", "Map provider:", out.map_provider,
                          tooltip='google за Google Maps визуализация или osm за Folium/OpenStreetMap.'); gr += 1
@@ -4039,7 +4044,8 @@ POST {trigger_path} - run с временни настройки, без да п
       "route_maps_upload_mode": "effect_upload",
       "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
       "route_maps_upload_token": "Effect-Bizante-Token",
-      "route_maps_upload_file_field": "files[]"
+      "route_maps_upload_file_field": "files[]",
+      "route_maps_upload_bus_id_field": "pData2[]"
     }},
     "set_data": {{
       "enable_set_data_upload": false,
@@ -4552,6 +4558,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "output.route_maps_upload_token_field": ("route_maps_upload_token_field", "str"),
             "output.route_maps_upload_token": ("route_maps_upload_token", "str"),
             "output.route_maps_upload_file_field": ("route_maps_upload_file_field", "str"),
+            "output.route_maps_upload_bus_id_field": ("route_maps_upload_bus_id_field", "str"),
             "output.route_maps_upload_timeout_seconds": ("route_maps_upload_timeout_seconds", "int"),
             "output.map_provider": ("map_provider", "str"),
             "output.folium_tiles": ("folium_tiles", "str"),

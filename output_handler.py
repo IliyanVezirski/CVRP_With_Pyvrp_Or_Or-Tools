@@ -190,6 +190,15 @@ def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_
         suffix += 1
 
 
+def _format_output_bus_number(output_config: OutputConfig, route_index: int) -> str:
+    prefix = str(getattr(output_config, "excel_bus_number_prefix", "10045010") or "")
+    try:
+        digits = int(getattr(output_config, "excel_bus_number_digits", 2) or 2)
+    except (TypeError, ValueError):
+        digits = 2
+    return f"{prefix}{route_index + 1:0{max(1, digits)}d}"
+
+
 # Цветове за всеки отделен автобус
 BUS_COLORS = [
     '#C74440',  # Меко червен
@@ -4913,7 +4922,7 @@ class OutputHandler:
     def _route_maps_upload_mode(self) -> str:
         return str(getattr(self.config, "route_maps_upload_mode", "disabled") or "disabled").strip().lower()
 
-    def _upload_route_maps(self, route_map_files: List[str]) -> Optional[str]:
+    def _upload_route_maps(self, route_map_items: List[Dict[str, str]]) -> Optional[str]:
         """Upload generated individual route HTML maps when configured."""
         mode = self._route_maps_upload_mode()
         if mode in {"", "0", "false", "off", "none", "disabled"}:
@@ -4932,20 +4941,38 @@ class OutputHandler:
             logger.warning(message)
             return f"failed: {message}"
 
-        existing_files = [path for path in route_map_files if path and os.path.isfile(path)]
-        if not existing_files:
+        existing_items = []
+        for item in route_map_items or []:
+            if isinstance(item, dict):
+                file_path = str(item.get("file_path") or item.get("path") or "")
+                bus_id = str(item.get("bus_id") or "")
+            else:
+                file_path = str(item or "")
+                bus_id = ""
+            if file_path and os.path.isfile(file_path):
+                existing_items.append({"file_path": file_path, "bus_id": bus_id})
+        if not existing_items:
             logger.info("Няма индивидуални HTML карти за качване.")
             return "skipped: няма route HTML файлове"
 
         token_field = str(getattr(self.config, "route_maps_upload_token_field", "pData") or "pData").strip()
         token = str(getattr(self.config, "route_maps_upload_token", "") or "").strip()
         file_field = str(getattr(self.config, "route_maps_upload_file_field", "files[]") or "files[]").strip()
+        bus_id_field = str(getattr(self.config, "route_maps_upload_bus_id_field", "pData2[]") or "pData2[]").strip()
         timeout = int(getattr(self.config, "route_maps_upload_timeout_seconds", 60) or 60)
 
         opened_files = []
         files_payload = []
         try:
-            for file_path in existing_files:
+            data_payload = []
+            if token_field:
+                data_payload.append((token_field, token))
+
+            for item in existing_items:
+                file_path = item.get("file_path", "")
+                bus_id = str(item.get("bus_id", "") or "")
+                if bus_id_field:
+                    data_payload.append((bus_id_field, bus_id))
                 file_handle = open(file_path, "rb")
                 opened_files.append(file_handle)
                 files_payload.append(
@@ -4959,11 +4986,15 @@ class OutputHandler:
                     )
                 )
 
-            data = {token_field: token} if token_field else {}
-            logger.info("Качвам %s route HTML карти към %s", len(files_payload), upload_url)
+            logger.info(
+                "Качвам %s route HTML карти към %s с bus ID поле %s",
+                len(files_payload),
+                upload_url,
+                bus_id_field or "-",
+            )
             response = requests.post(
                 upload_url,
-                data=data,
+                data=data_payload,
                 files=files_payload,
                 timeout=timeout,
             )
@@ -5012,7 +5043,7 @@ class OutputHandler:
                 # 1.1. Отделни HTML карти за всеки маршрут
                 routes_dir = self.config.routes_output_dir
                 generated_route_maps = 0
-                route_map_files: List[str] = []
+                route_map_items: List[Dict[str, str]] = []
                 try:
                     os.makedirs(routes_dir, exist_ok=True)
                     used_route_file_names = set()
@@ -5029,12 +5060,17 @@ class OutputHandler:
                             route_file = os.path.join(routes_dir, route_filename)
                             saved_route_file = map_gen.save_map(single_map, route_file)
                             output_files[f'route_map_{route_number}'] = saved_route_file
-                            route_map_files.append(saved_route_file)
+                            route_map_items.append(
+                                {
+                                    "file_path": saved_route_file,
+                                    "bus_id": _format_output_bus_number(self.config, idx),
+                                }
+                            )
                             generated_route_maps += 1
                         except Exception as e:
                             logger.error(f"Грешка при генериране на HTML карта за маршрут {route_number}: {e}", exc_info=True)
                     logger.info(f"Генерирани {generated_route_maps}/{len(solution.routes)} отделни HTML карти в {routes_dir}")
-                    upload_summary = self._upload_route_maps(route_map_files)
+                    upload_summary = self._upload_route_maps(route_map_items)
                     if upload_summary:
                         output_files["route_maps_upload"] = upload_summary
                 except Exception as e:

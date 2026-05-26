@@ -892,6 +892,7 @@ class OutputConfig:
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
     route_maps_upload_token: str = "Effect-Bizante-Token" # Token стойност за upload endpoint-а.
     route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
+    route_maps_upload_bus_id_field: str = "pData2[]" # Multipart POST поле за ID-та на бусовете, подредени като files[].
     route_maps_upload_timeout_seconds: int = 60 # Таймаут за качване на route HTML файловете.
     map_provider: str = "osm" # Кой визуален слой да се използва: "google" или "osm".
     folium_tiles: str = "Esri.WorldStreetMap" # Фонов слой за Folium/OpenStreetMap режим. Не използва официалния OSM tile сървър.
