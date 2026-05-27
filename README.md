@@ -1,4 +1,4 @@
-# CVRP OR-Tools Optimizer
+# CVRP Optimizer (PyVRP / OR-Tools)
 
 Софтуер за дневно планиране на маршрути на бусове с капацитет, работно време, различни депа, зона център, реални пътни разстояния и подробни изходни файлове.
 
@@ -21,6 +21,8 @@
 - В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане, popup с обем и бутон за навигация.
 - В общата карта има GPS търсачка за временни пинове по координати, с име и обем, ако са подадени.
 - Показва посока на движение по маршрутите с разредени стрелки.
+- Поддържа отделен `/tsp` режим за текущ маршрут на един шофьор: текуща GPS позиция, optional крайна точка, клиенти, работно време, оборот, количество и коментар.
+- Имената на TSP JSON полетата могат да се настройват от GUI, например ако външната система изпраща `Coord` вместо `gps` или `DriverNote` вместо `comment`.
 - Добавя дата на стартиране към имената на общата карта, Excel файловете и отделните route карти. CSV файлът остава без дата.
 - Има GUI за настройки и Windows Task Scheduler интеграция.
 - Може да работи като Python проект или да се build-не до `CVRP_Optimizer.exe`.
@@ -40,9 +42,68 @@
 | `osrm_client.py` | OSRM матрици, кеш и route geometry. |
 | `valhalla_client.py` | Valhalla интеграция. |
 | `output_handler.py` | HTML карти, Excel, CSV и графики. |
+| `cvrp_api_server.py` | HTTP API за `/health`, `/run`, `/solve` и `/tsp`. |
+| `current_tsp.py` | Отделен TSP режим за текущ маршрут на един шофьор. |
+| `setdata_client.py` | Връщане на резултата към Bizant чрез `setData` и `makeGroup`. |
 | `build_exe.py` | Автоматизиран build с PyInstaller. |
 | `start_cvrp.bat` | Стартира EXE, ако има; иначе стартира през `.venv`. |
 | `Settings.bat` | Отваря настройките през EXE или `.venv`. |
+| `start_api_server.bat` | Стартира API сървъра с видим прозорец. |
+| `start_api_server_hidden.bat` | Стартира API сървъра скрито, подходящо за автоматично стартиране. |
+
+## Архитектура по модули
+
+Програмата е разделена на ясни слоеве. В нормален дневен run потокът е:
+
+```text
+config.py / GUI
+  -> input_handler.py
+  -> warehouse_manager.py
+  -> osrm_client.py или valhalla_client.py
+  -> cvrp_solver.py или pyvrp_solver.py
+  -> output_handler.py
+  -> setdata_client.py
+```
+
+`main.py` е оркестраторът. Той зарежда конфигурацията, подготвя входните данни, отделя складовите/невалидните заявки, строи матрицата, пуска избрания solver, избира най-доброто решение при паралелен режим, генерира файловете и накрая извиква `setData`, ако е включено.
+
+`config.py` е централният модел на настройките. Там са dataclass конфигурациите за вход, бусове, депа, център зони, трафик зони, solver-и, OSRM/Valhalla, output, API и setData. GUI-то записва промените обратно в този файл, а при стартиране програмата чете текущите стойности от него.
+
+`config_gui.py` е административният екран. Той не решава маршрути, а управлява настройките: входни данни, превозни средства, депа, зони, solver параметри, output, API, TSP полета, setData и автоматично стартиране. В падащите полета скролът с колелцето е блокиран като промяна на стойност, за да не се сменя случайно депо или solver при скролване надолу.
+
+`input_handler.py` отговаря за входа. Той чете Excel или HTTP JSON, декодира отговори, извлича клиентски записи, валидира GPS, парсва работно време, пази коментар за доставка и може да групира няколко документа за един и същи клиент/GPS в едно посещение.
+
+`warehouse_manager.py` прави предварителното разпределение. Ако складовата логика е включена, част от заявките може да се отделят за склад според обем, близост, лимити и правила. Останалите клиенти влизат в solver-а.
+
+`osrm_client.py` и `valhalla_client.py` строят реалната матрица. Solver-ите не работят директно с GPS точки, а с таблица от разстояния и времена между депата и клиентите. OSRM е основният бърз режим с Table API и batch логика. Valhalla дава алтернатива с time-dependent/traffic възможности, но при липсващи клетки програмата има fallback, за да не пада целият run.
+
+`cvrp_solver.py` съдържа OR-Tools решението. То създава routing модел с capacity/time dimensions, стартови и крайни депа, възможност за пропускане на клиенти, center zone penalties, service time, time windows и предварително сметнати vehicle cost матрици, за да се намали Python callback overhead.
+
+`pyvrp_solver.py` съдържа PyVRP решението. То създава PyVRP модел със същите клиенти, депа и матрица, поддържа objective по `distance` или `time`, service time, time windows, center zone логика и profile compression за еднакви vehicle правила. В паралелен режим различните worker-и работят с различни seed-ове, а `main.py` избира решението с най-нисък `fitness_score`.
+
+`output_handler.py` генерира резултатите. Тук са общата карта, индивидуалните route карти, списъците с клиенти за шофьора, ETA, route geometry, Excel отчет, CSV файл, графики и upload на HTML картите към външен PHP сървър. Ако отделен output файл даде грешка, модулът логва проблема и продължава с останалите файлове.
+
+`cvrp_api_server.py` е remote control слоят. Той стартира API сървър, показва реалния адрес през `/health`, приема `/run` за стартиране с текущата конфигурация, `/solve` за клиенти в JSON body и `/tsp` за текущ маршрут на един шофьор. Поддържа временни settings override-и само за конкретната заявка, callback URL, API key и скрит subprocess режим за `/run`, когато няма override-и.
+
+`current_tsp.py` е отделен от CVRP solver-ите. Той не разпределя клиенти между много бусове, а подрежда останалите клиенти на един шофьор от текуща позиция до optional крайна точка. Използва OSRM/Valhalla матрица, greedy подреждане с time-window awareness и 2-opt подобрение. После генерира индивидуална карта със същия механизъм като нормалните route карти и при upload изпраща `pData2[]=driver_id`.
+
+`setdata_client.py` подготвя и изпраща резултатите към Bizant. За обслужените клиенти строи редове с `IdPlasDoc`, `DoneFlag`, `IdSkld`, `Bukva` и `IdGrafik`. За необслужените има отделни настройки, включително отделен `DoneFlag`. След успешни `setData` заявки може да изпрати `makeGroup` по склад.
+
+`main_exe.py` и `build_exe.py` са за EXE режима. `main_exe.py` избира дали да стартира основната програма, GUI настройките или API сървъра. `build_exe.py` генерира spec файл, hidden imports, version info, batch файлове и runtime файлове за разпространение.
+
+## Основен workflow
+
+1. Конфигурацията се зарежда от `config.py`.
+2. Входът се чете от Excel или HTTP JSON.
+3. Невалидни клиенти без GPS се местят към необслужени.
+4. Ако складовата логика е активна, част от клиентите се отделят за склад.
+5. Активните бусове и депа се подреждат в единен ред.
+6. OSRM или Valhalla изчислява матрицата между всички депа и клиенти.
+7. OR-Tools или PyVRP решава CVRP задачата.
+8. При паралелно решаване се избира решението с най-нисък `fitness_score`.
+9. Генерират се HTML карти, Excel, CSV и графики според включените output опции.
+10. Ако е включено, `setData` връща резултата към Bizant.
+11. API режимът връща JSON резюме с маршрути, необслужени клиенти, файлове и setData статус.
 
 ## Бърз старт с Python
 
@@ -99,6 +160,8 @@ GUI-то има табове за:
 - Solver настройки.
 - Локации и депа.
 - Изходни файлове.
+- API сървър: адрес, endpoint-и, API key, примерни команди и TSP имена на входни полета.
+- setData: връщане на обслужени/необслужени клиенти и makeGroup.
 - Автоматично стартиране през Windows Task Scheduler.
 
 В таб `Автоматично стартиране` може да се създават повече от една Windows Task Scheduler задача. Въведи различно име за всяка задача, например:
@@ -153,6 +216,54 @@ GPS стойностите се очакват като latitude/longitude, на
 HTTP JSON режимът поддържа URL с дата, декодиране на `utf-8`, `windows-1251`, `latin-1` и mapping на полетата в `InputConfig`.
 
 Ако един и същ клиентски номер (`IdCust`) идва повече от веднъж със същите GPS координати, програмата по подразбиране групира тези редове като едно посещение. Обемът се събира, solver-ът вижда един стоп, а оригиналните документи се пазят за отчетите и `setData`. Това може да се изключи от GUI: `Входни данни -> Групирай документи`, или през API/settings с `input.enable_customer_document_grouping=false`.
+
+Минимално валиден клиент има:
+
+- клиентски ID;
+- GPS координати;
+- положителен обем;
+- име или документ не са задължителни за solver-а, но са важни за отчетите и `setData`.
+
+При HTTP JSON полетата се четат от настройките:
+
+| Настройка | Какво значи | Пример |
+|---|---|---|
+| `json_gps_field` | GPS координати | `GPS` |
+| `json_client_id_field` | ID на клиента | `IdCust` |
+| `json_client_name_field` | Име на клиента | `CustName` |
+| `json_volume_field` | Обем/стекове | `Volume` |
+| `json_document_field` | Документ | `IdDoc` |
+| `json_plas_doc_field` | Документ за `setData` | `IdPlasDoc` |
+| `json_id_skld_field` | Оригинален склад | `IdSkld` |
+| `json_time_window_field` | Работно време | `WorkTime` |
+| `json_delivery_comment_field` | Коментар към доставка | `DeliveryComment` |
+
+Ако HTTP сървърът връща данни, но програмата казва "Не са намерени валидни клиенти", почти винаги причината е една от тези:
+
+- JSON отговорът не е списък и не е wrapper с разпознаваем ключ като `data`, `items`, `records`, `customers` или `orders`;
+- GPS полето в настройките не съвпада с реалното име в JSON;
+- обемът идва в друго поле или като невалидна стойност;
+- в JSON има суров newline/control character в текстово поле и отговорът не е валиден JSON;
+- всички редове са филтрирани преди solver-а заради липсващи координати, нулев обем или складова логика.
+
+## Работно време и коментари
+
+Работното време може да се включва и изключва от GUI. Когато е изключено, клиентите се приемат като отворени през целия ден.
+
+Поддържани входни формати:
+
+```text
+08:00-13:00
+08:00 - 16:00
+08:00-13:00
+16:00-18:00
+```
+
+Ако има два прозореца, програмата запазва текста и го показва на картите, но solver-ите използват първия валиден прозорец. Причината е практическа: текущият модел в проекта работи с един time window на клиент.
+
+Ако форматът е невалиден, програмата не спира run-а. Работното време се игнорира за този клиент, записва се предупреждение в лога и клиентът остава в маршрутизацията като нормален клиент.
+
+Коментарът към доставка не влияе на solver-а. Той се пази за шофьора и се показва в индивидуалните route карти. Когато клиент има работно време или коментар, списъкът го маркира визуално, за да се забележи по-лесно по време на доставка.
 
 ## Бусове, депа и сервизно време
 
@@ -373,6 +484,185 @@ CSV файлът не се променя по име, за да остане с
 - бутон `Навигация`;
 - клик върху клиент центрира картата и отваря popup.
 
+## API режими
+
+API сървърът е слой за дистанционно управление. Той не заменя GUI настройките, а ги използва като база. Всяка POST заявка може временно да подаде настройки само за конкретния run.
+
+Основни endpoint-и:
+
+| Endpoint | Метод | Какво прави |
+|---|---|---|
+| `/health` | `GET` | Връща статус, реалните URL-и, текущ run и `settings_schema`. |
+| `/run` | `GET` или `POST` | Стартира програмата с текущия `input_source` от конфигурацията. |
+| `/solve` | `POST` | Приема клиенти в JSON body и решава CVRP. |
+| `/tsp` | `POST` | Прави текущ маршрут за един шофьор от текуща GPS позиция. |
+
+Адресът се взема от `api.api_public_url`, ако е попълнен. Ако е празен, GUI-то и `/health` показват автоматично засечения адрес на машината и `api.api_port`.
+
+Ако `api.api_key` е попълнен, заявките трябва да подават един от тези варианти:
+
+```text
+X-CVRP-API-Key: <key>
+Authorization: Bearer <key>
+?api_key=<key>
+```
+
+### `/run`
+
+`/run` е режимът "стартирай програмата както е настроена". Той е подходящ, когато входните данни вече идват от Excel или HTTP JSON според `input.input_source`.
+
+Пример с текущите настройки:
+
+```cmd
+curl "http://IP:8088/run"
+```
+
+Пример с временни настройки само за този run:
+
+```cmd
+curl -X POST "http://IP:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"output\":{\"enable_excel_output\":true,\"route_maps_upload_mode\":\"effect_upload\"},\"set_data\":{\"enable_set_data_upload\":false}}}"
+```
+
+Поведение:
+
+- без `return_result` сървърът връща веднага `202 started`, а работата продължава във фонов режим;
+- с `return_result=true` заявката чака края и връща пълния JSON резултат;
+- с `callback_url` сървърът връща веднага, а след края изпраща POST известие към посочения URL;
+- ако вече има активен run, връща `409 already_running`.
+
+### `/solve`
+
+`/solve` е режимът "подавам клиенти и настройки в заявката". Използва се, когато външна система иска да управлява целия run без да променя `config.py`.
+
+Body може да бъде директен списък или wrapper:
+
+```json
+{
+  "settings": {
+    "solver_type": "or_tools",
+    "objective_metric": "time"
+  },
+  "customers": [
+    {
+      "IdCust": "1001",
+      "CustName": "Клиент",
+      "GPS": "42.6977,23.3219",
+      "Volume": 10,
+      "IdDoc": "D001",
+      "IdPlasDoc": "P001",
+      "IdSkld": "106",
+      "WorkTime": "08:00-13:00",
+      "DeliveryComment": "Обади се 10 мин преди доставка"
+    }
+  ]
+}
+```
+
+`/solve` използва същата логика за матрица, solver-и, output, `setData` и карти като нормалния run.
+
+### `/tsp`
+
+`/tsp` е отделен бърз режим за един шофьор, който вече има списък клиенти и текуща GPS позиция. Не прави CVRP разпределение между бусове. Той само подрежда зададените клиенти в добър ред на доставка.
+
+Алгоритъмът е лек: greedy старт с оценка по време/разстояние и работно време, после 2-opt подобрение. За около 40 клиента обикновено е много по-бърз от пълен CVRP run, защото няма разпределение между много бусове.
+
+Началният час се взема автоматично от текущия час на машината. Може да се подаде ръчно чрез `start_time`, но нормалният режим е да не се подава.
+
+Пример:
+
+```cmd
+curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"1004501001\",\"driver_name\":\"HELL 1\",\"driver_location\":\"42.695785029219415,23.23165887245312\",\"end_location\":\"42.695785029219415,23.23165887245312\",\"metric\":\"time\",\"service_time_minutes\":8,\"generate_map\":true,\"upload_map\":true,\"customers\":[{\"id\":\"1005487516\",\"name\":\"А И А ТРЕЙД ООД\",\"order\":\"0004384359\",\"quantity\":8,\"turnover\":245.50,\"gps\":\"42.67973749002523,23.324913047254086\",\"work_time\":\"08:00-13:00\",\"comment\":\"Вход откъм булеварда. Обади се 10 мин. преди доставка.\"}]}"
+```
+
+Имената на TSP полетата се настройват от GUI. Така може външната система да изпраща например `Coord` вместо `gps` или `DriverNote` вместо `comment`.
+
+## Настройки през API
+
+В API body настройките могат да се подават в `settings`. Поддържат се два стила.
+
+Кратък стил:
+
+```json
+{
+  "settings": {
+    "solver_type": "pyvrp",
+    "objective_metric": "time",
+    "time_limit_seconds": 180,
+    "routing_engine": "osrm",
+    "osrm_url": "http://127.0.0.1:5000",
+    "enable_excel_output": true
+  }
+}
+```
+
+Структуриран стил:
+
+```json
+{
+  "settings": {
+    "cvrp": {
+      "solver_type": "pyvrp",
+      "objective_metric": "time",
+      "time_limit_seconds": 180
+    },
+    "routing": {
+      "engine": "osrm"
+    },
+    "osrm": {
+      "base_url": "http://127.0.0.1:5000",
+      "profile": "driving"
+    },
+    "output": {
+      "enable_excel_output": true,
+      "routes_output_dir": "H:\\Hell_Bizant_files\\Routes"
+    }
+  }
+}
+```
+
+Най-важните секции:
+
+| Секция | Какво управлява |
+|---|---|
+| `cvrp` | solver, време за решаване, objective, PyVRP/OR-Tools настройки, паралелност, time windows. |
+| `input` | Excel/HTTP JSON вход, дата, склад, DoneFlag, имена на JSON полета, групиране на документи. |
+| `vehicles` | типове бусове, брой, капацитет, имена, старт/край, service time, лимити. |
+| `locations` | депа, основна център зона, допълнителни център зони, трафик зони. |
+| `routing` | избор между OSRM и Valhalla. |
+| `osrm` | OSRM URL, profile, timeout, chunk size. |
+| `valhalla` | Valhalla URL, profile, timeout, batch настройки. |
+| `output` | карти, Excel, CSV, chart-ове, директории, upload на route карти. |
+| `set_data` | `setData`, DoneFlag, складове, необслужени клиенти, `makeGroup`. |
+
+За пълния списък извикай:
+
+```cmd
+curl "http://IP:8088/health"
+```
+
+В отговора има `commands` и `settings_schema`, които показват текущите endpoint-и, примерни body-та и всички позволени полета.
+
+## Upload на индивидуални карти
+
+Индивидуалните route карти могат едновременно да се генерират като локални HTML файлове и да се качват към PHP endpoint.
+
+Режими:
+
+| Стойност | Поведение |
+|---|---|
+| `disabled` | Не качва карти. |
+| `legacy` | Запазва старото поведение. |
+| `effect_upload` | Качва HTML файловете към `route_maps_upload_url`. |
+
+При `effect_upload` се изпраща multipart POST:
+
+- token поле, по подразбиране `pData`;
+- token стойност, по подразбиране `Effect-Bizante-Token`;
+- файлове в `files[]`;
+- ID на буса в `pData2[]`, подредено в същия ред като файловете.
+
+Това не променя локалното генериране на файловете. Ако `enable_interactive_map` и route map output са включени, файловете се записват локално; upload-ът е допълнителна стъпка.
+
 ## Build до EXE
 
 Подробно е описано в [BUILD_EXE_README.md](BUILD_EXE_README.md).
@@ -424,7 +714,13 @@ Build-ът създава `CVRP_Optimizer.exe` в `..\dist`.
 
 Генерирай route картите наново. Новият списък е зад бутон `Клиенти`, за да не закрива картата.
 
-## Последни промени по проекта
+### HTTP входът връща данни, но програмата казва, че няма клиенти
+
+Провери първо имената на JSON полетата в GUI. Най-важни са GPS, клиентски ID и обем. Ако външният сървър връща `Coord`, а в програмата е настроено `GPS`, всички редове ще изглеждат като невалидни.
+
+Провери и дали JSON отговорът е валиден. Непозволени control characters в коментар или работно време могат да счупят `json.loads`, преди програмата изобщо да стигне до обработка на клиенти.
+
+## Интеграции и подробни настройки
 
 ### PyVRP, бусове и глоби
 
@@ -473,9 +769,21 @@ http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&Don
 POST http://IP:8088/solve
 GET  http://IP:8088/run
 POST http://IP:8088/run
+POST http://IP:8088/tsp
 ```
 
 `/solve` приема JSON клиенти и връща резултата след решаване. `/run` не очаква входни данни: само стартира оптимизацията с текущата конфигурация и връща веднага `202 started`. Ако вече има активен run, връща `409 already_running`.
+
+`/tsp` е отделен режим за текущ маршрут на един шофьор. Той приема `driver_id`, текуща GPS позиция `driver_location`, optional `end_location`, клиенти, работно време, оборот, количество, номер на поръчка и коментар. Връща реда на доставка, ETA данни, генерира индивидуална HTML карта и при upload изпраща `pData2[]=driver_id` заедно с HTML файла.
+
+Адресът за извикване не е хардкоднат само за TSP. Всички API примери използват общия адрес от `api.api_public_url`, а ако той е празен, сървърът/GUI-то показват автоматично засечения IP адрес на машината и `api.api_port`.
+
+Имената на TSP полетата се настройват в GUI: `API сървър -> TSP полета във входната заявка`. Така външна система може да изпраща например `Coord` вместо `gps`, `OrderNumber` вместо `order` или `DriverNote` вместо `comment`, без да се променя кодът. Може да се зададат и няколко имена със запетая:
+
+```text
+gps,GPS,Coord,coordinates
+comment,DeliveryComment,DriverNote,note
+```
 
 Trigger може да се извика и през `/solve` с query или JSON команда:
 
@@ -494,6 +802,7 @@ cmd=start_program
 ```cmd
 curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
 curl "http://10.10.100.134:8088/run"
+curl -X POST "http://10.10.100.134:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"metric\":\"time\",\"customers\":[{\"id\":\"C001\",\"name\":\"Client 001\",\"order\":\"0004384359\",\"gps\":\"42.6629,23.37682\",\"work_time\":\"08:00-13:00\",\"turnover\":120.5,\"quantity\":5,\"comment\":\"Обади се 10 мин преди доставка\"}]}"
 ```
 
 След една заявка API сървърът не спира. Той връща резултат и остава да чака следваща заявка.
@@ -551,7 +860,7 @@ par: IdSkld
 
 Build-ът включва основната програма, Settings GUI, API сървъра и стартовите batch файлове. Има и скрит старт на API сървъра чрез `start_api_server_hidden.bat`, когато трябва сървърът да работи без отворен CMD прозорец.
 
-## Последни възможности
+## Обобщение на възможностите
 
 Текущата версия може да се управлява много по-пълно от GUI и API:
 
@@ -573,8 +882,10 @@ Build-ът включва основната програма, Settings GUI, API
 ### Пример `/run` с настройки
 
 ```powershell
-curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
+curl -X POST "http://IP:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
 ```
+
+Замени `IP` с адреса, който GUI-то показва в таб `API сървър`, или виж `public_url` от `GET /health`.
 
 ### Пример API center_zones
 

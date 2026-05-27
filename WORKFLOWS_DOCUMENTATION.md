@@ -513,6 +513,7 @@ API-то може да стартира програмата по два нач�
 
 - `POST /solve` приема клиентски записи и настройки в същото body.
 - `GET/POST /run` стартира текущо конфигурирания вход, но може да приеме временни настройки.
+- `POST /tsp` подрежда текущ маршрут за един шофьор от текуща GPS позиция, optional крайна точка и списък клиенти, без да пуска пълния CVRP solver.
 
 Настройките могат да се подават така:
 
@@ -578,13 +579,39 @@ API-то може да стартира програмата по два нач�
       "route_maps_upload_mode": "effect_upload",
       "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
       "route_maps_upload_token": "Effect-Bizante-Token",
-      "route_maps_upload_file_field": "files[]"
+      "route_maps_upload_file_field": "files[]",
+      "route_maps_upload_bus_id_field": "pData2[]"
     }
   }
 }
 ```
 
 `disabled` изключва качването. `legacy` запазва старото поведение без нов HTTP upload.
+
+При `/tsp` качването изпраща `pData2[]=driver_id`, за да може PHP сървърът да знае за кой шофьор е HTML картата.
+
+Пример `/tsp` заявка:
+
+```json
+{
+  "driver_id": "1004501001",
+  "driver_location": "42.6977,23.3219",
+  "end_location": "42.7000,23.4000",
+  "metric": "time",
+  "service_time_minutes": 8,
+  "upload_map": true,
+  "customers": [
+    {
+      "id": "C001",
+      "name": "Client 001",
+      "gps": "42.6629,23.37682",
+      "work_time": "08:00-13:00",
+      "turnover": 120.5,
+      "quantity": 5
+    }
+  ]
+}
+```
 
 Кратки aliases, които са удобни за API:
 

@@ -2987,12 +2987,23 @@ class InteractiveMapGenerator:
             if end_time
             else ""
         )
+        total_turnover = getattr(route, "total_turnover", None)
+        turnover_html = ""
+        try:
+            if total_turnover not in (None, "") and float(total_turnover or 0) != 0:
+                turnover_html = (
+                    f'<div class="route-client-stat"><span>Оборот:</span>'
+                    f'<b>{self._format_route_number(float(total_turnover))}</b></div>'
+                )
+        except (TypeError, ValueError):
+            turnover_html = ""
         return f'''
             <div class="route-client-stats">
                 <div class="route-client-stat"><span>Общо:</span><b>{len(route.customers)} клиента</b></div>
                 <div class="route-client-stat"><span>Стекове:</span><b>{self._format_route_number(route.total_volume)}</b></div>
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
+                {turnover_html}
                 {start_html}
                 {end_html}
             </div>
@@ -3316,6 +3327,20 @@ class InteractiveMapGenerator:
             arrival_time = html.escape(str(entry.get("arrival_time", "") or ""))
             time_window_text = html.escape(str(entry.get("time_window_text", "") or ""))
             delivery_comment = html.escape(str(entry.get("delivery_comment", "") or ""))
+            quantity_text = ""
+            turnover_text = ""
+            try:
+                quantity_raw = entry.get("quantity")
+                if quantity_raw not in (None, ""):
+                    quantity_text = f" &middot; Количество: {float(quantity_raw):.2f}"
+            except (TypeError, ValueError):
+                quantity_text = ""
+            try:
+                turnover_raw = entry.get("turnover")
+                if turnover_raw not in (None, "") and float(turnover_raw or 0) != 0:
+                    turnover_text = f'<div class="route-client-turnover">Оборот: {float(turnover_raw):.2f}</div>'
+            except (TypeError, ValueError):
+                turnover_text = ""
             has_time_window = bool(entry.get("has_time_window"))
             card_extra_class = " route-client-card-time-window" if has_time_window else ""
             time_html = ""
@@ -3337,8 +3362,9 @@ class InteractiveMapGenerator:
                     <div class="route-client-number" style="background:{safe_color}">{number}</div>
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
-                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.</div>
+                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.{quantity_text}</div>
                         {time_html}
+                        {turnover_text}
                         {time_window_html}
                         {comment_html}
                     </div>
@@ -3501,6 +3527,12 @@ class InteractiveMapGenerator:
             .route-client-time {
                 font-size: 11px;
                 color: #188038;
+                margin-top: 2px;
+                line-height: 1.25;
+            }
+            .route-client-turnover {
+                font-size: 11px;
+                color: #44546a;
                 margin-top: 2px;
                 line-height: 1.25;
             }
@@ -3823,6 +3855,22 @@ class InteractiveMapGenerator:
                 time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
                 has_time_window = self._customer_has_declared_time_window(customer)
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
+                quantity_value = getattr(customer, "quantity", None)
+                turnover_value = getattr(customer, "turnover", None)
+                try:
+                    quantity_float = float(quantity_value)
+                except (TypeError, ValueError):
+                    quantity_float = None
+                try:
+                    turnover_float = float(turnover_value)
+                except (TypeError, ValueError):
+                    turnover_float = None
+                quantity_line = f"<b>Количество:</b> {quantity_float:.2f}<br>" if quantity_float is not None else ""
+                turnover_line = (
+                    f"<b>Оборот:</b> {turnover_float:.2f}<br>"
+                    if turnover_float is not None and turnover_float != 0
+                    else ""
+                )
                 icon_html = f'''
                 <div style="
                     background-color: {bus_color};
@@ -3849,6 +3897,8 @@ class InteractiveMapGenerator:
                     <b>ID:</b> {customer.id}<br>
                     <b>Ред в маршрута:</b> #{client_number}<br>
                     <b>Обем:</b> {customer.volume:.2f} ст.<br>
+                    {quantity_line}
+                    {turnover_line}
                     <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
                     {"<br>".join(schedule_lines)}{"<br>" if schedule_lines else ""}
                     {self._popup_action_buttons(navigation_url, street_view_url)}
@@ -3882,6 +3932,8 @@ class InteractiveMapGenerator:
                     "time_window_text": time_window_text,
                     "has_time_window": has_time_window,
                     "delivery_comment": delivery_comment,
+                    "quantity": quantity_value,
+                    "turnover": turnover_value,
                 })
 
         # Линия на маршрута

@@ -231,6 +231,31 @@ class ConfigGUI:
             for sequence in sequences:
                 widget.bind(sequence, handler)
 
+    def _scroll_parent_canvas_from_child(self, widget, event):
+        parent = widget
+        while parent is not None:
+            parent = getattr(parent, "master", None)
+            if isinstance(parent, tk.Canvas):
+                if getattr(parent, "_scroll_needed", False):
+                    if getattr(event, "num", None) == 4:
+                        units = -3
+                    elif getattr(event, "num", None) == 5:
+                        units = 3
+                    else:
+                        units = int(-1 * (getattr(event, "delta", 0) / 120))
+                    if units:
+                        parent.yview_scroll(units, "units")
+                return "break"
+        return "break"
+
+    def _bind_combobox_scrolling(self, combo):
+        def _on_wheel(event):
+            return self._scroll_parent_canvas_from_child(combo, event)
+
+        combo.bind("<MouseWheel>", _on_wheel)
+        combo.bind("<Button-4>", _on_wheel)
+        combo.bind("<Button-5>", _on_wheel)
+
     def _bind_text_scrolling(self, text_widget):
         def _scroll_units(units):
             first, last = text_widget.yview()
@@ -290,6 +315,7 @@ class ConfigGUI:
             combo = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=34)
             combo.grid(row=row, column=1, sticky="w", padx=6, pady=6)
             self._bind_text_editing(combo)
+            self._bind_combobox_scrolling(combo)
             self.widgets[key] = var
         else:
             var = tk.StringVar(value=display_value)
@@ -1444,6 +1470,7 @@ locations.*:
         combo = ttk.Combobox(parent, textvariable=var, values=options, state="normal", width=34)
         combo.grid(row=row, column=1, sticky="w", padx=6, pady=6)
         self._bind_text_editing(combo)
+        self._bind_combobox_scrolling(combo)
         self.widgets[key] = var
         if key.endswith(".start_depot_name"):
             self.depot_choice_widgets.append(combo)
@@ -3819,6 +3846,7 @@ setData не трябва да се пуска:
         base_url = self._api_base_url_preview(api)
         solve_path = self._api_path_preview(api, "api_endpoint", "/solve")
         trigger_path = self._api_path_preview(api, "trigger_endpoint", "/run")
+        tsp_path = self._api_path_preview(api, "tsp_endpoint", "/tsp")
         health_path = self._api_path_preview(api, "health_endpoint", "/health")
         api_key = str(getattr(api, "api_key", "") or "").strip()
         auth_header = f' -H "X-CVRP-API-Key: {api_key}"' if api_key else ""
@@ -3848,6 +3876,13 @@ setData не трябва да се пуска:
             "JSON решение:",
             f'curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"customers\\":[...]}}"',
             "Използва се когато външната система подава клиентите директно в заявката.",
+        )
+        r = self._add_copyable_command(
+            quick,
+            r,
+            "Текущ TSP:",
+            f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"driver_id\\":\\"1004501001\\",\\"driver_location\\":\\"42.6977,23.3219\\",\\"end_location\\":\\"42.7000,23.4000\\",\\"customers\\":[...]}}"',
+            "Подрежда текущ маршрут за един шофьор от текущ GPS, optional крайна точка и списък клиенти; връща реда и генерира индивидуална карта.",
         )
         r = self._add_copyable_command(
             quick,
@@ -3918,8 +3953,42 @@ setData не трябва да се пуска:
                         tooltip="POST с JSON клиенти. Сървърът чака решението и връща пълен резултат."); r += 1
         self._add_field(endpoints, r, "api.trigger_endpoint", "Старт без вход:", getattr(api, "trigger_endpoint", "/run"),
                         tooltip="GET/POST без body. Стартира програмата във фонова нишка."); r += 1
+        self._add_field(endpoints, r, "api.tsp_endpoint", "Текущ TSP:", getattr(api, "tsp_endpoint", "/tsp"),
+                        tooltip="POST. Подрежда текущ маршрут за един шофьор с текуща GPS позиция и optional крайна точка."); r += 1
         self._add_field(endpoints, r, "api.health_endpoint", "Статус:", getattr(api, "health_endpoint", "/health"),
                         tooltip="GET. Проверка дали API-то е живо и дали има активен run."); r += 1
+
+        tsp_fields, r = self._add_group(
+            f,
+            "TSP полета във входната заявка",
+            "Тук настройваш как се казват полетата, които външната система изпраща към /tsp. Може да зададеш повече от едно име, разделени със запетая; първото намерено поле се използва.",
+        )
+        self._add_field(tsp_fields, r, "api.tsp_driver_id_field", "ID шофьор/бус:", getattr(api, "tsp_driver_id_field", "driver_id"),
+                        tooltip="Пример: driver_id или DriverID."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_driver_name_field", "Име шофьор/бус:", getattr(api, "tsp_driver_name_field", "driver_name"),
+                        tooltip="Optional. Ако липсва, картата използва ID-то."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_driver_location_field", "Стартова GPS точка:", getattr(api, "tsp_driver_location_field", "driver_location"),
+                        tooltip="Пример: driver_location,current_location,gps."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_end_location_field", "Крайна GPS точка:", getattr(api, "tsp_end_location_field", "end_location"),
+                        tooltip="Optional. Ако липсва, TSP маршрутът е отворен."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customers_field", "Списък клиенти:", getattr(api, "tsp_customers_field", "customers"),
+                        tooltip="Пример: customers,clients,orders,data."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_id_field", "Клиент ID:", getattr(api, "tsp_customer_id_field", "id"),
+                        tooltip="Пример: id,IdCust,customer_id."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_name_field", "Име клиент:", getattr(api, "tsp_customer_name_field", "name"),
+                        tooltip="Пример: name,CustName,client_name."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_order_field", "Номер поръчка:", getattr(api, "tsp_customer_order_field", "order"),
+                        tooltip="Пример: order,document,DocNo."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_gps_field", "GPS координати:", getattr(api, "tsp_customer_gps_field", "gps"),
+                        tooltip="Пример: gps,GPS,coordinates,location."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_quantity_field", "Количество/стекове:", getattr(api, "tsp_customer_quantity_field", "quantity"),
+                        tooltip="Пример: quantity,Volume,stacks."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_turnover_field", "Оборот:", getattr(api, "tsp_customer_turnover_field", "turnover"),
+                        tooltip="Пример: turnover,amount,oborot."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_work_time_field", "Работно време:", getattr(api, "tsp_customer_work_time_field", "work_time"),
+                        tooltip="Пример: work_time,WorkTime,TimeWindow."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_comment_field", "Коментар доставка:", getattr(api, "tsp_customer_comment_field", "comment"),
+                        tooltip="Пример: comment,note,remark,DeliveryComment."); r += 1
 
         commands, r = self._add_group(
             f,
@@ -3993,6 +4062,30 @@ POST {solve_path}
     200 с пълния JSON резултат от решението.
   Пример:
     curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"customers\":[{{\"IdCust\":\"1\",\"GPS\":\"42.6977,23.3219\",\"Volume\":10}}]}}"
+
+POST {base_url}{tsp_path}
+  За какво е:
+    Подрежда текущ маршрут за един шофьор, без да пуска CVRP solver.
+    Стартира от текущата GPS позиция на шофьора и ако има end_location,
+    оптимизира реда така, че маршрутът да завърши в тази крайна точка.
+  Body:
+    {{
+      "driver_id": "1004501001",
+      "driver_location": "42.6977,23.3219",
+      "end_location": "42.7000,23.4000",
+      "metric": "time",
+      "service_time_minutes": 8,
+      "upload_map": true,
+      "customers": [{{"id":"1","name":"Клиент","order":"0004384359","gps":"42.6629,23.37682","work_time":"08:00-13:00","turnover":120.5,"quantity":5,"comment":"Обади се 10 мин преди доставка"}}]
+    }}
+  Field names:
+    driver_id, driver_location, gps, work_time, quantity, turnover and comment
+    are configurable in the "TSP полета във входната заявка" section.
+  Връща:
+    driver_id, ред на доставка, ETA, общи км/минути, HTML карта и upload статус.
+    Ако upload_map=true и route_maps_upload_mode=effect_upload, картата се качва с pData2[]=driver_id.
+  Пример:
+    curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json" -d "{{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"customers\":[{{\"id\":\"1\",\"gps\":\"42.6629,23.37682\",\"quantity\":5}}]}}"
 
 POST {solve_path}?cmd=run
   За какво е:
@@ -4096,6 +4189,35 @@ POST {solve_path} - клиенти + настройки в една заявка
     {{"IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00 - 16:00"}}
   ]
 }}
+
+POST {base_url}{tsp_path} - текущ TSP маршрут за един шофьор:
+{{
+  "driver_id": "1004501001",
+  "driver_location": "42.6977,23.3219",
+  "end_location": "42.7000,23.4000",
+  "metric": "time",
+  "service_time_minutes": 8,
+  "generate_map": true,
+  "upload_map": true,
+  "customers": [
+    {{"id": "1", "name": "Клиент 1", "order": "0004384359", "gps": "42.6629,23.37682", "work_time": "08:00-13:00", "turnover": 120.50, "quantity": 5, "comment": "Обади се 10 мин преди доставка"}},
+    {{"id": "2", "name": "Клиент 2", "order": "0004385134", "gps": "42.66119,23.39272", "work_time": "16:00-18:00", "turnover": 80.00, "quantity": 3, "comment": ""}}
+  ],
+  "settings": {{
+    "routing": {{"engine": "osrm"}},
+    "output": {{
+      "routes_output_dir": "H:\\\\Hell_Bizant_files\\\\Routes",
+      "route_maps_upload_mode": "effect_upload",
+      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
+      "route_maps_upload_bus_id_field": "pData2[]"
+    }}
+  }}
+}}
+
+TSP имената на полетата се настройват от GUI:
+  API сървър -> TSP полета във входната заявка.
+  Ако външната система праща GPS като Coord или коментар като Note,
+  попълни съответното име там, без да променяш кода.
 
 Формат за vehicles patch:
 {{
@@ -4581,7 +4703,21 @@ POST {solve_path} - клиенти + настройки в една заявка
             "api.api_key": ("api_key", "str"),
             "api.api_endpoint": ("api_endpoint", "str"),
             "api.trigger_endpoint": ("trigger_endpoint", "str"),
+            "api.tsp_endpoint": ("tsp_endpoint", "str"),
             "api.health_endpoint": ("health_endpoint", "str"),
+            "api.tsp_driver_id_field": ("tsp_driver_id_field", "str"),
+            "api.tsp_driver_name_field": ("tsp_driver_name_field", "str"),
+            "api.tsp_driver_location_field": ("tsp_driver_location_field", "str"),
+            "api.tsp_end_location_field": ("tsp_end_location_field", "str"),
+            "api.tsp_customers_field": ("tsp_customers_field", "str"),
+            "api.tsp_customer_id_field": ("tsp_customer_id_field", "str"),
+            "api.tsp_customer_name_field": ("tsp_customer_name_field", "str"),
+            "api.tsp_customer_order_field": ("tsp_customer_order_field", "str"),
+            "api.tsp_customer_gps_field": ("tsp_customer_gps_field", "str"),
+            "api.tsp_customer_quantity_field": ("tsp_customer_quantity_field", "str"),
+            "api.tsp_customer_turnover_field": ("tsp_customer_turnover_field", "str"),
+            "api.tsp_customer_work_time_field": ("tsp_customer_work_time_field", "str"),
+            "api.tsp_customer_comment_field": ("tsp_customer_comment_field", "str"),
             # Bizant setData
             "set_data.enable_set_data_upload": ("enable_set_data_upload", "bool"),
             "set_data.set_data_url": ("set_data_url", "str"),

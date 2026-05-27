@@ -195,6 +195,7 @@ explicit_hiddenimports = [
     "config",
     "config_gui",
     "cvrp_api_server",
+    "current_tsp",
     "input_handler",
     "warehouse_manager",
     "cvrp_solver",

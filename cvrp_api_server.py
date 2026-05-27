@@ -47,6 +47,7 @@ from config import (
 )
 from input_handler import InputHandler
 from main import run_optimization
+from current_tsp import solve_current_tsp_route
 
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "route_maps_upload_token": ("output", "route_maps_upload_token"),
     "route_maps_upload_token_field": ("output", "route_maps_upload_token_field"),
     "route_maps_upload_file_field": ("output", "route_maps_upload_file_field"),
+    "route_maps_upload_bus_id_field": ("output", "route_maps_upload_bus_id_field"),
     "route_maps_upload_timeout": ("output", "route_maps_upload_timeout_seconds"),
     "route_maps_upload_timeout_seconds": ("output", "route_maps_upload_timeout_seconds"),
     "upload_route_maps": ("output", "route_maps_upload_mode"),
@@ -209,6 +211,7 @@ _QUERY_SETTING_ALIASES = {
     "route_maps_upload_token": "route_maps_upload_token",
     "route_maps_upload_token_field": "route_maps_upload_token_field",
     "route_maps_upload_file_field": "route_maps_upload_file_field",
+    "route_maps_upload_bus_id_field": "route_maps_upload_bus_id_field",
     "route_maps_upload_timeout": "route_maps_upload_timeout",
     "route_maps_upload_timeout_seconds": "route_maps_upload_timeout_seconds",
     "upload_route_maps": "upload_route_maps",
@@ -366,7 +369,13 @@ def _hidden_process_kwargs() -> Dict[str, Any]:
     }
 
 
-def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoint: str, health_endpoint: str) -> Dict[str, Any]:
+def _api_commands_reference(
+    public_url: str,
+    solve_endpoint: str,
+    trigger_endpoint: str,
+    health_endpoint: str,
+    tsp_endpoint: str,
+) -> Dict[str, Any]:
     return {
         "health": {
             "method": "GET",
@@ -431,6 +440,31 @@ def _api_commands_reference(public_url: str, solve_endpoint: str, trigger_endpoi
                         "Volume": 10,
                         "WorkTime": "08:00-13:00",
                         "DeliveryComment": "Обади се 10 мин преди доставка",
+                    }
+                ],
+            },
+        },
+        "current_tsp_post": {
+            "method": "POST",
+            "url": f"{public_url}{tsp_endpoint}",
+            "description": "Подрежда текущ маршрут за един шофьор от текуща GPS позиция, optional крайна точка и списък клиенти. Връща реда на доставка и генерира индивидуална HTML карта.",
+            "body_example": {
+                "driver_id": "1004501001",
+                "driver_location": "42.6977,23.3219",
+                "end_location": "42.7000,23.4000",
+                "metric": "time",
+                "service_time_minutes": 8,
+                "upload_map": True,
+                "customers": [
+                    {
+                        "id": "1",
+                        "name": "Клиент",
+                        "order": "0004384359",
+                        "gps": "42.6629,23.37682",
+                        "work_time": "08:00-13:00",
+                        "turnover": 120.50,
+                        "quantity": 5,
+                        "comment": "Обади се 10 мин преди доставка",
                     }
                 ],
             },
@@ -1536,14 +1570,22 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
             api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
             trigger_endpoint_url = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
             health_endpoint_url = _normalise_endpoint(getattr(api_config, "health_endpoint", "/health"))
+            tsp_endpoint_url = _normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp"))
             self._send_json(200, {
                 "status": "ok",
                 "listen_url": f"http://{host}:{port}",
                 "public_url": public_url,
                 "solve_url": f"{public_url}{api_endpoint}",
                 "trigger_url": f"{public_url}{trigger_endpoint_url}",
+                "tsp_url": f"{public_url}{tsp_endpoint_url}",
                 "run_status": _run_status_snapshot(),
-                "commands": _api_commands_reference(public_url, api_endpoint, trigger_endpoint_url, health_endpoint_url),
+                "commands": _api_commands_reference(
+                    public_url,
+                    api_endpoint,
+                    trigger_endpoint_url,
+                    health_endpoint_url,
+                    tsp_endpoint_url,
+                ),
                 "settings_schema": _settings_schema_reference(get_config()),
             })
             return
@@ -1564,9 +1606,24 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         api_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "api_endpoint", "/solve")))
         trigger_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run")))
+        tsp_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp")))
 
         try:
             payload = self._read_json_body(required=False)
+            if path == tsp_endpoint:
+                if (error := _auth_error(api_config, query, self.headers)):
+                    self._send_json(401, {"status": "error", "error": error})
+                    return
+                if payload is None:
+                    raise ValueError("Empty request body")
+                config_override, applied_settings, ignored_settings = _build_request_config_override(payload, query)
+                result = solve_current_tsp_route(payload, config_override or get_config())
+                if applied_settings or ignored_settings:
+                    result["settings_overrides"] = applied_settings
+                    result["ignored_settings"] = ignored_settings
+                self._send_json(200, result)
+                return
+
             if path == trigger_endpoint:
                 if (error := _auth_error(api_config, query, self.headers)):
                     self._send_json(401, {"status": "error", "error": error})
@@ -1704,10 +1761,12 @@ def run_server(host: str | None = None, port: int | None = None):
     public_url = _build_public_base_url(api_config, host, port)
     api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
     trigger_endpoint = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
+    tsp_endpoint = _normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp"))
     logger.info("CVRP API server listening on http://%s:%s", host, port)
     logger.info("Public/base URL: %s", public_url)
     logger.info("POST customer JSON to %s%s", public_url, api_endpoint)
     logger.info("Trigger configured run with GET/POST %s%s", public_url, trigger_endpoint)
+    logger.info("POST current driver TSP JSON to %s%s", public_url, tsp_endpoint)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
