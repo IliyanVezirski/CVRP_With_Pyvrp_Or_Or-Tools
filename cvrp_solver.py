@@ -33,7 +33,13 @@ from config import (
     get_traffic_multiplier,
     get_traffic_zones,
 )
-from input_handler import Customer
+from input_handler import (
+    Customer,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
+    time_windows_to_seconds,
+)
 from osrm_client import DistanceMatrix
 from warehouse_manager import WarehouseAllocation
 
@@ -445,8 +451,16 @@ class ORToolsSolver:
                     index = manager.NodeToIndex(node_idx)
                     if index < 0:
                         continue
-                    start_s, end_s = window
-                    time_dimension.CumulVar(index).SetRange(int(start_s), int(end_s))
+                    windows = list(window)
+                    start_s = int(windows[0][0])
+                    end_s = int(windows[-1][1])
+                    cumul_var = time_dimension.CumulVar(index)
+                    cumul_var.SetRange(start_s, end_s)
+                    for current_window, next_window in zip(windows, windows[1:]):
+                        gap_start = int(current_window[1]) + 1
+                        gap_end = int(next_window[0]) - 1
+                        if gap_start <= gap_end:
+                            cumul_var.RemoveInterval(gap_start, gap_end)
                     applied_windows += 1
 
                 logger.info(f"✅ Работно време приложено за {applied_windows} клиента")
@@ -805,7 +819,7 @@ class ORToolsSolver:
         data['time_windows_enabled'] = self._time_windows_enabled()
         data['time_slack_max'] = 24 * 3600 if data['time_windows_enabled'] else 0
         data['time_windows'] = [None] * len(self.unique_depots) + [
-            self._customer_time_window_seconds(customer)
+            self._customer_time_windows_seconds(customer)
             for customer in self.customers
         ]
         
@@ -1012,15 +1026,7 @@ class ORToolsSolver:
         return f"{hours:02d}:{minutes:02d}"
 
     def _format_customer_time_window_for_schedule(self, customer: Customer) -> str:
-        window = self._customer_time_window_seconds(customer)
-        if not window:
-            return ""
-        if (
-            getattr(customer, "time_window_start_minutes", None) is None
-            and getattr(customer, "time_window_end_minutes", None) is None
-        ):
-            return "Постоянно"
-        return f"{self._format_schedule_time(window[0])}-{self._format_schedule_time(window[1])}"
+        return self._format_customer_time_windows_for_schedule(customer)
 
     def _build_route_schedule_entries(
         self,
@@ -1060,21 +1066,11 @@ class ORToolsSolver:
             cumulative_distance_m += distance_m
 
             raw_arrival_seconds = current_clock_seconds + travel_time_seconds
-            wait_seconds = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_seconds(customer)
-            if window:
-                window_start, window_end = window
-                if raw_arrival_seconds < window_start:
-                    wait_seconds = float(window_start - raw_arrival_seconds)
-                    time_window_status = "Изчакване"
-                arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
-                if arrival_after_wait_seconds > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait_seconds = raw_arrival_seconds
+            wait_seconds, time_window_status = self._time_window_status_for_arrival(
+                raw_arrival_seconds,
+                customer,
+            )
+            arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
 
             step_time_seconds = travel_time_seconds + wait_seconds + service_time_seconds
             total_time_seconds += step_time_seconds
@@ -1179,20 +1175,19 @@ class ORToolsSolver:
             total_time += travel_time
             current_clock_seconds += travel_time
 
-            window = self._customer_time_window_seconds(customer)
-            if window:
-                window_start, window_end = window
-                if current_clock_seconds < window_start:
-                    wait_seconds = window_start - current_clock_seconds
-                    total_time += wait_seconds
-                    current_clock_seconds += wait_seconds
-                elif current_clock_seconds > window_end:
-                    logger.debug(
-                        "Клиент %s е след работното време при преизчисление: %.1f мин > %.1f мин",
-                        customer.id,
-                        current_clock_seconds / 60,
-                        window_end / 60,
-                    )
+            wait_seconds, time_window_status = self._time_window_status_for_arrival(
+                current_clock_seconds,
+                customer,
+            )
+            if wait_seconds:
+                total_time += wait_seconds
+                current_clock_seconds += wait_seconds
+            elif time_window_status.startswith("След работно време"):
+                logger.debug(
+                    "Клиент %s е след работното време при преизчисление: %.1f мин",
+                    customer.id,
+                    current_clock_seconds / 60,
+                )
             
             # Service time за клиента (само за клиенти, не за депо)
             total_time += service_time_seconds
@@ -1468,23 +1463,46 @@ class ORToolsSolver:
         return max(0, minutes) * 60
 
     def _customer_time_window_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        return windows[0] if windows else None
+
+    def _customer_time_windows_seconds(self, customer: Customer) -> List[Tuple[int, int]]:
         if not self._time_windows_enabled():
+            return []
+
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return []
+
+        return time_windows_to_seconds(windows)
+
+    def _format_customer_time_windows_for_schedule(self, customer: Customer) -> str:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            if self._time_windows_enabled():
+                return "Постоянно"
+            return ""
+        return format_time_windows_minutes(windows)
+
+    def _time_window_status_for_arrival(
+        self,
+        arrival_seconds: float,
+        customer: Customer,
+    ) -> Tuple[float, str]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
+            return 0.0, ""
+
+        _, wait_seconds, window_index, status = choose_time_window_for_arrival(arrival_seconds, windows)
+        if status and len(windows) > 1 and window_index >= 0:
+            status = f"{status} (прозорец {window_index + 1})"
+        return wait_seconds, status
+
+    def _customer_time_window_domain_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes * 60, end_minutes * 60
+        return windows[0][0], windows[-1][1]
     
     def _create_empty_solution(self) -> CVRPSolution:
         """Създава празно решение в случай на грешка."""

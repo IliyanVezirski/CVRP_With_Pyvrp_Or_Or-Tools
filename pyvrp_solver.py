@@ -55,7 +55,13 @@ from config import (
     get_traffic_multiplier,
     get_traffic_zones,
 )
-from input_handler import Customer
+from input_handler import (
+    Customer,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
+    time_windows_to_seconds,
+)
 from osrm_client import DistanceMatrix
 from warehouse_manager import WarehouseAllocation
 from cvrp_solver import Route, CVRPSolution, calculate_distance_km
@@ -109,6 +115,8 @@ class PyVRPSolver:
         self.unique_depots = unique_depots
         self.center_zone_customers = center_zone_customers or []
         self.location_config = location_config
+        self._pyvrp_client_to_customer_idx: List[int] = []
+        self._pyvrp_location_matrix_indices: List[int] = []
 
     def _objective_metric(self) -> str:
         metric = str(getattr(self.config, "objective_metric", "distance") or "distance").strip().lower()
@@ -140,23 +148,46 @@ class PyVRPSolver:
         return max(0, minutes) * 60
 
     def _customer_time_window_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        return windows[0] if windows else None
+
+    def _customer_time_windows_seconds(self, customer: Customer) -> List[Tuple[int, int]]:
         if not self._time_windows_enabled():
+            return []
+
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return []
+
+        return time_windows_to_seconds(windows)
+
+    def _format_customer_time_windows_for_schedule(self, customer: Customer) -> str:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            if self._time_windows_enabled():
+                return "Постоянно"
+            return ""
+        return format_time_windows_minutes(windows)
+
+    def _time_window_status_for_arrival(
+        self,
+        arrival_seconds: float,
+        customer: Customer,
+    ) -> Tuple[float, str]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
+            return 0.0, ""
+
+        _, wait_seconds, window_index, status = choose_time_window_for_arrival(arrival_seconds, windows)
+        if status and len(windows) > 1 and window_index >= 0:
+            status = f"{status} (прозорец {window_index + 1})"
+        return wait_seconds, status
+
+    def _customer_time_window_domain_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes * 60, end_minutes * 60
+        return windows[0][0], windows[-1][1]
 
     def solve(self) -> CVRPSolution:
         """
@@ -273,6 +304,8 @@ class PyVRPSolver:
         
         # Всички локации (депа + клиенти) в списък за лесен достъп
         all_locations = []  # List of (depot/client objects)
+        self._pyvrp_client_to_customer_idx = []
+        self._pyvrp_location_matrix_indices = []
         
         # 1. Добавяме депа
         depot_objects = []  # За референция към depot обекти
@@ -284,6 +317,7 @@ class PyVRPSolver:
             depot_objects.append(depot)
             depot_to_obj[(lat, lon)] = depot
             all_locations.append(depot)
+            self._pyvrp_location_matrix_indices.append(i)
             logger.info(f"  - Depot {i}: ({lat}, {lon})")
 
         # 2. Определяме кои клиенти са в център зоната
@@ -341,34 +375,58 @@ class PyVRPSolver:
             
             # Проверяваме дали клиентът е в център зоната
             is_in_center = customer.id in center_zone_customer_ids
-            client_in_center.append(is_in_center)
             
             # Prize пропорционална на обема - по-големи клиенти са по-важни
             # Ако allow_dropping=False, клиентите са required=True
             client_prize = self._objective_penalty_cost(drop_penalties[idx]) if allow_dropping else 0
-            time_window = self._customer_time_window_seconds(customer)
-            time_window_kwargs = {}
-            if time_window:
-                time_window_kwargs = {
-                    "tw_early": int(time_window[0]),
-                    "tw_late": int(time_window[1]),
-                }
-            
-            # Model.add_client приема параметри директно
-            # delivery има 2 измерения: [volume, 1 stop]
-            client = model.add_client(
-                x=lon,
-                y=lat,
-                delivery=[delivery, 1],  # [volume, 1 спирка]
-                service_duration=service_duration_s,
-                prize=client_prize,
-                required=not allow_dropping,  # Ако allow_dropping=True, клиентите НЕ са required
-                name=f"Client_{customer.id}",
-                **time_window_kwargs,
+            time_windows = self._customer_time_windows_seconds(customer)
+            if not time_windows:
+                time_windows = [None]
+
+            client_group = None
+            use_alternatives = len(time_windows) > 1
+            if use_alternatives:
+                client_group = model.add_client_group(
+                    required=not allow_dropping,
+                    name=f"ClientGroup_{customer.id}",
+                )
+
+            for window_idx, time_window in enumerate(time_windows):
+                time_window_kwargs = {}
+                if time_window:
+                    time_window_kwargs = {
+                        "tw_early": int(time_window[0]),
+                        "tw_late": int(time_window[1]),
+                    }
+
+                # Model.add_client приема параметри директно.
+                # При няколко прозореца създаваме алтернативни клиенти в mutually exclusive group.
+                client = model.add_client(
+                    x=lon,
+                    y=lat,
+                    delivery=[delivery, 1],  # [volume, 1 спирка]
+                    service_duration=service_duration_s,
+                    prize=client_prize,
+                    required=(not allow_dropping and not use_alternatives),
+                    group=client_group,
+                    name=f"Client_{customer.id}_tw{window_idx + 1}",
+                    **time_window_kwargs,
+                )
+                client_objects.append(client)
+                all_locations.append(client)
+                client_in_center.append(is_in_center)
+                self._pyvrp_client_to_customer_idx.append(idx)
+                self._pyvrp_location_matrix_indices.append(len(self.unique_depots) + idx)
+
+            logger.debug(
+                "  - Client %s: ID=%s, volume=%s, center=%s, prize=%s, windows=%s",
+                idx,
+                customer.id,
+                delivery,
+                is_in_center,
+                client_prize,
+                len(time_windows) if time_windows != [None] else 0,
             )
-            client_objects.append(client)
-            all_locations.append(client)
-            logger.debug(f"  - Client {idx}: ID={customer.id}, volume={delivery}, center={is_in_center}, prize={client_prize}")
 
         # 4. Създаваме профил за всеки тип бус, за да има точен service time.
         def profile_signature(v_config: VehicleConfig):
@@ -435,15 +493,16 @@ class PyVRPSolver:
         # Настройки за градски трафик
         traffic_zones = get_traffic_zones(self.location_config)
         location_coords = []
-        for loc_idx in range(num_locations):
-            if loc_idx < num_depots:
-                coords = self.unique_depots[loc_idx]
+        for loc_idx, matrix_idx in enumerate(self._pyvrp_location_matrix_indices):
+            if matrix_idx < len(self.unique_depots):
+                coords = self.unique_depots[matrix_idx]
             else:
-                client_idx = loc_idx - num_depots
-                if client_idx < len(self.customers):
-                    coords = self.customers[client_idx].coordinates or (0, 0)
-                else:
-                    coords = (0, 0)
+                client_idx = matrix_idx - len(self.unique_depots)
+                coords = (
+                    self.customers[client_idx].coordinates
+                    if 0 <= client_idx < len(self.customers) and self.customers[client_idx].coordinates
+                    else (0, 0)
+                )
             location_coords.append(coords)
 
         if traffic_zones:
@@ -464,8 +523,10 @@ class PyVRPSolver:
                     continue
                 
                 # Базово разстояние и време от OSRM матрицата
-                base_distance = int(self.distance_matrix.distances[i][j])
-                duration = int(self.distance_matrix.durations[i][j])
+                matrix_i = self._pyvrp_location_matrix_indices[i]
+                matrix_j = self._pyvrp_location_matrix_indices[j]
+                base_distance = int(self.distance_matrix.distances[matrix_i][matrix_j])
+                duration = int(self.distance_matrix.durations[matrix_i][matrix_j])
                 
                 # Прилагаме множител за градски трафик ако отсечката попада в активна зона.
                 traffic_multiplier = get_traffic_multiplier(
@@ -663,8 +724,9 @@ class PyVRPSolver:
                 
                 # Tova e klient
                 client_idx = visit_idx - num_depots
-                if client_idx < len(self.customers):
-                    customer = self.customers[client_idx]
+                if 0 <= client_idx < len(self._pyvrp_client_to_customer_idx):
+                    original_customer_idx = self._pyvrp_client_to_customer_idx[client_idx]
+                    customer = self.customers[original_customer_idx]
                     route_customers.append(customer)
                     dropped_customers.discard(customer.id)
                     route_volume += customer.volume if hasattr(customer, 'volume') and customer.volume else 0
@@ -807,15 +869,7 @@ class PyVRPSolver:
         return f"{hours:02d}:{minutes:02d}"
 
     def _format_customer_time_window_for_schedule(self, customer: Customer) -> str:
-        window = self._customer_time_window_seconds(customer)
-        if not window:
-            return ""
-        if (
-            getattr(customer, "time_window_start_minutes", None) is None
-            and getattr(customer, "time_window_end_minutes", None) is None
-        ):
-            return "Постоянно"
-        return f"{self._format_schedule_time(window[0])}-{self._format_schedule_time(window[1])}"
+        return self._format_customer_time_windows_for_schedule(customer)
 
     def _build_route_schedule_entries(
         self,
@@ -855,21 +909,11 @@ class PyVRPSolver:
             cumulative_distance_m += distance_m
 
             raw_arrival_seconds = current_clock_seconds + travel_time_seconds
-            wait_seconds = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_seconds(customer)
-            if window:
-                window_start, window_end = window
-                if raw_arrival_seconds < window_start:
-                    wait_seconds = float(window_start - raw_arrival_seconds)
-                    time_window_status = "Изчакване"
-                arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
-                if arrival_after_wait_seconds > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait_seconds = raw_arrival_seconds
+            wait_seconds, time_window_status = self._time_window_status_for_arrival(
+                raw_arrival_seconds,
+                customer,
+            )
+            arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
 
             step_time_seconds = travel_time_seconds + wait_seconds + service_time_seconds
             total_time_seconds += step_time_seconds
@@ -988,20 +1032,16 @@ class PyVRPSolver:
             total_time += travel_time
             current_clock_s += travel_time
 
-            time_window = self._customer_time_window_seconds(customer)
-            if time_window:
-                window_start, window_end = time_window
-                if current_clock_s < window_start:
-                    wait_time = window_start - current_clock_s
-                    total_time += wait_time
-                    current_clock_s += wait_time
-                elif current_clock_s > window_end:
-                    logger.debug(
-                        "Клиент %s е след работното време при PyVRP метрики: %.1f мин > %.1f мин",
-                        customer.id,
-                        current_clock_s / 60,
-                        window_end / 60,
-                    )
+            wait_time, time_window_status = self._time_window_status_for_arrival(current_clock_s, customer)
+            if wait_time:
+                total_time += wait_time
+                current_clock_s += wait_time
+            elif time_window_status.startswith("След работно време"):
+                logger.debug(
+                    "Клиент %s е след работното време при PyVRP метрики: %.1f мин",
+                    customer.id,
+                    current_clock_s / 60,
+                )
 
             total_time += service_time_s  # vehicle-specific service time
             current_clock_s += service_time_s

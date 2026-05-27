@@ -22,8 +22,12 @@ from input_handler import (
     Customer,
     GPSParser,
     _safe_delivery_comment,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
     parse_time_value_to_minutes,
-    safe_parse_time_window_value,
+    safe_parse_time_window_values,
+    time_windows_to_seconds,
 )
 from osrm_client import DistanceMatrix, OSRMClient
 from output_handler import InteractiveMapGenerator, OutputHandler
@@ -296,7 +300,8 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
             record,
             *_tsp_field_names(config, "tsp_customer_work_time_field", _CUSTOMER_WORK_TIME_KEYS),
         )
-        tw_start, tw_end = safe_parse_time_window_value(raw_work_time, f" за TSP клиент {customer_id}")
+        time_windows = safe_parse_time_window_values(raw_work_time, f" за TSP клиент {customer_id}")
+        tw_start, tw_end = time_windows[0] if time_windows else (None, None)
         comment = _safe_delivery_comment(
             _first_present(record, *_tsp_field_names(config, "tsp_customer_comment_field", _CUSTOMER_COMMENT_KEYS)),
             f" за TSP клиент {customer_id}",
@@ -314,6 +319,7 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
             document=order_no,
             time_window_start_minutes=tw_start,
             time_window_end_minutes=tw_end,
+            time_windows=time_windows,
             delivery_comment=comment,
         )
         setattr(customer, "quantity", quantity)
@@ -458,15 +464,12 @@ def _greedy_step_score(
     base = _matrix_cost(matrix, current_node, next_node, metric)
     travel_seconds = _safe_matrix_value(matrix.durations, current_node, next_node)
     arrival_seconds = current_clock_seconds + travel_seconds
-    tw_start = getattr(customer, "time_window_start_minutes", None)
-    tw_end = getattr(customer, "time_window_end_minutes", None)
-    if tw_start is None and tw_end is None:
+    windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+    if not windows:
         return base
 
-    start_seconds = 0 if tw_start is None else int(tw_start) * 60
-    end_seconds = 1439 * 60 if tw_end is None else int(tw_end) * 60
-    wait_seconds = max(0.0, start_seconds - arrival_seconds)
-    late_seconds = max(0.0, arrival_seconds - end_seconds)
+    _, wait_seconds, _, status = choose_time_window_for_arrival(arrival_seconds, windows)
+    late_seconds = max(0.0, arrival_seconds - windows[-1][1]) if status == "След работно време" else 0.0
     return base + wait_seconds + late_seconds * 20
 
 
@@ -480,9 +483,10 @@ def _arrival_after_service_seconds(
 ) -> float:
     travel_seconds = _safe_matrix_value(matrix.durations, current_node, next_node)
     arrival_seconds = current_clock_seconds + travel_seconds
-    tw_start = getattr(customer, "time_window_start_minutes", None)
-    if tw_start is not None:
-        arrival_seconds = max(arrival_seconds, int(tw_start) * 60)
+    windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+    if windows:
+        _, wait_seconds, _, _ = choose_time_window_for_arrival(arrival_seconds, windows)
+        arrival_seconds += wait_seconds
     return arrival_seconds + service_time_minutes * 60
 
 
@@ -569,23 +573,11 @@ def _build_schedule_entries(
         cumulative_distance_m += distance_m
 
         raw_arrival_seconds = current_clock_seconds + travel_seconds
-        wait_seconds = 0.0
-        status = ""
-        tw_start = getattr(customer, "time_window_start_minutes", None)
-        tw_end = getattr(customer, "time_window_end_minutes", None)
-        if tw_start is not None or tw_end is not None:
-            start_seconds = 0 if tw_start is None else int(tw_start) * 60
-            end_seconds = 1439 * 60 if tw_end is None else int(tw_end) * 60
-            if raw_arrival_seconds < start_seconds:
-                wait_seconds = start_seconds - raw_arrival_seconds
-                status = "Изчакване"
-            arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
-            if arrival_after_wait_seconds > end_seconds:
-                status = "След работно време"
-            elif not status:
-                status = "OK"
-        else:
-            arrival_after_wait_seconds = raw_arrival_seconds
+        windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+        _, wait_seconds, window_index, status = choose_time_window_for_arrival(raw_arrival_seconds, windows)
+        if status and len(windows) > 1 and window_index >= 0:
+            status = f"{status} (прозорец {window_index + 1})"
+        arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
 
         current_clock_seconds = arrival_after_wait_seconds + service_time_minutes * 60
         total_time_seconds = current_clock_seconds - start_time_minutes * 60
@@ -626,13 +618,7 @@ def _build_schedule_entries(
 
 
 def _format_customer_time_window(customer: Customer) -> str:
-    start = getattr(customer, "time_window_start_minutes", None)
-    end = getattr(customer, "time_window_end_minutes", None)
-    if start is None and end is None:
-        return ""
-    start = 0 if start is None else int(start)
-    end = 1439 if end is None else int(end)
-    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+    return format_time_windows_minutes(customer_time_windows_minutes(customer))
 
 
 def _generate_tsp_map(config: MainConfig, route: Route, driver_id: str) -> str:

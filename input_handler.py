@@ -35,6 +35,7 @@ class Customer:
     source_id_skld: str = ""
     time_window_start_minutes: Optional[int] = None
     time_window_end_minutes: Optional[int] = None
+    time_windows: List[Tuple[int, int]] = field(default_factory=list)
     delivery_comment: str = ""
     grouped_documents: List[Dict[str, object]] = field(default_factory=list)
 
@@ -273,29 +274,64 @@ def _time_tokens_from_text(text: str) -> List[str]:
     return valid_compact
 
 
-def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
-    """Парсира работен прозорец от различни GET/Excel формати."""
+def _normalise_time_window_pair(start, end) -> Optional[Tuple[int, int]]:
+    if start is None or end is None:
+        return None
+
+    try:
+        start = int(start)
+        end = int(end)
+    except (TypeError, ValueError):
+        return None
+
+    if not (0 <= start <= 1439 and 0 <= end <= 1439):
+        return None
+    if start == end:
+        return None
+    return start, end
+
+
+def _dedupe_time_windows(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    unique: List[Tuple[int, int]] = []
+    seen = set()
+    for start, end in windows:
+        key = (int(start), int(end))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return sorted(unique, key=lambda item: (item[0], item[1] if item[1] >= item[0] else item[1] + 24 * 60))
+
+
+def parse_time_window_values(value) -> List[Tuple[Optional[int], Optional[int]]]:
+    """Parse one or more customer working windows from GET/Excel formats."""
     if _is_empty_value(value):
-        return None, None
+        return []
 
     if isinstance(value, dict):
         start = _record_value(value, "start", ("begin",))
         end = _record_value(value, "end", ("finish",))
         if start is not None or end is not None:
-            return parse_time_value_to_minutes(start), parse_time_value_to_minutes(end)
+            return [(parse_time_value_to_minutes(start), parse_time_value_to_minutes(end))]
         value = _record_value(value, "value", TIME_WINDOW_FIELD_ALIASES)
         if _is_empty_value(value):
-            return None, None
+            return []
 
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        first_start, first_end = parse_time_window_value(value[0])
-        if first_start is not None or first_end is not None:
-            return first_start, first_end
-        return parse_time_value_to_minutes(value[0]), parse_time_value_to_minutes(value[1])
+    if isinstance(value, (list, tuple)):
+        windows: List[Tuple[Optional[int], Optional[int]]] = []
+        for item in value:
+            windows.extend(parse_time_window_values(item))
+
+        if windows:
+            return windows
+
+        if len(value) >= 2:
+            return [(parse_time_value_to_minutes(value[0]), parse_time_value_to_minutes(value[1]))]
+        return []
 
     text = str(value).strip()
     if not text or text.lower() in ("nan", "none", "null", "-"):
-        return None, None
+        return []
 
     normalized = (
         text.replace("–", "-")
@@ -306,56 +342,129 @@ def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
 
     if re.fullmatch(r"\d{6,8}", normalized):
         half = len(normalized) // 2
-        return parse_time_value_to_minutes(normalized[:half]), parse_time_value_to_minutes(normalized[half:])
+        return [(parse_time_value_to_minutes(normalized[:half]), parse_time_value_to_minutes(normalized[half:]))]
 
     time_tokens = _time_tokens_from_text(normalized)
     if len(time_tokens) >= 2:
-        return parse_time_value_to_minutes(time_tokens[0]), parse_time_value_to_minutes(time_tokens[1])
+        return [
+            (parse_time_value_to_minutes(time_tokens[i]), parse_time_value_to_minutes(time_tokens[i + 1]))
+            for i in range(0, len(time_tokens) - 1, 2)
+        ]
 
     range_match = re.match(r"^\s*(.+?)\s*(?:-|до|to|/|;|,)\s*(.+?)\s*$", normalized, flags=re.IGNORECASE)
     if range_match:
         start = parse_time_value_to_minutes(range_match.group(1))
         end = parse_time_value_to_minutes(range_match.group(2))
-        return start, end
+        return [(start, end)]
 
-    return None, None
+    return []
+
+
+def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
+    """Парсира работен прозорец от различни GET/Excel формати."""
+    windows = parse_time_window_values(value)
+    if not windows:
+        return None, None
+    return windows[0]
+
+
+def safe_parse_time_window_values(value, context: str = "") -> List[Tuple[int, int]]:
+    """Parse and validate all customer time windows. Invalid values are ignored."""
+    if _is_empty_value(value):
+        return []
+
+    try:
+        raw_windows = parse_time_window_values(value)
+    except Exception as exc:
+        logger.warning("Игнорирам невалидно работно време%s: %r (%s)", context, value, exc)
+        return []
+
+    if not raw_windows:
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return []
+
+    windows: List[Tuple[int, int]] = []
+    invalid_count = 0
+    for start, end in raw_windows:
+        normalised = _normalise_time_window_pair(start, end)
+        if normalised is None:
+            invalid_count += 1
+            continue
+        windows.append(normalised)
+
+    windows = _dedupe_time_windows(windows)
+    if not windows:
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return []
+    if invalid_count:
+        logger.warning(
+            "Игнорирам %s невалидни части от работно време%s: %r",
+            invalid_count,
+            context,
+            value,
+        )
+    return windows
 
 
 def safe_parse_time_window_value(value, context: str = "") -> Tuple[Optional[int], Optional[int]]:
-    """Parse and validate one customer time window. Invalid values are ignored."""
-    if _is_empty_value(value):
+    """Parse and validate the first customer time window. Invalid values are ignored."""
+    windows = safe_parse_time_window_values(value, context)
+    if not windows:
         return None, None
+    return windows[0]
 
-    try:
-        start, end = parse_time_window_value(value)
-    except Exception as exc:
-        logger.warning("Игнорирам невалидно работно време%s: %r (%s)", context, value, exc)
-        return None, None
 
-    if start is None and end is None:
-        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
-        return None, None
+def customer_time_windows_minutes(customer: Customer) -> List[Tuple[int, int]]:
+    windows = getattr(customer, "time_windows", None) or []
+    normalised = [
+        window
+        for window in (_normalise_time_window_pair(start, end) for start, end in windows)
+        if window is not None
+    ]
+    if normalised:
+        return _dedupe_time_windows(normalised)
 
-    if start is None or end is None:
-        logger.warning("Игнорирам непълно работно време%s: %r", context, value)
-        return None, None
+    start = getattr(customer, "time_window_start_minutes", None)
+    end = getattr(customer, "time_window_end_minutes", None)
+    fallback = _normalise_time_window_pair(start, end)
+    return [fallback] if fallback else []
 
-    try:
-        start = int(start)
-        end = int(end)
-    except (TypeError, ValueError):
-        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
-        return None, None
 
-    if not (0 <= start <= 1439 and 0 <= end <= 1439):
-        logger.warning("Игнорирам работно време извън 00:00-23:59%s: %r", context, value)
-        return None, None
+def format_time_windows_minutes(windows: List[Tuple[int, int]]) -> str:
+    def fmt(minutes: int) -> str:
+        minutes = int(minutes)
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
-    if start == end:
-        logger.warning("Игнорирам работно време с еднакви начало и край%s: %r", context, value)
-        return None, None
+    return "; ".join(f"{fmt(start)}-{fmt(end)}" for start, end in windows)
 
-    return start, end
+
+def time_windows_to_seconds(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    result = []
+    for start, end in windows:
+        start_s = max(0, int(start)) * 60
+        end_s = max(0, int(end)) * 60
+        if end_s < start_s:
+            end_s += 24 * 3600
+        result.append((start_s, end_s))
+    return sorted(result, key=lambda item: (item[0], item[1]))
+
+
+def choose_time_window_for_arrival(
+    arrival_seconds: float,
+    windows_seconds: List[Tuple[int, int]],
+) -> Tuple[Optional[Tuple[int, int]], float, int, str]:
+    """Return selected window, wait seconds, window index, and status for an arrival."""
+    if not windows_seconds:
+        return None, 0.0, -1, ""
+
+    for index, (start_s, end_s) in enumerate(windows_seconds):
+        if arrival_seconds <= end_s:
+            wait_seconds = max(0.0, float(start_s) - float(arrival_seconds))
+            if wait_seconds > 0:
+                return (start_s, end_s), wait_seconds, index, "Изчакване"
+            return (start_s, end_s), 0.0, index, "OK"
+
+    return windows_seconds[-1], 0.0, len(windows_seconds) - 1, "След работно време"
 
 
 def _unique_join(values: List[object], separator: str = "; ") -> str:
@@ -682,11 +791,8 @@ class InputHandler:
                 source_id_skld = str(record.get(skld_field, "")).strip()
                 tw_value = _record_value(record, tw_field, TIME_WINDOW_FIELD_ALIASES)
                 record_context = f" (JSON запис {idx}, клиент {client_id})"
-                tw_start, tw_end = (
-                    safe_parse_time_window_value(tw_value, record_context)
-                    if tw_value is not None
-                    else (None, None)
-                )
+                time_windows = safe_parse_time_window_values(tw_value, record_context) if tw_value is not None else []
+                tw_start, tw_end = time_windows[0] if time_windows else (None, None)
                 delivery_comment = _safe_delivery_comment(
                     _record_value(record, comment_field, DELIVERY_COMMENT_FIELD_ALIASES),
                     record_context,
@@ -705,6 +811,7 @@ class InputHandler:
                     source_id_skld=source_id_skld,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    time_windows=time_windows,
                     delivery_comment=delivery_comment,
                     grouped_documents=[
                         {
@@ -745,12 +852,14 @@ class InputHandler:
 
                 tw_start = None
                 tw_end = None
+                time_windows = []
                 tw_column = getattr(self.config, "time_window_column", "")
                 if tw_column and tw_column in row.index:
-                    tw_start, tw_end = safe_parse_time_window_value(
+                    time_windows = safe_parse_time_window_values(
                         row[tw_column],
                         f" (Excel ред {index}, клиент {client_id})",
                     )
+                    tw_start, tw_end = time_windows[0] if time_windows else (None, None)
                 delivery_comment = ""
                 comment_column = getattr(self.config, "delivery_comment_column", "")
                 if comment_column and comment_column in row.index:
@@ -770,6 +879,7 @@ class InputHandler:
                     document=document,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    time_windows=time_windows,
                     delivery_comment=delivery_comment,
                     grouped_documents=[
                         {
@@ -834,16 +944,13 @@ class InputHandler:
                 separator=" | ",
             )
 
-            if target.time_window_start_minutes is None and target.time_window_end_minutes is None:
+            target_windows = customer_time_windows_minutes(target)
+            customer_windows = customer_time_windows_minutes(customer)
+            if not target_windows and customer_windows:
                 target.time_window_start_minutes = customer.time_window_start_minutes
                 target.time_window_end_minutes = customer.time_window_end_minutes
-            elif (
-                (customer.time_window_start_minutes is not None or customer.time_window_end_minutes is not None)
-                and (
-                    target.time_window_start_minutes != customer.time_window_start_minutes
-                    or target.time_window_end_minutes != customer.time_window_end_minutes
-                )
-            ):
+                target.time_windows = list(customer_windows)
+            elif customer_windows and target_windows != customer_windows:
                 logger.warning(
                     "Клиент %s има различно работно време в няколко документа; "
                     "запазвам първото за общото посещение.",

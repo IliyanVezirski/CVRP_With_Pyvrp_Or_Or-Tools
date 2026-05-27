@@ -18,7 +18,13 @@ from urllib.parse import urlencode
 from config import get_config, OutputConfig, RoutingEngine, is_location_in_center_zone, get_center_zones
 from cvrp_solver import CVRPSolution, Route
 from warehouse_manager import WarehouseAllocation
-from input_handler import Customer
+from input_handler import (
+    Customer,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
+    time_windows_to_seconds,
+)
 from osrm_client import get_distance_matrix_from_central_cache
 
 try:
@@ -152,14 +158,8 @@ def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
         if customer is not None:
             if not item.get("delivery_comment"):
                 item["delivery_comment"] = getattr(customer, "delivery_comment", "")
-            raw_start = getattr(customer, "time_window_start_minutes", None)
-            raw_end = getattr(customer, "time_window_end_minutes", None)
-            if not item.get("time_window_text") and (raw_start is not None or raw_end is not None):
-                start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-                end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-                if end_minutes < start_minutes:
-                    end_minutes += 24 * 60
-                item["time_window_text"] = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}-{end_minutes // 60:02d}:{end_minutes % 60:02d}"
+            if not item.get("time_window_text"):
+                item["time_window_text"] = format_time_windows_minutes(customer_time_windows_minutes(customer))
         else:
             item.setdefault("delivery_comment", "")
 
@@ -892,41 +892,21 @@ class InteractiveMapGenerator:
     def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
         if not self._customer_time_windows_enabled():
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes, end_minutes
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return None
+        return windows[0]
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        raw_start = getattr(customer, "time_window_start_minutes", None)
-        raw_end = getattr(customer, "time_window_end_minutes", None)
-        if raw_start is None and raw_end is None:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
             if self._customer_time_windows_enabled():
                 return "Постоянно"
             return ""
-
-        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
+        return format_time_windows_minutes(windows)
 
     def _customer_has_declared_time_window(self, customer: Customer) -> bool:
-        return (
-            getattr(customer, "time_window_start_minutes", None) is not None
-            or getattr(customer, "time_window_end_minutes", None) is not None
-        )
+        return bool(customer_time_windows_minutes(customer))
 
     def _calculate_distance_between_points(
         self,
@@ -1007,22 +987,12 @@ class InteractiveMapGenerator:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            wait_minutes = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_minutes(customer)
-
-            if window:
-                window_start, window_end = window
-                if raw_arrival < window_start:
-                    wait_minutes = window_start - raw_arrival
-                    time_window_status = "Изчакване"
-                arrival_after_wait = raw_arrival + wait_minutes
-                if arrival_after_wait > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait = raw_arrival
+            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
+            wait_minutes = wait_seconds / 60
+            if time_window_status and len(windows) > 1 and window_index >= 0:
+                time_window_status = f"{time_window_status} (прозорец {window_index + 1})"
+            arrival_after_wait = raw_arrival + wait_minutes
 
             total_time_for_step = travel_time + wait_minutes + service_time_minutes
             cumulative_time += total_time_for_step
@@ -1138,10 +1108,7 @@ class InteractiveMapGenerator:
         customer = entry.get("customer")
         has_declared_window = bool(
             customer is not None
-            and (
-                getattr(customer, "time_window_start_minutes", None) is not None
-                or getattr(customer, "time_window_end_minutes", None) is not None
-            )
+            and customer_time_windows_minutes(customer)
         )
         if time_window_text and (has_declared_window or time_window_text != "Постоянно"):
             lines.append(f"<b>Работно време:</b> {html.escape(time_window_text)}")
@@ -4420,35 +4387,18 @@ class ExcelExporter:
     def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
         if not self._customer_time_windows_enabled():
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes, end_minutes
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return None
+        return windows[0]
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        raw_start = getattr(customer, "time_window_start_minutes", None)
-        raw_end = getattr(customer, "time_window_end_minutes", None)
-        if raw_start is None and raw_end is None:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
             if self._customer_time_windows_enabled():
                 return "Постоянно"
             return ""
-
-        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
+        return format_time_windows_minutes(windows)
 
     def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
         stored_entries = _stored_route_schedule_entries(route)
@@ -4479,22 +4429,12 @@ class ExcelExporter:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            wait_minutes = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_minutes(customer)
-
-            if window:
-                window_start, window_end = window
-                if raw_arrival < window_start:
-                    wait_minutes = window_start - raw_arrival
-                    time_window_status = "Изчакване"
-                arrival_after_wait = raw_arrival + wait_minutes
-                if arrival_after_wait > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait = raw_arrival
+            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
+            wait_minutes = wait_seconds / 60
+            if time_window_status and len(windows) > 1 and window_index >= 0:
+                time_window_status = f"{time_window_status} (прозорец {window_index + 1})"
+            arrival_after_wait = raw_arrival + wait_minutes
 
             total_time_for_step = travel_time + wait_minutes + service_time_minutes
             cumulative_time += total_time_for_step
