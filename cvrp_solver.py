@@ -815,7 +815,7 @@ class ORToolsSolver:
         logger.info("--- СЪЗДАВАНЕ НА DATA MODEL (СТРИКТЕН РЕЖИМ) ---")
         data = {}
         data['distance_matrix'] = self.distance_matrix.distances
-        data['demands'] = [0] * len(self.unique_depots) + [int(c.volume * 100) for c in self.customers]
+        data['demands'] = [0] * len(self.unique_depots) + [int(round(float(c.volume or 0) * 100)) for c in self.customers]
         data['time_windows_enabled'] = self._time_windows_enabled()
         data['time_slack_max'] = 24 * 3600 if data['time_windows_enabled'] else 0
         data['time_windows'] = [None] * len(self.unique_depots) + [
@@ -905,7 +905,7 @@ class ORToolsSolver:
                         vratza_bus_vehicle_ids.append(vehicle_id)
                     
                     # 1. Обем (Capacity) - стриктно
-                    vehicle_capacities.append(int(v_config.capacity * 100))
+                    vehicle_capacities.append(int(round(float(v_config.capacity or 0) * 100)))
                     
                     # 2. Разстояние (Distance) - стриктно
                     max_dist = int(v_config.max_distance_km * 1000) if v_config.max_distance_km else 999999999
@@ -2099,7 +2099,7 @@ class ORToolsSolver:
         
         # Demands - депо има 0, клиенти имат реални стойности
         # Конвертираме обемите към цели числа с по-голям мащаб за по-висока прецизност
-        data['demands'] = [0] + [max(1, int(c.volume * SCALE_FACTOR)) for c in self.customers]
+        data['demands'] = [0] + [max(1, int(round(float(c.volume or 0) * SCALE_FACTOR))) for c in self.customers]
         
         # Добавяме подробна информация за дебъг
         total_demand = sum(data['demands'])
@@ -2112,7 +2112,7 @@ class ORToolsSolver:
         for v_config in self.vehicle_configs:
             if v_config.enabled:
                 # Скалираме капацитета в СЪЩИЯ мащаб като изискванията
-                capacity = int(v_config.capacity * SCALE_FACTOR)
+                capacity = int(round(float(v_config.capacity or 0) * SCALE_FACTOR))
                 logger.info(f"🚚 Превозно средство {v_config.vehicle_type.value}: капацитет {v_config.capacity} → {capacity} (scaled)")
                 for _ in range(v_config.count):
                     data['vehicle_capacities'].append(capacity)

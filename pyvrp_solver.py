@@ -371,7 +371,7 @@ class PyVRPSolver:
             lat, lon = customer.coordinates if customer.coordinates else (0, 0)
             
             # Определяме delivery (обем на клиента)
-            delivery = int(customer.volume * 100) if hasattr(customer, 'volume') and customer.volume else 1
+            delivery = int(round(float(customer.volume or 0) * 100)) if hasattr(customer, 'volume') and customer.volume else 1
             
             # Проверяваме дали клиентът е в център зоната
             is_in_center = customer.id in center_zone_customer_ids
@@ -609,7 +609,7 @@ class PyVRPSolver:
             end_depot = resolve_depot(getattr(v_config, "end_location", None), start_depot, v_config.vehicle_type.value)
 
             # Преобразуваме ограниченията
-            capacity = int(v_config.capacity * 100)
+            capacity = int(round(float(v_config.capacity or 0) * 100))
             max_distance = int(v_config.max_distance_km * 1000) if v_config.max_distance_km else constants.MAX_VALUE
             if self._objective_metric() == "time":
                 max_distance = constants.MAX_VALUE

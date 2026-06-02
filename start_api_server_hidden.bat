@@ -3,6 +3,8 @@ set "APP_DIR=%~dp0"
 cd /d "%APP_DIR%"
 set "PYINSTALLER_RESET_ENVIRONMENT=1"
 set "_MEIPASS2="
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
 if exist "%APP_DIR%CVRP_Optimizer.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%CVRP_Optimizer.exe' -ArgumentList '--server' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%APP_DIR%logs\api_server_stdout.log' -RedirectStandardError '%APP_DIR%logs\api_server_stderr.log'"

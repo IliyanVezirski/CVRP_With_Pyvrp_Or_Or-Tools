@@ -465,8 +465,22 @@ date / json_override_date             -> input.json_override_date
 sklad / json_sklad                    -> input.json_sklad
 done_flag / json_done_flag            -> input.json_done_flag
 group_customer_documents              -> input.enable_customer_document_grouping
+tsp_service_time_minutes              -> api.tsp_default_service_time_minutes
+tsp_metric / tsp_optimize_by          -> api.tsp_objective_metric
+tsp_time_windows                      -> api.tsp_use_time_windows
+tsp_wait_weight                       -> api.tsp_time_window_wait_weight
+tsp_late_weight                       -> api.tsp_time_window_late_weight
+tsp_two_opt                           -> api.tsp_enable_two_opt
+tsp_two_opt_max_passes                -> api.tsp_two_opt_max_passes
+tsp_generate_map                      -> api.tsp_generate_html_map
+tsp_generate_local_html               -> api.tsp_generate_html_map
+tsp_local_html                        -> api.tsp_generate_html_map
+tsp_upload_map                        -> api.tsp_upload_html_map
+tsp_worker_timeout                    -> api.tsp_worker_timeout_seconds
+tsp_daily_report                      -> api.tsp_daily_report_enabled
+tsp_daily_report_time                 -> api.tsp_daily_report_time
                 """,
-                17,
+                31,
             ),
             (
                 "Solver настройки:",
@@ -3881,7 +3895,7 @@ setData не трябва да се пуска:
             quick,
             r,
             "Текущ TSP:",
-            f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"driver_id\\":\\"1004501001\\",\\"driver_location\\":\\"42.6977,23.3219\\",\\"end_location\\":\\"42.7000,23.4000\\",\\"customers\\":[...]}}"',
+            f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"driver_id\\":\\"1004501001\\",\\"driver_location\\":\\"42.6977,23.3219\\",\\"end_location\\":\\"42.7000,23.4000\\",\\"service_time_minutes\\":8,\\"customers\\":[{{\\"id\\":\\"1\\",\\"document\\":\\"0004384359\\",\\"gps\\":\\"42.6629,23.37682\\",\\"quantity\\":5}}]}}"',
             "Подрежда текущ маршрут за един шофьор от текущ GPS, optional крайна точка и списък клиенти; връща реда и генерира индивидуална карта.",
         )
         r = self._add_copyable_command(
@@ -3955,8 +3969,60 @@ setData не трябва да се пуска:
                         tooltip="GET/POST без body. Стартира програмата във фонова нишка."); r += 1
         self._add_field(endpoints, r, "api.tsp_endpoint", "Текущ TSP:", getattr(api, "tsp_endpoint", "/tsp"),
                         tooltip="POST. Подрежда текущ маршрут за един шофьор с текуща GPS позиция и optional крайна точка."); r += 1
+        self._add_field(endpoints, r, "api.tsp_report_endpoint", "TSP отчет:", getattr(api, "tsp_report_endpoint", "/tsp-report"),
+                        tooltip="GET/POST. Генерира Excel отчет за TSP маршрутите за деня."); r += 1
+        self._add_field(endpoints, r, "api.shutdown_endpoint", "Спиране:", getattr(api, "shutdown_endpoint", "/shutdown"),
+                        tooltip="GET/POST. Спира API сървъра/програмата. Ползвай API key при отдалечен достъп."); r += 1
         self._add_field(endpoints, r, "api.health_endpoint", "Статус:", getattr(api, "health_endpoint", "/health"),
                         tooltip="GET. Проверка дали API-то е живо и дали има активен run."); r += 1
+
+        tsp_optimization, r = self._add_group(
+            f,
+            "TSP оптимизация",
+            "Тези стойности управляват как /tsp подрежда текущ маршрут, когато POST заявката не ги подаде.",
+        )
+        self._add_field(tsp_optimization, r, "api.tsp_objective_metric", "Цел:", getattr(api, "tsp_objective_metric", "time"),
+                        tooltip="time = най-кратко време, distance = най-къси километри. POST metric/objective има приоритет."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_default_service_time_minutes", "Обслужване (мин):", getattr(api, "tsp_default_service_time_minutes", 8), "int",
+                        tooltip="Default service_time_minutes за TSP. Ако POST подаде service_time_minutes, POST стойността има приоритет."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_use_time_windows", "Отчитай работно време:", getattr(api, "tsp_use_time_windows", True), "bool",
+                        tooltip="Ако е включено, TSP предпочита ред, който намалява чакането и закъсненията спрямо работното време."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_time_window_wait_weight", "Тежест чакане:", getattr(api, "tsp_time_window_wait_weight", 1.0), "float",
+                        tooltip="Колко силно чакането влияе на TSP подреждането. 0 = почти не го интересува чакането."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_time_window_late_weight", "Тежест закъснение:", getattr(api, "tsp_time_window_late_weight", 20.0), "float",
+                        tooltip="Колко силно закъснението след работно време влияе на TSP подреждането. По-високо = по-строго."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_enable_two_opt", "2-opt подобрение:", getattr(api, "tsp_enable_two_opt", True), "bool",
+                        tooltip="Прави допълнително локално подобрение след първоначалното greedy подреждане."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_two_opt_max_passes", "2-opt обходи:", getattr(api, "tsp_two_opt_max_passes", 30), "int",
+                        tooltip="Повече обходи могат леко да подобрят реда, но забавят TSP при много клиенти."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_worker_timeout_seconds", "Worker timeout (сек):", getattr(api, "tsp_worker_timeout_seconds", 30), "int",
+                        tooltip="Максимално време за отделния TSP процес, когато основният CVRP solver вече работи."); r += 1
+
+        tsp_html, r = self._add_group(
+            f,
+            "TSP HTML и upload",
+            "Тези настройки важат само за /tsp картите и не променят нормалните CVRP route карти.",
+        )
+        self._add_field(tsp_html, r, "api.tsp_generate_html_map", "Локална HTML карта:", getattr(api, "tsp_generate_html_map", True), "bool",
+                        tooltip="Само за /tsp. Ако е изключено, TSP връща JSON реда, но не създава локален HTML файл и няма какво да качи."); r += 1
+        self._add_field(tsp_html, r, "api.tsp_upload_html_map", "Качвай HTML карта:", getattr(api, "tsp_upload_html_map", True), "bool",
+                        tooltip="Само за /tsp. Качването използва Output -> Route maps upload URL/token, но се включва/изключва отделно от нормалните route карти."); r += 1
+
+        tsp_report, r = self._add_group(
+            f,
+            "TSP дневен Excel отчет",
+            "API сървърът записва всяка успешна /tsp заявка и може автоматично да генерира дневен Excel отчет в зададен час.",
+        )
+        self._add_field(tsp_report, r, "api.tsp_daily_report_enabled", "Автоматичен отчет:", getattr(api, "tsp_daily_report_enabled", False), "bool",
+                        tooltip="Ако е включено, API сървърът генерира TSP Excel отчет веднъж дневно в зададения час."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_time", "Час:", getattr(api, "tsp_daily_report_time", "18:00"),
+                        tooltip="Формат HH:MM, например 18:00."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_output_dir", "Папка за отчети:", getattr(api, "tsp_daily_report_output_dir", ""),
+                        tooltip="Ако е празно, използва Output -> Excel директория."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_history_file", "TSP дневник:", getattr(api, "tsp_daily_report_history_file", ""),
+                        tooltip="JSONL файл с история на /tsp маршрутите. Ако е празно, използва logs/tsp_routes_history.jsonl."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_include_details", "Лист с клиенти:", getattr(api, "tsp_daily_report_include_details", True), "bool",
+                        tooltip="Добавя подробен лист с всички клиенти/стопове към Excel отчета."); r += 1
 
         tsp_fields, r = self._add_group(
             f,
@@ -3977,8 +4043,8 @@ setData не трябва да се пуска:
                         tooltip="Пример: id,IdCust,customer_id."); r += 1
         self._add_field(tsp_fields, r, "api.tsp_customer_name_field", "Име клиент:", getattr(api, "tsp_customer_name_field", "name"),
                         tooltip="Пример: name,CustName,client_name."); r += 1
-        self._add_field(tsp_fields, r, "api.tsp_customer_order_field", "Номер поръчка:", getattr(api, "tsp_customer_order_field", "order"),
-                        tooltip="Пример: order,document,DocNo."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_order_field", "Номер документ:", getattr(api, "tsp_customer_order_field", "document"),
+                        tooltip="Пример: document,order,DocNo."); r += 1
         self._add_field(tsp_fields, r, "api.tsp_customer_gps_field", "GPS координати:", getattr(api, "tsp_customer_gps_field", "gps"),
                         tooltip="Пример: gps,GPS,coordinates,location."); r += 1
         self._add_field(tsp_fields, r, "api.tsp_customer_quantity_field", "Количество/стекове:", getattr(api, "tsp_customer_quantity_field", "quantity"),
@@ -4073,19 +4139,20 @@ POST {base_url}{tsp_path}
       "driver_id": "1004501001",
       "driver_location": "42.6977,23.3219",
       "end_location": "42.7000,23.4000",
-      "metric": "time",
       "service_time_minutes": 8,
-      "upload_map": true,
-      "customers": [{{"id":"1","name":"Клиент","order":"0004384359","gps":"42.6629,23.37682","work_time":"08:00-13:00","turnover":120.5,"quantity":5,"comment":"Обади се 10 мин преди доставка"}}]
+      "customers": [{{"id":"1","name":"Клиент","document":"0004384359","gps":"42.6629,23.37682","work_time":"08:00-13:00","turnover":120.5,"quantity":5,"comment":"Обади се 10 мин преди доставка"}}]
     }}
   Field names:
-    driver_id, driver_location, gps, work_time, quantity, turnover and comment
+    driver_id, driver_location, document, gps, work_time, quantity, turnover and comment
     are configurable in the "TSP полета във входната заявка" section.
+  Defaults:
+    Ако service_time_minutes липсва, /tsp използва "TSP оптимизация -> Обслужване (мин)".
+    Генерирането и качването на TSP HTML карта се управляват от отделните TSP checkbox-и в GUI.
   Връща:
-    driver_id, ред на доставка, ETA, общи км/минути, HTML карта и upload статус.
-    Ако upload_map=true и route_maps_upload_mode=effect_upload, картата се качва с pData2[]=driver_id.
+    driver_id, ред на доставка, ETA, общи км/минути, HTML карта и upload статус, ако картите са включени.
+    Ако route_maps_upload_mode=effect_upload, картата се качва с pData2[]=driver_id.
   Пример:
-    curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json" -d "{{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"customers\":[{{\"id\":\"1\",\"gps\":\"42.6629,23.37682\",\"quantity\":5}}]}}"
+    curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json" -d "{{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"service_time_minutes\":8,\"customers\":[{{\"id\":\"1\",\"document\":\"0004384359\",\"gps\":\"42.6629,23.37682\",\"quantity\":5}}]}}"
 
 POST {solve_path}?cmd=run
   За какво е:
@@ -4195,23 +4262,11 @@ POST {base_url}{tsp_path} - текущ TSP маршрут за един шофь
   "driver_id": "1004501001",
   "driver_location": "42.6977,23.3219",
   "end_location": "42.7000,23.4000",
-  "metric": "time",
   "service_time_minutes": 8,
-  "generate_map": true,
-  "upload_map": true,
   "customers": [
-    {{"id": "1", "name": "Клиент 1", "order": "0004384359", "gps": "42.6629,23.37682", "work_time": "08:00-13:00", "turnover": 120.50, "quantity": 5, "comment": "Обади се 10 мин преди доставка"}},
-    {{"id": "2", "name": "Клиент 2", "order": "0004385134", "gps": "42.66119,23.39272", "work_time": "16:00-18:00", "turnover": 80.00, "quantity": 3, "comment": ""}}
-  ],
-  "settings": {{
-    "routing": {{"engine": "osrm"}},
-    "output": {{
-      "routes_output_dir": "H:\\\\Hell_Bizant_files\\\\Routes",
-      "route_maps_upload_mode": "effect_upload",
-      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
-      "route_maps_upload_bus_id_field": "pData2[]"
-    }}
-  }}
+    {{"id": "1", "name": "Клиент 1", "document": "0004384359", "gps": "42.6629,23.37682", "work_time": "08:00-13:00", "turnover": 120.50, "quantity": 5, "comment": "Обади се 10 мин преди доставка"}},
+    {{"id": "2", "name": "Клиент 2", "document": "0004385134", "gps": "42.66119,23.39272", "work_time": "16:00-18:00", "turnover": 80.00, "quantity": 3, "comment": ""}}
+  ]
 }}
 
 TSP имената на полетата се настройват от GUI:
@@ -4704,7 +4759,24 @@ TSP имената на полетата се настройват от GUI:
             "api.api_endpoint": ("api_endpoint", "str"),
             "api.trigger_endpoint": ("trigger_endpoint", "str"),
             "api.tsp_endpoint": ("tsp_endpoint", "str"),
+            "api.tsp_report_endpoint": ("tsp_report_endpoint", "str"),
+            "api.shutdown_endpoint": ("shutdown_endpoint", "str"),
             "api.health_endpoint": ("health_endpoint", "str"),
+            "api.tsp_default_service_time_minutes": ("tsp_default_service_time_minutes", "int"),
+            "api.tsp_objective_metric": ("tsp_objective_metric", "str"),
+            "api.tsp_use_time_windows": ("tsp_use_time_windows", "bool"),
+            "api.tsp_time_window_wait_weight": ("tsp_time_window_wait_weight", "float"),
+            "api.tsp_time_window_late_weight": ("tsp_time_window_late_weight", "float"),
+            "api.tsp_enable_two_opt": ("tsp_enable_two_opt", "bool"),
+            "api.tsp_two_opt_max_passes": ("tsp_two_opt_max_passes", "int"),
+            "api.tsp_generate_html_map": ("tsp_generate_html_map", "bool"),
+            "api.tsp_upload_html_map": ("tsp_upload_html_map", "bool"),
+            "api.tsp_worker_timeout_seconds": ("tsp_worker_timeout_seconds", "int"),
+            "api.tsp_daily_report_enabled": ("tsp_daily_report_enabled", "bool"),
+            "api.tsp_daily_report_time": ("tsp_daily_report_time", "str"),
+            "api.tsp_daily_report_output_dir": ("tsp_daily_report_output_dir", "str"),
+            "api.tsp_daily_report_history_file": ("tsp_daily_report_history_file", "str"),
+            "api.tsp_daily_report_include_details": ("tsp_daily_report_include_details", "bool"),
             "api.tsp_driver_id_field": ("tsp_driver_id_field", "str"),
             "api.tsp_driver_name_field": ("tsp_driver_name_field", "str"),
             "api.tsp_driver_location_field": ("tsp_driver_location_field", "str"),

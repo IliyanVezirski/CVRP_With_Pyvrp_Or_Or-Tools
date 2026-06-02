@@ -134,6 +134,44 @@ def _clean_text_value(value) -> str:
     return str(value).strip()
 
 
+def _parse_volume_value(value, context: str = "") -> float:
+    """Parse stack volume while preserving decimal halves from Excel/HTTP input."""
+    if _is_empty_value(value):
+        return 0.0
+
+    if isinstance(value, bool):
+        raise ValueError(f"Невалиден обем{context}: {value!r}")
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isnan(number):
+            return 0.0
+        return number
+
+    text = str(value).strip().replace("\xa0", " ")
+    if not text:
+        return 0.0
+
+    compact = re.sub(r"\s+", "", text)
+    matches = re.findall(r"[-+]?\d+(?:[.,]\d+)*", compact)
+    if not matches:
+        raise ValueError(f"Невалиден обем{context}: {value!r}")
+    compact = matches[0]
+
+    if "," in compact and "." in compact:
+        if compact.rfind(",") > compact.rfind("."):
+            compact = compact.replace(".", "").replace(",", ".")
+        else:
+            compact = compact.replace(",", "")
+    elif "," in compact:
+        compact = compact.replace(",", ".")
+
+    try:
+        return float(compact)
+    except ValueError as exc:
+        raise ValueError(f"Невалиден обем{context}: {value!r}") from exc
+
+
 def _safe_delivery_comment(value, context: str = "") -> str:
     """Return a safe one-line delivery comment, or empty string for invalid values."""
     if _is_empty_value(value):
@@ -785,7 +823,10 @@ class InputHandler:
                 gps_data = str(record.get(gps_field, "")).strip()
                 client_id = str(record.get(id_field, "")).strip()
                 client_name = str(record.get(name_field, "")).strip()
-                volume = float(record.get(vol_field, 0))
+                volume = _parse_volume_value(
+                    record.get(vol_field, 0),
+                    f" (JSON запис {idx}, клиент {client_id})",
+                )
                 document = str(record.get(doc_field, "")).strip()
                 plas_doc = str(record.get(plas_doc_field, "")).strip()
                 source_id_skld = str(record.get(skld_field, "")).strip()
@@ -841,7 +882,10 @@ class InputHandler:
                 client_id = str(row[self.config.client_id_column]).strip()
                 client_name = str(row[self.config.client_name_column]).strip()
                 gps_data = str(row[self.config.gps_column]).strip()
-                volume = float(row[self.config.volume_column])
+                volume = _parse_volume_value(
+                    row[self.config.volume_column],
+                    f" (Excel ред {index}, клиент {client_id})",
+                )
                 
                 # Четем номер на документ/поръчка ако колоната съществува
                 document = ""

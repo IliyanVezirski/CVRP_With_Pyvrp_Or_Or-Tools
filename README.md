@@ -110,7 +110,7 @@ config.py / GUI
 PowerShell:
 
 ```powershell
-cd "C:\Programming\Bizant 2.0\cvrp-ortools-optimizer"
+cd "C:\CVRP_Optimizer"
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -568,10 +568,18 @@ Body може да бъде директен списък или wrapper:
 
 Началният час се взема автоматично от текущия час на машината. Може да се подаде ръчно чрез `start_time`, но нормалният режим е да не се подава.
 
+Ако POST заявката не подаде `service_time_minutes`, `/tsp` използва стойността от GUI: `API сървър -> TSP оптимизация -> Обслужване (мин)`. В същата секция се управляват TSP целта `time/distance`, работното време, 2-opt подобрението и тежестите за чакане/закъснение.
+
+Локалните HTML файлове за TSP се управляват само от `api.tsp_generate_html_map` или API alias `tsp_generate_map`/`tsp_local_html`. Това не спира нормалните CVRP route карти. Ако локалната TSP HTML карта е изключена, TSP пак връща JSON реда на доставка, но не създава файл и няма файл за upload.
+
+Ако в TSP заявката има няколко документа за един и същ клиент със същите GPS координати, `/tsp` използва същата настройка `input.enable_customer_document_grouping`. При включена настройка те стават едно посещение, количеството и оборотът се събират, а отделните документи се връщат в `delivery_order[].documents`.
+
+Всяка успешна `/tsp` заявка се записва в TSP дневник. От GUI може да се включи автоматичен дневен Excel отчет: `API сървър -> TSP дневен Excel отчет`. В зададения час API сървърът генерира `tsp_daily_report_YYYY-MM-DD.xlsx` с обобщение на всички TSP маршрути за деня и подробен лист с клиентите. Отчет може да се генерира и ръчно през `GET/POST /tsp-report`.
+
 Пример:
 
 ```cmd
-curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"1004501001\",\"driver_name\":\"HELL 1\",\"driver_location\":\"42.695785029219415,23.23165887245312\",\"end_location\":\"42.695785029219415,23.23165887245312\",\"metric\":\"time\",\"service_time_minutes\":8,\"generate_map\":true,\"upload_map\":true,\"customers\":[{\"id\":\"1005487516\",\"name\":\"А И А ТРЕЙД ООД\",\"order\":\"0004384359\",\"quantity\":8,\"turnover\":245.50,\"gps\":\"42.67973749002523,23.324913047254086\",\"work_time\":\"08:00-13:00\",\"comment\":\"Вход откъм булеварда. Обади се 10 мин. преди доставка.\"}]}"
+curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"BUS001\",\"driver_location\":\"42.7000,23.3000\",\"end_location\":\"42.7000,23.3000\",\"service_time_minutes\":8,\"customers\":[{\"id\":\"C001\",\"name\":\"Client 001\",\"document\":\"DOC001\",\"quantity\":8,\"turnover\":245.50,\"gps\":\"42.7100,23.3200\",\"work_time\":\"08:00-13:00\",\"comment\":\"Обади се 10 мин. преди доставка.\"}]}"
 ```
 
 Имената на TSP полетата се настройват от GUI. Така може външната система да изпраща например `Coord` вместо `gps` или `DriverNote` вместо `comment`.
@@ -614,7 +622,7 @@ curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"dri
     },
     "output": {
       "enable_excel_output": true,
-      "routes_output_dir": "H:\\Hell_Bizant_files\\Routes"
+      "routes_output_dir": "D:\\CVRP_Output\\Routes"
     }
   }
 }
@@ -657,7 +665,7 @@ curl "http://IP:8088/health"
 При `effect_upload` се изпраща multipart POST:
 
 - token поле, по подразбиране `pData`;
-- token стойност, по подразбиране `Effect-Bizante-Token`;
+- token стойност от настройките;
 - файлове в `files[]`;
 - ID на буса в `pData2[]`, подредено в същия ред като файловете.
 
@@ -741,7 +749,7 @@ Build-ът създава `CVRP_Optimizer.exe` в `..\dist`.
 Новият GET адрес се настройва от GUI и използва:
 
 ```text
-http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&DoneFlag=1973
+https://YOUR-DATA-SERVER/PATH?cmd=getData&Date=YYYY-MM-DD&Sklad=106&DoneFlag=1973
 ```
 
 Датата остава автоматична, ако не е зададена ръчно. Полетата, които се четат от отговора, са:
@@ -770,15 +778,45 @@ POST http://IP:8088/solve
 GET  http://IP:8088/run
 POST http://IP:8088/run
 POST http://IP:8088/tsp
+GET  http://IP:8088/tsp-report
+GET  http://IP:8088/shutdown
 ```
 
 `/solve` приема JSON клиенти и връща резултата след решаване. `/run` не очаква входни данни: само стартира оптимизацията с текущата конфигурация и връща веднага `202 started`. Ако вече има активен run, връща `409 already_running`.
 
-`/tsp` е отделен режим за текущ маршрут на един шофьор. Той приема `driver_id`, текуща GPS позиция `driver_location`, optional `end_location`, клиенти, работно време, оборот, количество, номер на поръчка и коментар. Връща реда на доставка, ETA данни, генерира индивидуална HTML карта и при upload изпраща `pData2[]=driver_id` заедно с HTML файла.
+`/tsp` е отделен режим за текущ маршрут на един шофьор. Той приема `driver_id`, текуща GPS позиция `driver_location`, optional `end_location`, клиенти, работно време, оборот, количество, номер на документ и коментар. Връща реда на доставка, ETA данни, генерира индивидуална HTML карта и при upload изпраща `pData2[]=driver_id` заедно с HTML файла.
+
+Default service time и настройките за TSP подреждане се настройват в GUI: `API сървър -> TSP оптимизация`. Генерирането и качването на TSP HTML карта са отделно в `API сървър -> TSP HTML и upload`. Ако POST подаде `service_time_minutes`, `metric`, `tsp_local_html` или друга TSP настройка, тя има приоритет само за конкретната заявка.
+
+TSP дневният Excel отчет се настройва отделно в GUI. Полетата са: включено/изключено, час на отчета, папка за отчети, файл на TSP дневника и дали да има подробен лист с клиентите. Ръчно генериране за текущия ден:
+
+```cmd
+curl "http://IP:8088/tsp-report"
+```
+
+За конкретна дата:
+
+```cmd
+curl "http://IP:8088/tsp-report?date=2026-05-29"
+```
+
+Спиране на API сървъра/програмата:
+
+```cmd
+curl "http://IP:8088/shutdown"
+```
+
+Алтернативно:
+
+```cmd
+curl "http://IP:8088/solve?cmd=shutdown"
+```
+
+Ако API-то е достъпно от мрежата, задължително задай `api.api_key`, защото `/shutdown` е remote stop команда.
 
 Адресът за извикване не е хардкоднат само за TSP. Всички API примери използват общия адрес от `api.api_public_url`, а ако той е празен, сървърът/GUI-то показват автоматично засечения IP адрес на машината и `api.api_port`.
 
-Имената на TSP полетата се настройват в GUI: `API сървър -> TSP полета във входната заявка`. Така външна система може да изпраща например `Coord` вместо `gps`, `OrderNumber` вместо `order` или `DriverNote` вместо `comment`, без да се променя кодът. Може да се зададат и няколко имена със запетая:
+Имената на TSP полетата се настройват в GUI: `API сървър -> TSP полета във входната заявка`. Така външна система може да изпраща например `Coord` вместо `gps`, `DocNo` вместо `document` или `DriverNote` вместо `comment`, без да се променя кодът. Може да се зададат и няколко имена със запетая:
 
 ```text
 gps,GPS,Coord,coordinates
@@ -800,9 +838,9 @@ cmd=start_program
 Пример:
 
 ```cmd
-curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
-curl "http://10.10.100.134:8088/run"
-curl -X POST "http://10.10.100.134:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"metric\":\"time\",\"customers\":[{\"id\":\"C001\",\"name\":\"Client 001\",\"order\":\"0004384359\",\"gps\":\"42.6629,23.37682\",\"work_time\":\"08:00-13:00\",\"turnover\":120.5,\"quantity\":5,\"comment\":\"Обади се 10 мин преди доставка\"}]}"
+curl -X POST "http://IP:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
+curl "http://IP:8088/run"
+curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"driver_id\":\"BUS001\",\"driver_location\":\"42.7000,23.3000\",\"end_location\":\"42.7000,23.3000\",\"service_time_minutes\":8,\"customers\":[{\"id\":\"C001\",\"name\":\"Client 001\",\"document\":\"DOC001\",\"gps\":\"42.7100,23.3200\",\"work_time\":\"08:00-13:00\",\"turnover\":120.5,\"quantity\":5,\"comment\":\"Обади се 10 мин преди доставка\"}]}"
 ```
 
 След една заявка API сървърът не спира. Той връща резултат и остава да чака следваща заявка.
@@ -874,7 +912,7 @@ Build-ът включва основната програма, Settings GUI, API
 - `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
 - Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
 - `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
-- Индивидуалните route HTML карти по подразбиране се качват към `https://effect.bg/dragon/hellbizante/upload-files.php` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
+- Индивидуалните route HTML карти могат да се качват към URL от настройката `output.route_maps_upload_url` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
 - OR-Tools използва предварително сметнати vehicle cost матрици за по-малко Python callback overhead.
 - PyVRP компресира еднаквите профили, без да губи различните депа на бусовете.
 - При Excel вход Враца бусовете не се изключват автоматично само защото липсва `IdSkld`; тази автоматична филтрация важи само за HTTP JSON вход.
@@ -882,7 +920,7 @@ Build-ът включва основната програма, Settings GUI, API
 ### Пример `/run` с настройки
 
 ```powershell
-curl -X POST "http://IP:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
+curl -X POST "http://IP:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"D:\\\\CVRP_Output\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://YOUR-UPLOAD-SERVER/upload-files.php\",\"route_maps_upload_token\":\"YOUR_UPLOAD_TOKEN\"}}}"
 ```
 
 Замени `IP` с адреса, който GUI-то показва в таб `API сървър`, или виж `public_url` от `GET /health`.
@@ -919,11 +957,11 @@ curl -X POST "http://IP:8088/run" -H "Content-Type: application/json" -d "{\"ret
 ```json
 {
   "vehicle_type": "internal_bus",
-  "name": "HELL 1",
+  "name": "Бус 1",
   "count": 1,
   "capacity": 385,
-  "start_location": [42.695785, 23.231659],
-  "end_location": [42.700000, 23.400000]
+  "start_location": [42.700000, 23.300000],
+  "end_location": [42.710000, 23.320000]
 }
 ```
 

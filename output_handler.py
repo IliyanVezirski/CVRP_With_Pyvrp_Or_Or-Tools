@@ -78,6 +78,12 @@ def _safe_filename_stem(value: str, fallback: str) -> str:
     cleaned = " ".join(cleaned.split()).strip(" .")
     return cleaned or fallback
 
+
+def _html_comment_safe(value: object) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = " ".join(text.split())
+    return text.replace("--", "- -")
+
 # Настройки за различните типове превозни средства
 VEHICLE_SETTINGS = {
     'internal_bus': {
@@ -904,6 +910,43 @@ class InteractiveMapGenerator:
                 return "Постоянно"
             return ""
         return format_time_windows_minutes(windows)
+
+    def _customer_document_text(self, customer: Customer) -> str:
+        documents = []
+        for item in getattr(customer, "grouped_documents", None) or []:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("document") or item.get("order") or item.get("order_no") or "").strip()
+            if value and value not in documents:
+                documents.append(value)
+
+        for attr_name in ("document", "order_no", "order"):
+            value = str(getattr(customer, attr_name, "") or "").strip()
+            if value and value not in documents:
+                documents.append(value)
+
+        return ", ".join(documents)
+
+    def _route_delivery_order_html_comment(self, route: Route, route_number: int) -> str:
+        lines = [
+            "CVRP_ROUTE_DELIVERY_ORDER",
+            f"route_number={_html_comment_safe(route_number)}",
+            f"vehicle={_html_comment_safe(_route_vehicle_name(route))}",
+            "delivery_order | customer_id | customer_name | document | delivery_comment",
+        ]
+
+        for delivery_order, customer in enumerate(route.customers, start=1):
+            lines.append(
+                " | ".join([
+                    _html_comment_safe(delivery_order),
+                    _html_comment_safe(getattr(customer, "id", "")),
+                    _html_comment_safe(getattr(customer, "name", "")),
+                    _html_comment_safe(self._customer_document_text(customer)),
+                    _html_comment_safe(getattr(customer, "delivery_comment", "")),
+                ])
+            )
+
+        return "<!--\n" + "\n".join(lines) + "\n-->\n"
 
     def _customer_has_declared_time_window(self, customer: Customer) -> bool:
         return bool(customer_time_windows_minutes(customer))
@@ -1870,6 +1913,13 @@ class InteractiveMapGenerator:
         : number.toFixed(1);
     }}
 
+    function formatStackNumber(value) {{
+      const number = Number(value) || 0;
+      const fixed = number.toFixed(2);
+      if (fixed.endsWith(".00")) return number.toFixed(1);
+      return fixed.replace(/0$/, "");
+    }}
+
     function escapeHtml(value) {{
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
         "&": "&amp;",
@@ -1929,7 +1979,7 @@ class InteractiveMapGenerator:
           </div>
           <div class="client-route-stats">
             <div class="client-route-stat"><span>Общо:</span><b>${{route.markers.length}} клиента</b></div>
-            <div class="client-route-stat"><span>Стекове:</span><b>${{formatRouteNumber(route.volume)}}</b></div>
+            <div class="client-route-stat"><span>Стекове:</span><b>${{formatStackNumber(route.volume)}}</b></div>
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
             ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
@@ -2941,6 +2991,12 @@ class InteractiveMapGenerator:
             return str(int(round(number)))
         return f"{number:.1f}"
 
+    def _format_stack_number(self, value: float) -> str:
+        text = f"{float(value or 0):.2f}"
+        if text.endswith(".00"):
+            return f"{text[:-3]}.0"
+        return text.rstrip("0")
+
     def _route_stats_html(self, route: Route) -> str:
         start_time = self._route_start_time_text(route)
         end_time = self._route_end_time_text(route)
@@ -2967,7 +3023,7 @@ class InteractiveMapGenerator:
         return f'''
             <div class="route-client-stats">
                 <div class="route-client-stat"><span>Общо:</span><b>{len(route.customers)} клиента</b></div>
-                <div class="route-client-stat"><span>Стекове:</span><b>{self._format_route_number(route.total_volume)}</b></div>
+                <div class="route-client-stat"><span>Стекове:</span><b>{self._format_stack_number(route.total_volume)}</b></div>
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
                 {turnover_html}
@@ -3777,13 +3833,15 @@ class InteractiveMapGenerator:
             center = route_depot
 
         if self._use_google_maps():
-            return self._build_google_html(
+            route_document = self._build_google_html(
                 f"Маршрут {route_number}",
                 center,
                 [route],
                 list(dict.fromkeys([route_depot, route_end])),
                 single_route_number=route_number,
             )
+            setattr(route_document, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number))
+            return route_document
 
         route_map = self._create_folium_map(center)
 
@@ -3963,6 +4021,7 @@ class InteractiveMapGenerator:
         </div>
         '''
         route_map.get_root().add_child(folium.Element(legend_html))
+        setattr(route_map, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number))
 
         return route_map
 
@@ -3976,6 +4035,19 @@ class InteractiveMapGenerator:
         
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         route_map.save(file_path)
+
+        top_comment = str(getattr(route_map, "_cvrp_top_html_comment", "") or "")
+        if top_comment:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    saved_html = f.read()
+                saved_html = saved_html.lstrip("\ufeff")
+                if not saved_html.startswith(top_comment):
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(top_comment)
+                        f.write(saved_html)
+            except Exception as exc:
+                logger.warning(f"Не успях да добавя HTML коментар с реда на доставка: {exc}")
         
         logger.info(f"Интерактивна карта записана в {file_path}")
         return file_path
@@ -4045,6 +4117,50 @@ class ExcelExporter:
         if not coords:
             return ""
         return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
+
+    def _apply_decimal_format_by_header(
+        self,
+        ws,
+        headers: List[str],
+        number_format: str = "0.0#",
+        header_row: int = 1,
+    ) -> None:
+        wanted_headers = {str(header).strip() for header in headers}
+        for cell in ws[header_row]:
+            if str(cell.value or "").strip() not in wanted_headers:
+                continue
+            for row_idx in range(header_row + 1, ws.max_row + 1):
+                ws.cell(row=row_idx, column=cell.column).number_format = number_format
+
+    def _apply_decimal_format_by_label(
+        self,
+        ws,
+        labels: List[str],
+        number_format: str = "0.0#",
+        label_col: int = 1,
+        value_col: int = 2,
+    ) -> None:
+        wanted_labels = {str(label).strip() for label in labels}
+        for row_idx in range(1, ws.max_row + 1):
+            label_value = str(ws.cell(row=row_idx, column=label_col).value or "").strip()
+            if label_value in wanted_labels:
+                ws.cell(row=row_idx, column=value_col).number_format = number_format
+
+    def _apply_decimal_format_to_excel_file(
+        self,
+        file_path: str,
+        headers: List[str],
+        number_format: str = "0.0#",
+    ) -> None:
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(file_path)
+            for ws in wb.worksheets:
+                self._apply_decimal_format_by_header(ws, headers, number_format=number_format)
+            wb.save(file_path)
+        except Exception as exc:
+            logger.warning(f"Не успях да форматирам дробните обеми в Excel файла {file_path}: {exc}")
     
     def _create_routes_sheet(self, wb, solution: CVRPSolution):
         """Създава sheet с маршрутите"""
@@ -4121,6 +4237,7 @@ class ExcelExporter:
                 row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4177,6 +4294,7 @@ class ExcelExporter:
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4219,6 +4337,7 @@ class ExcelExporter:
             ws[f'A{row}'].font = header_font
             ws[f'B{row}'] = stat_value
             row += 1
+        self._apply_decimal_format_by_label(ws, ["Общ обем (ст.)"])
         
         # Информация за стартови времена
         row += 2
@@ -4271,6 +4390,7 @@ class ExcelExporter:
         
         # Заглавни редове за статистики
         headers = ['Бус / тип', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
+        summary_header_row = row
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = header_font
@@ -4291,6 +4411,7 @@ class ExcelExporter:
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"], header_row=summary_header_row)
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4369,6 +4490,7 @@ class ExcelExporter:
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4584,6 +4706,7 @@ class ExcelExporter:
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False)
+        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
         
         logger.info(f"Складови заявки експортирани в {file_path}")
         return file_path
@@ -4617,6 +4740,7 @@ class ExcelExporter:
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False, engine='openpyxl')
+        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
         
         logger.info(f"Маршрути експортирани в {file_path}")
         return file_path

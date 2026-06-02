@@ -51,7 +51,20 @@ _END_LOCATION_KEYS = (
 )
 _CUSTOMER_ID_KEYS = ("id", "customer_id", "client_id", "IdCust", "ID", "id_cust")
 _CUSTOMER_NAME_KEYS = ("name", "customer_name", "client_name", "CustName", "ClientName")
-_CUSTOMER_ORDER_KEYS = ("order", "order_no", "order_number", "document", "Document", "DocNo", "NomerPorachka")
+_CUSTOMER_ORDER_KEYS = (
+    "document",
+    "document_no",
+    "doc_no",
+    "IdDoc",
+    "Document",
+    "DocNo",
+    "order",
+    "order_no",
+    "order_number",
+    "NomerPorachka",
+)
+_CUSTOMER_PLAS_DOC_KEYS = ("plas_doc", "plasDoc", "IdPlasDoc", "id_plas_doc", "plas_document")
+_CUSTOMER_SOURCE_SKLD_KEYS = ("source_id_skld", "IdSkld", "id_skld", "warehouse_id", "sklad")
 _CUSTOMER_GPS_KEYS = ("coordinates", "coords", "gps", "GPS", "Gps", "location")
 _CUSTOMER_QUANTITY_KEYS = (
     "quantity",
@@ -108,6 +121,11 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     metric = _objective_metric(payload, active_config)
     service_time_minutes = _service_time_minutes(payload, active_config)
     start_time_minutes = _start_time_minutes(payload, active_config)
+    use_time_windows = _tsp_use_time_windows(payload, active_config)
+    wait_weight = _tsp_time_window_wait_weight(payload, active_config)
+    late_weight = _tsp_time_window_late_weight(payload, active_config)
+    two_opt_enabled = _tsp_two_opt_enabled(payload, active_config)
+    two_opt_max_passes = _tsp_two_opt_max_passes(payload, active_config)
     vehicle_type = _vehicle_type(payload)
     vehicle_config = _vehicle_config_for_type(active_config, vehicle_type)
 
@@ -124,6 +142,11 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         metric=metric,
         start_time_minutes=start_time_minutes,
         service_time_minutes=service_time_minutes,
+        use_time_windows=use_time_windows,
+        wait_weight=wait_weight,
+        late_weight=late_weight,
+        two_opt_enabled=two_opt_enabled,
+        two_opt_max_passes=two_opt_max_passes,
         end_node=end_node,
     )
     schedule_entries, total_distance_km, total_time_minutes = _build_schedule_entries(
@@ -132,6 +155,7 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         matrix,
         start_time_minutes=start_time_minutes,
         service_time_minutes=service_time_minutes,
+        use_time_windows=use_time_windows,
         end_node=end_node,
     )
 
@@ -154,9 +178,9 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
 
     map_file = None
     upload_summary = None
-    if _payload_bool(payload, "generate_map", default=True):
+    if _tsp_generate_map_enabled(payload, active_config):
         map_file = _generate_tsp_map(active_config, route, driver_id)
-        if _payload_bool(payload, "upload_map", default=True):
+        if _tsp_upload_map_enabled(payload, active_config):
             upload_summary = OutputHandler(active_config.output)._upload_route_maps(
                 [{"file_path": map_file, "bus_id": driver_id}]
             )
@@ -167,6 +191,14 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         "driver_id": driver_id,
         "driver_name": driver_name,
         "metric": metric,
+        "tsp_settings": {
+            "use_time_windows": use_time_windows,
+            "wait_weight": wait_weight,
+            "late_weight": late_weight,
+            "two_opt_enabled": two_opt_enabled,
+            "two_opt_max_passes": two_opt_max_passes,
+            "service_time_minutes": service_time_minutes,
+        },
         "start_location": _coords_dict(start_location),
         "end_location": _coords_dict(end_location) if end_location else None,
         "has_fixed_end_location": bool(end_location),
@@ -309,6 +341,8 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
         order_no = _clean_text(
             _first_present(record, *_tsp_field_names(config, "tsp_customer_order_field", _CUSTOMER_ORDER_KEYS))
         )
+        plas_doc = _clean_text(_first_present(record, *_CUSTOMER_PLAS_DOC_KEYS))
+        source_id_skld = _clean_text(_first_present(record, *_CUSTOMER_SOURCE_SKLD_KEYS))
 
         customer = Customer(
             id=customer_id,
@@ -317,10 +351,24 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
             volume=quantity,
             original_gps_data=f"{coords[0]:.6f},{coords[1]:.6f}",
             document=order_no,
+            plas_doc=plas_doc,
+            source_id_skld=source_id_skld,
             time_window_start_minutes=tw_start,
             time_window_end_minutes=tw_end,
             time_windows=time_windows,
             delivery_comment=comment,
+            grouped_documents=[
+                {
+                    "customer_id": customer_id,
+                    "document": order_no,
+                    "order": order_no,
+                    "plas_doc": plas_doc,
+                    "source_id_skld": source_id_skld,
+                    "volume": quantity,
+                    "quantity": quantity,
+                    "turnover": turnover,
+                }
+            ],
         )
         setattr(customer, "quantity", quantity)
         setattr(customer, "turnover", turnover)
@@ -329,7 +377,185 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
         setattr(customer, "order_no", order_no)
         customers.append(customer)
 
-    return customers, skipped
+    return _group_tsp_customer_documents(customers, config), skipped
+
+
+def _group_tsp_customer_documents(customers: List[Customer], config: MainConfig) -> List[Customer]:
+    input_config = getattr(config, "input", None)
+    if not bool(getattr(input_config, "enable_customer_document_grouping", True)):
+        for customer in customers:
+            customer.grouped_documents = _normalise_tsp_grouped_documents(customer)
+            _refresh_tsp_group_fields(customer)
+        return customers
+
+    grouped: Dict[Tuple[str, float, float], Customer] = {}
+    ordered: List[Customer] = []
+    grouped_rows = 0
+
+    for customer in customers:
+        key = _tsp_group_key(customer)
+        if key is None:
+            customer.grouped_documents = _normalise_tsp_grouped_documents(customer)
+            _refresh_tsp_group_fields(customer)
+            ordered.append(customer)
+            continue
+
+        if key not in grouped:
+            customer.grouped_documents = _normalise_tsp_grouped_documents(customer)
+            _refresh_tsp_group_fields(customer)
+            grouped[key] = customer
+            ordered.append(customer)
+            continue
+
+        target = grouped[key]
+        grouped_rows += 1
+        target.grouped_documents = _merge_tsp_grouped_document_lists(
+            _normalise_tsp_grouped_documents(target),
+            _normalise_tsp_grouped_documents(customer),
+        )
+        target.delivery_comment = _join_unique_text(
+            [getattr(target, "delivery_comment", ""), getattr(customer, "delivery_comment", "")],
+            separator=" | ",
+        )
+
+        target_windows = customer_time_windows_minutes(target)
+        customer_windows = customer_time_windows_minutes(customer)
+        if not target_windows and customer_windows:
+            target.time_window_start_minutes = customer.time_window_start_minutes
+            target.time_window_end_minutes = customer.time_window_end_minutes
+            target.time_windows = list(customer_windows)
+        elif customer_windows and target_windows != customer_windows:
+            logger.warning(
+                "TSP customer %s has different time windows in grouped documents; keeping the first one.",
+                customer.id,
+            )
+
+        _refresh_tsp_group_fields(target)
+
+    if grouped_rows:
+        logger.info("Grouped %s TSP document row(s) into existing customer stops.", grouped_rows)
+    return ordered
+
+
+def _tsp_group_key(customer: Customer) -> Optional[Tuple[str, float, float]]:
+    customer_id = str(getattr(customer, "id", "") or "").strip()
+    coords = getattr(customer, "coordinates", None)
+    if not customer_id or not coords:
+        return None
+    return (customer_id.lower(), round(float(coords[0]), 6), round(float(coords[1]), 6))
+
+
+def _normalise_tsp_grouped_documents(customer: Customer) -> List[Dict[str, object]]:
+    documents = list(getattr(customer, "grouped_documents", None) or [])
+    if not documents:
+        quantity = _parse_float(getattr(customer, "quantity", getattr(customer, "volume", 0)), 0.0)
+        documents = [
+            {
+                "customer_id": getattr(customer, "id", ""),
+                "document": getattr(customer, "document", ""),
+                "order": getattr(customer, "order_no", getattr(customer, "document", "")),
+                "plas_doc": getattr(customer, "plas_doc", ""),
+                "source_id_skld": getattr(customer, "source_id_skld", ""),
+                "volume": quantity,
+                "quantity": quantity,
+                "turnover": _parse_float(getattr(customer, "turnover", 0), 0.0),
+            }
+        ]
+
+    normalised: List[Dict[str, object]] = []
+    for item in documents:
+        if not isinstance(item, dict):
+            continue
+        document = str(item.get("document", item.get("order", "")) or "")
+        order = str(item.get("order", document) or "")
+        quantity = _parse_float(item.get("quantity", item.get("volume", 0)), 0.0)
+        normalised.append(
+            {
+                "customer_id": str(item.get("customer_id", getattr(customer, "id", "")) or ""),
+                "document": document,
+                "order": order,
+                "plas_doc": str(item.get("plas_doc", "") or ""),
+                "source_id_skld": str(item.get("source_id_skld", "") or ""),
+                "volume": quantity,
+                "quantity": quantity,
+                "turnover": _parse_float(item.get("turnover", 0), 0.0),
+            }
+        )
+    return normalised
+
+
+def _merge_tsp_grouped_document_lists(
+    left: List[Dict[str, object]],
+    right: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    merged: List[Dict[str, object]] = []
+    positions: Dict[str, Dict[str, object]] = {}
+
+    for item in [*left, *right]:
+        document = str(item.get("document", "") or "")
+        plas_doc = str(item.get("plas_doc", "") or "")
+        key = plas_doc or document
+        if not key:
+            key = f"__row_{len(merged)}"
+
+        if key in positions:
+            existing = positions[key]
+            existing["volume"] = _parse_float(existing.get("volume"), 0.0) + _parse_float(item.get("volume"), 0.0)
+            existing["quantity"] = _parse_float(existing.get("quantity"), 0.0) + _parse_float(item.get("quantity"), 0.0)
+            existing["turnover"] = _parse_float(existing.get("turnover"), 0.0) + _parse_float(item.get("turnover"), 0.0)
+            if not existing.get("document") and document:
+                existing["document"] = document
+            if not existing.get("order") and item.get("order"):
+                existing["order"] = str(item.get("order", ""))
+            if not existing.get("plas_doc") and plas_doc:
+                existing["plas_doc"] = plas_doc
+            if not existing.get("source_id_skld") and item.get("source_id_skld"):
+                existing["source_id_skld"] = str(item.get("source_id_skld", ""))
+            continue
+
+        copied = dict(item)
+        copied["volume"] = _parse_float(copied.get("volume"), 0.0)
+        copied["quantity"] = _parse_float(copied.get("quantity"), 0.0)
+        copied["turnover"] = _parse_float(copied.get("turnover"), 0.0)
+        positions[key] = copied
+        merged.append(copied)
+
+    return merged
+
+
+def _refresh_tsp_group_fields(customer: Customer) -> None:
+    documents = _normalise_tsp_grouped_documents(customer)
+    customer.grouped_documents = documents
+
+    total_quantity = sum(_parse_float(item.get("quantity", item.get("volume", 0)), 0.0) for item in documents)
+    total_turnover = sum(_parse_float(item.get("turnover", 0), 0.0) for item in documents)
+    order_text = _join_unique_text([item.get("order") or item.get("document") for item in documents])
+    document_text = _join_unique_text([item.get("document") or item.get("order") for item in documents])
+
+    customer.volume = total_quantity
+    customer.document = document_text
+    customer.plas_doc = _join_unique_text([item.get("plas_doc") for item in documents])
+    customer.source_id_skld = _join_unique_text([item.get("source_id_skld") for item in documents])
+    setattr(customer, "quantity", total_quantity)
+    setattr(customer, "turnover", total_turnover)
+    setattr(customer, "order", order_text)
+    setattr(customer, "order_no", order_text)
+
+    windows = customer_time_windows_minutes(customer)
+    if windows:
+        setattr(customer, "work_time_text", format_time_windows_minutes(windows))
+
+
+def _join_unique_text(values: Iterable[Any], separator: str = "; ") -> str:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        text = _clean_text(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return separator.join(result)
 
 
 def _parse_float(value: Any, default: float = 0.0) -> float:
@@ -343,8 +569,13 @@ def _parse_float(value: Any, default: float = 0.0) -> float:
 
 def _objective_metric(payload: Dict[str, Any], config: MainConfig) -> str:
     metric = _clean_text(
-        _first_present(payload, "metric", "objective", "objective_metric", "optimize_by")
-    ) or str(getattr(config.cvrp, "objective_metric", "time") or "time")
+        _first_present(payload, "metric", "objective", "objective_metric", "optimize_by", "tsp_metric", "tsp_optimize_by")
+    )
+    if not metric:
+        api_config = getattr(config, "api", None)
+        metric = str(getattr(api_config, "tsp_objective_metric", "") or "")
+    if not metric:
+        metric = str(getattr(config.cvrp, "objective_metric", "time") or "time")
     metric = metric.lower()
     return "time" if metric in {"time", "duration", "fastest", "shortest_time"} else "distance"
 
@@ -368,10 +599,102 @@ def _service_time_minutes(payload: Dict[str, Any], config: MainConfig) -> float:
     value = _first_present(payload, "service_time_minutes", "service_minutes", "serviceTimeMinutes")
     if value is not None:
         return max(0.0, _parse_float(value, default=0.0))
+    api_config = getattr(config, "api", None)
+    if api_config is not None and hasattr(api_config, "tsp_default_service_time_minutes"):
+        return max(0.0, _parse_float(getattr(api_config, "tsp_default_service_time_minutes", 8), default=8.0))
     vehicle_config = _vehicle_config_for_type(config, _vehicle_type(payload))
     if vehicle_config:
         return float(getattr(vehicle_config, "service_time_minutes", 15) or 15)
     return float(getattr(config.cvrp, "service_time_minutes", 15) or 15)
+
+
+def _tsp_payload_bool(payload: Dict[str, Any], default: bool, *names: str) -> bool:
+    value = _first_present(payload, *names)
+    if value is None:
+        return default
+    return _payload_bool({"value": value}, "value", default=default)
+
+
+def _tsp_payload_float(payload: Dict[str, Any], default: float, *names: str, minimum: float = 0.0) -> float:
+    value = _first_present(payload, *names)
+    parsed = _parse_float(value, default) if value is not None else default
+    return max(minimum, parsed)
+
+
+def _tsp_payload_int(payload: Dict[str, Any], default: int, *names: str, minimum: int = 0) -> int:
+    value = _first_present(payload, *names)
+    parsed = int(round(_parse_float(value, default))) if value is not None else int(default)
+    return max(minimum, parsed)
+
+
+def _tsp_use_time_windows(payload: Dict[str, Any], config: MainConfig) -> bool:
+    api_config = getattr(config, "api", None)
+    default = bool(getattr(api_config, "tsp_use_time_windows", True))
+    return _tsp_payload_bool(payload, default, "use_time_windows", "time_windows", "tsp_use_time_windows")
+
+
+def _tsp_time_window_wait_weight(payload: Dict[str, Any], config: MainConfig) -> float:
+    api_config = getattr(config, "api", None)
+    default = float(getattr(api_config, "tsp_time_window_wait_weight", 1.0) or 1.0)
+    return _tsp_payload_float(
+        payload,
+        default,
+        "wait_weight",
+        "time_window_wait_weight",
+        "tsp_wait_weight",
+        "tsp_time_window_wait_weight",
+    )
+
+
+def _tsp_time_window_late_weight(payload: Dict[str, Any], config: MainConfig) -> float:
+    api_config = getattr(config, "api", None)
+    default = float(getattr(api_config, "tsp_time_window_late_weight", 20.0) or 20.0)
+    return _tsp_payload_float(
+        payload,
+        default,
+        "late_weight",
+        "time_window_late_weight",
+        "tsp_late_weight",
+        "tsp_time_window_late_weight",
+    )
+
+
+def _tsp_two_opt_enabled(payload: Dict[str, Any], config: MainConfig) -> bool:
+    api_config = getattr(config, "api", None)
+    default = bool(getattr(api_config, "tsp_enable_two_opt", True))
+    return _tsp_payload_bool(payload, default, "enable_two_opt", "two_opt", "tsp_enable_two_opt", "tsp_two_opt")
+
+
+def _tsp_two_opt_max_passes(payload: Dict[str, Any], config: MainConfig) -> int:
+    api_config = getattr(config, "api", None)
+    default = int(getattr(api_config, "tsp_two_opt_max_passes", 30) or 30)
+    return _tsp_payload_int(payload, default, "two_opt_max_passes", "tsp_two_opt_max_passes", minimum=0)
+
+
+def _tsp_generate_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bool:
+    api_config = getattr(config, "api", None)
+    default = bool(getattr(api_config, "tsp_generate_html_map", True))
+    value = _first_present(
+        payload,
+        "generate_map",
+        "generate_html_map",
+        "generate_local_html_map",
+        "local_html_map",
+        "tsp_generate_map",
+        "tsp_local_html",
+    )
+    if value is None:
+        return default
+    return _payload_bool({"value": value}, "value", default=default)
+
+
+def _tsp_upload_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bool:
+    api_config = getattr(config, "api", None)
+    default = bool(getattr(api_config, "tsp_upload_html_map", True))
+    value = _first_present(payload, "upload_map", "upload_html_map", "tsp_upload_map", "tsp_upload_html_map")
+    if value is None:
+        return default
+    return _payload_bool({"value": value}, "value", default=default)
 
 
 def _start_time_minutes(payload: Dict[str, Any], config: MainConfig) -> int:
@@ -415,6 +738,11 @@ def _solve_open_tsp_order(
     metric: str,
     start_time_minutes: int,
     service_time_minutes: float,
+    use_time_windows: bool,
+    wait_weight: float,
+    late_weight: float,
+    two_opt_enabled: bool,
+    two_opt_max_passes: int,
     end_node: Optional[int] = None,
 ) -> Tuple[List[Customer], List[int]]:
     if not customers:
@@ -435,6 +763,9 @@ def _solve_open_tsp_order(
                 matrix,
                 metric,
                 current_clock_seconds,
+                use_time_windows,
+                wait_weight,
+                late_weight,
             ),
         )
         order.append(best_node)
@@ -445,11 +776,13 @@ def _solve_open_tsp_order(
             matrix,
             current_clock_seconds,
             service_time_minutes,
+            use_time_windows,
         )
         unvisited.remove(best_node)
         current = best_node
 
-    order = _two_opt_open_route(order, matrix, metric, end_node=end_node)
+    if two_opt_enabled:
+        order = _two_opt_open_route(order, matrix, metric, end_node=end_node, max_passes=two_opt_max_passes)
     return [customers[node - 1] for node in order], order
 
 
@@ -460,17 +793,20 @@ def _greedy_step_score(
     matrix: DistanceMatrix,
     metric: str,
     current_clock_seconds: float,
+    use_time_windows: bool,
+    wait_weight: float,
+    late_weight: float,
 ) -> float:
     base = _matrix_cost(matrix, current_node, next_node, metric)
     travel_seconds = _safe_matrix_value(matrix.durations, current_node, next_node)
     arrival_seconds = current_clock_seconds + travel_seconds
-    windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+    windows = time_windows_to_seconds(customer_time_windows_minutes(customer)) if use_time_windows else []
     if not windows:
         return base
 
     _, wait_seconds, _, status = choose_time_window_for_arrival(arrival_seconds, windows)
     late_seconds = max(0.0, arrival_seconds - windows[-1][1]) if status == "След работно време" else 0.0
-    return base + wait_seconds + late_seconds * 20
+    return base + wait_seconds * wait_weight + late_seconds * late_weight
 
 
 def _arrival_after_service_seconds(
@@ -480,10 +816,11 @@ def _arrival_after_service_seconds(
     matrix: DistanceMatrix,
     current_clock_seconds: float,
     service_time_minutes: float,
+    use_time_windows: bool,
 ) -> float:
     travel_seconds = _safe_matrix_value(matrix.durations, current_node, next_node)
     arrival_seconds = current_clock_seconds + travel_seconds
-    windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+    windows = time_windows_to_seconds(customer_time_windows_minutes(customer)) if use_time_windows else []
     if windows:
         _, wait_seconds, _, _ = choose_time_window_for_arrival(arrival_seconds, windows)
         arrival_seconds += wait_seconds
@@ -495,15 +832,16 @@ def _two_opt_open_route(
     matrix: DistanceMatrix,
     metric: str,
     end_node: Optional[int] = None,
+    max_passes: int = 30,
 ) -> List[int]:
-    if len(order) < 4:
+    if len(order) < 4 or max_passes <= 0:
         return order
 
     best = list(order)
     best_cost = _open_route_cost(best, matrix, metric, end_node=end_node)
     improved = True
     passes = 0
-    while improved and passes < 30:
+    while improved and passes < max_passes:
         improved = False
         passes += 1
         for i in range(len(best) - 2):
@@ -557,6 +895,7 @@ def _build_schedule_entries(
     matrix: DistanceMatrix,
     start_time_minutes: int,
     service_time_minutes: float,
+    use_time_windows: bool,
     end_node: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], float, float]:
     entries: List[Dict[str, Any]] = []
@@ -573,7 +912,7 @@ def _build_schedule_entries(
         cumulative_distance_m += distance_m
 
         raw_arrival_seconds = current_clock_seconds + travel_seconds
-        windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+        windows = time_windows_to_seconds(customer_time_windows_minutes(customer)) if use_time_windows else []
         _, wait_seconds, window_index, status = choose_time_window_for_arrival(raw_arrival_seconds, windows)
         if status and len(windows) > 1 and window_index >= 0:
             status = f"{status} (прозорец {window_index + 1})"
@@ -653,11 +992,13 @@ def _coords_dict(coords: Tuple[float, float]) -> Dict[str, float]:
 def _schedule_entry_to_json(entry: Dict[str, Any]) -> Dict[str, Any]:
     customer = entry.get("customer")
     coords = getattr(customer, "coordinates", None) if customer is not None else None
+    documents = _normalise_tsp_grouped_documents(customer) if customer is not None else []
     return {
         "sequence": int(entry.get("index", 0) or 0),
         "customer_id": getattr(customer, "id", "") if customer is not None else "",
         "customer_name": getattr(customer, "name", "") if customer is not None else "",
         "order": str(entry.get("order", "") or ""),
+        "documents": documents,
         "coordinates": _coords_dict(coords) if coords else None,
         "quantity": round(_parse_float(entry.get("quantity"), 0.0), 2),
         "turnover": round(_parse_float(entry.get("turnover"), 0.0), 2),

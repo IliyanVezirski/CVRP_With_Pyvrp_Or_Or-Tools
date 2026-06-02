@@ -696,7 +696,7 @@ class InputConfig:
     json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
     json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
     json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
-    json_sklad: str = "106"  # Стойност за Sklad параметъра.
+    json_sklad: str = "106,128"  # Стойност за Sklad параметъра.
     json_done_flag: str = "1973"  # Стойност за DoneFlag параметъра.
     json_extra_query: str = ""  # Допълнителни GET параметри във формат key=value&key2=value2.
     json_date_field: str = "Date"  # Име на полето/параметъра за датата при HTTP JSON заявка.
@@ -743,7 +743,7 @@ class CVRPConfig:
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 480
+    time_limit_seconds: int = 300
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
 
     objective_metric: str = "time"
@@ -887,10 +887,10 @@ class OutputConfig:
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
     routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
-    route_maps_upload_mode: str = "legacy" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
+    route_maps_upload_mode: str = "effect_upload" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizante/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
-    route_maps_upload_token: str = "Effect-Bizante-Token" # Token стойност за upload endpoint-а.
+    route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
     route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
     route_maps_upload_bus_id_field: str = "pData2[]" # Multipart POST поле за ID-та на бусовете, подредени като files[].
     route_maps_upload_timeout_seconds: int = 60 # Таймаут за качване на route HTML файловете.
@@ -971,7 +971,24 @@ class APIConfig:
     api_endpoint: str = "/solve"
     trigger_endpoint: str = "/run"  # Стартира оптимизацията с текущата конфигурация, без POST payload с клиенти.
     tsp_endpoint: str = "/tsp"  # Подрежда текущ TSP маршрут за един шофьор с текуща GPS позиция и optional крайна точка.
+    tsp_report_endpoint: str = "/tsp-report"  # Генерира дневен Excel отчет за TSP маршрутите.
+    shutdown_endpoint: str = "/shutdown"  # Спира API сървъра/програмата; ползвай с API key при отдалечен достъп.
     health_endpoint: str = "/health"
+    tsp_default_service_time_minutes: int = 8  # TSP service time по подразбиране, ако POST не подаде service_time_minutes.
+    tsp_objective_metric: str = "time"  # TSP цел по подразбиране: time или distance.
+    tsp_use_time_windows: bool = True  # Дали TSP подреждането да отчита работното време на клиентите.
+    tsp_time_window_wait_weight: float = 1.0  # Тежест на чакането при TSP greedy подреждане.
+    tsp_time_window_late_weight: float = 20.0  # Тежест на закъснението след работно време при TSP greedy подреждане.
+    tsp_enable_two_opt: bool = True  # Включва 2-opt подобрение след първоначалното TSP подреждане.
+    tsp_two_opt_max_passes: int = 30  # Максимален брой 2-opt обхода за TSP.
+    tsp_generate_html_map: bool = True  # Дали /tsp да генерира локална индивидуална HTML карта по подразбиране.
+    tsp_upload_html_map: bool = True  # Дали /tsp да качва HTML картата по подразбиране; използва output route upload настройките.
+    tsp_worker_timeout_seconds: int = 30  # Максимално време за отделен TSP worker процес, когато CVRP solver-ът работи.
+    tsp_daily_report_enabled: bool = False  # Автоматичен дневен Excel отчет за всички /tsp маршрути.
+    tsp_daily_report_time: str = "18:00"  # Час за автоматичния TSP дневен отчет във формат HH:MM.
+    tsp_daily_report_output_dir: str = ""  # Папка за TSP отчетите. Ако е празно, използва output.excel_output_dir.
+    tsp_daily_report_history_file: str = ""  # JSONL дневник на TSP маршрутите. Ако е празно, използва logs/tsp_routes_history.jsonl.
+    tsp_daily_report_include_details: bool = True  # Добавя лист с всички клиенти/стопове към TSP дневния отчет.
     tsp_driver_id_field: str = "driver_id"
     tsp_driver_name_field: str = "driver_name"
     tsp_driver_location_field: str = "driver_location"
@@ -979,7 +996,7 @@ class APIConfig:
     tsp_customers_field: str = "customers"
     tsp_customer_id_field: str = "id"
     tsp_customer_name_field: str = "name"
-    tsp_customer_order_field: str = "order"
+    tsp_customer_order_field: str = "document"
     tsp_customer_gps_field: str = "gps"
     tsp_customer_quantity_field: str = "quantity"
     tsp_customer_turnover_field: str = "turnover"
@@ -1051,7 +1068,7 @@ class MainConfig:
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
                 capacity=385,
-                count=5,
+                count=6,
                 name="Маршрут",
                 fixed_cost=0,
                 max_distance_km=None,
@@ -1083,7 +1100,7 @@ class MainConfig:
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
                 capacity=320,
-                count=2,
+                count=1,
                 name="Доп. бус",
                 fixed_cost=0,
                 max_distance_km=None,
@@ -1095,6 +1112,22 @@ class MainConfig:
                 end_location=None,
                 start_time_minutes=480,
                 tsp_depot_location=(42.695785029219415, 23.23165887245312)
+            ),
+            VehicleConfig(
+                vehicle_type=VehicleType.VRATZA_BUS,
+                capacity=385,
+                count=3,
+                name="Враца",
+                fixed_cost=0,
+                max_distance_km=None,
+                max_time_hours=8,
+                service_time_minutes=8,
+                enabled=True,
+                max_customers_per_route=None,
+                start_location=(43.221042895146915, 23.5344026186417),
+                end_location=None,
+                start_time_minutes=480,
+                tsp_depot_location=(43.221042895146915, 23.5344026186417)
             ),
         ]
 

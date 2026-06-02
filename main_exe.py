@@ -292,12 +292,20 @@ def server_exe():
         host = args.host or getattr(api_config, "api_host", "0.0.0.0")
         port = args.port or int(getattr(api_config, "api_port", 8088))
         endpoint = getattr(api_config, "api_endpoint", "/solve")
+        trigger_endpoint = getattr(api_config, "trigger_endpoint", "/run")
+        tsp_endpoint = getattr(api_config, "tsp_endpoint", "/tsp")
+        tsp_report_endpoint = getattr(api_config, "tsp_report_endpoint", "/tsp-report")
+        shutdown_endpoint = getattr(api_config, "shutdown_endpoint", "/shutdown")
         from cvrp_api_server import _build_public_base_url, run_server
 
         public_url = _build_public_base_url(api_config, host, port)
 
         print(f"🌐 CVRP API сървър: http://{host}:{port}")
-        print(f"🔗 URL за извикване: {public_url}{endpoint}")
+        print(f"🔗 URL за клиенти: {public_url}{endpoint}")
+        print(f"▶️ URL за run: {public_url}{trigger_endpoint}")
+        print(f"🧭 URL за TSP: {public_url}{tsp_endpoint}")
+        print(f"📊 URL за TSP отчет: {public_url}{tsp_report_endpoint}")
+        print(f"⏹ URL за спиране: {public_url}{shutdown_endpoint}")
         print("Натиснете Ctrl+C за спиране.")
         run_server(host, port)
     except KeyboardInterrupt:
@@ -308,11 +316,34 @@ def server_exe():
         sys.exit(1)
 
 
+def tsp_worker_exe():
+    """Runs one current-driver TSP request in a separate EXE process."""
+    try:
+        parser = argparse.ArgumentParser(description="CVRP TSP worker")
+        parser.add_argument("--tsp-worker", action="store_true")
+        parser.add_argument("input_json")
+        parser.add_argument("output_json")
+        args, _ = parser.parse_known_args()
+
+        setup_exe_environment()
+        load_config()
+
+        from tsp_worker import run_worker_from_files
+
+        sys.exit(run_worker_from_files(args.input_json, args.output_json))
+    except Exception as e:
+        print(f"\n❌ Грешка при TSP worker: {e}")
+        logging.error(f"EXE TSP worker грешка: {e}", exc_info=True)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     
-    if "--settings" in sys.argv or "--config" in sys.argv:
+    if "--tsp-worker" in sys.argv:
+        tsp_worker_exe()
+    elif "--settings" in sys.argv or "--config" in sys.argv:
         # Стартираме GUI за настройки
         from config_gui import main as gui_main
         gui_main()

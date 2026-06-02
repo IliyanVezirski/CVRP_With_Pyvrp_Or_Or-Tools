@@ -6,6 +6,7 @@ Endpoints:
   POST /solve
   GET  /run
   POST /run
+  POST /tsp
 
 POST /solve accepts either a JSON list of customer records or an object with a
 list under one of these keys: customers, clients, orders, data, items, records.
@@ -14,6 +15,9 @@ The record fields are mapped by config.InputConfig JSON settings.
 GET/POST /run starts the optimiser with the configured input source and returns
 immediately. Optional settings in JSON body or query string override the
 configuration for that request only.
+
+POST /tsp orders the current route for one driver from a current GPS location
+and uses the same endpoint in visible and hidden API server modes.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -48,11 +53,21 @@ from config import (
 from input_handler import InputHandler
 from main import run_optimization
 from current_tsp import solve_current_tsp_route
+from tsp_daily_report import (
+    generate_tsp_daily_excel_report,
+    record_tsp_result,
+    tsp_daily_report_path,
+    tsp_history_file,
+)
 
 
 logger = logging.getLogger(__name__)
 _TRIGGER_COMMANDS = {"run", "start", "trigger", "solve_config", "start_program"}
+_SHUTDOWN_COMMANDS = {"shutdown", "stop", "stop_program", "exit", "quit"}
 _RUN_LOCK = threading.Lock()
+_TSP_REPORT_SCHEDULER_LOCK = threading.Lock()
+_TSP_REPORT_SCHEDULER_STARTED = False
+_TSP_REPORT_SCHEDULER_LAST_ATTEMPT: Dict[str, str] = {}
 _RUN_STATUS: Dict[str, Any] = {
     "running": False,
     "status": "idle",
@@ -79,6 +94,7 @@ _ALLOWED_SETTING_SECTIONS = {
     "locations",
     "output",
     "set_data",
+    "api",
 }
 _SPECIAL_SETTING_KEYS = {
     "depots",
@@ -129,6 +145,35 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "delivery_comment_field": ("input", "json_delivery_comment_field"),
     "enable_customer_document_grouping": ("input", "enable_customer_document_grouping"),
     "group_customer_documents": ("input", "enable_customer_document_grouping"),
+    "tsp_default_service_time_minutes": ("api", "tsp_default_service_time_minutes"),
+    "tsp_service_time_minutes": ("api", "tsp_default_service_time_minutes"),
+    "tsp_objective_metric": ("api", "tsp_objective_metric"),
+    "tsp_metric": ("api", "tsp_objective_metric"),
+    "tsp_optimize_by": ("api", "tsp_objective_metric"),
+    "tsp_use_time_windows": ("api", "tsp_use_time_windows"),
+    "tsp_time_windows": ("api", "tsp_use_time_windows"),
+    "tsp_time_window_wait_weight": ("api", "tsp_time_window_wait_weight"),
+    "tsp_wait_weight": ("api", "tsp_time_window_wait_weight"),
+    "tsp_time_window_late_weight": ("api", "tsp_time_window_late_weight"),
+    "tsp_late_weight": ("api", "tsp_time_window_late_weight"),
+    "tsp_enable_two_opt": ("api", "tsp_enable_two_opt"),
+    "tsp_two_opt": ("api", "tsp_enable_two_opt"),
+    "tsp_two_opt_max_passes": ("api", "tsp_two_opt_max_passes"),
+    "tsp_generate_html_map": ("api", "tsp_generate_html_map"),
+    "tsp_generate_map": ("api", "tsp_generate_html_map"),
+    "tsp_generate_local_html": ("api", "tsp_generate_html_map"),
+    "tsp_local_html": ("api", "tsp_generate_html_map"),
+    "tsp_local_html_map": ("api", "tsp_generate_html_map"),
+    "tsp_upload_html_map": ("api", "tsp_upload_html_map"),
+    "tsp_upload_map": ("api", "tsp_upload_html_map"),
+    "tsp_worker_timeout": ("api", "tsp_worker_timeout_seconds"),
+    "tsp_worker_timeout_seconds": ("api", "tsp_worker_timeout_seconds"),
+    "tsp_daily_report": ("api", "tsp_daily_report_enabled"),
+    "tsp_daily_report_enabled": ("api", "tsp_daily_report_enabled"),
+    "tsp_daily_report_time": ("api", "tsp_daily_report_time"),
+    "tsp_daily_report_output_dir": ("api", "tsp_daily_report_output_dir"),
+    "tsp_daily_report_history_file": ("api", "tsp_daily_report_history_file"),
+    "tsp_daily_report_include_details": ("api", "tsp_daily_report_include_details"),
     "map_output_file": ("output", "map_output_file"),
     "routes_output_dir": ("output", "routes_output_dir"),
     "route_maps_upload_mode": ("output", "route_maps_upload_mode"),
@@ -204,6 +249,35 @@ _QUERY_SETTING_ALIASES = {
     "delivery_comment_field": "delivery_comment_field",
     "enable_customer_document_grouping": "enable_customer_document_grouping",
     "group_customer_documents": "group_customer_documents",
+    "tsp_default_service_time_minutes": "tsp_default_service_time_minutes",
+    "tsp_service_time_minutes": "tsp_service_time_minutes",
+    "tsp_objective_metric": "tsp_objective_metric",
+    "tsp_metric": "tsp_metric",
+    "tsp_optimize_by": "tsp_optimize_by",
+    "tsp_use_time_windows": "tsp_use_time_windows",
+    "tsp_time_windows": "tsp_time_windows",
+    "tsp_time_window_wait_weight": "tsp_time_window_wait_weight",
+    "tsp_wait_weight": "tsp_wait_weight",
+    "tsp_time_window_late_weight": "tsp_time_window_late_weight",
+    "tsp_late_weight": "tsp_late_weight",
+    "tsp_enable_two_opt": "tsp_enable_two_opt",
+    "tsp_two_opt": "tsp_two_opt",
+    "tsp_two_opt_max_passes": "tsp_two_opt_max_passes",
+    "tsp_generate_html_map": "tsp_generate_html_map",
+    "tsp_generate_map": "tsp_generate_map",
+    "tsp_generate_local_html": "tsp_generate_local_html",
+    "tsp_local_html": "tsp_local_html",
+    "tsp_local_html_map": "tsp_local_html_map",
+    "tsp_upload_html_map": "tsp_upload_html_map",
+    "tsp_upload_map": "tsp_upload_map",
+    "tsp_worker_timeout": "tsp_worker_timeout",
+    "tsp_worker_timeout_seconds": "tsp_worker_timeout_seconds",
+    "tsp_daily_report": "tsp_daily_report",
+    "tsp_daily_report_enabled": "tsp_daily_report_enabled",
+    "tsp_daily_report_time": "tsp_daily_report_time",
+    "tsp_daily_report_output_dir": "tsp_daily_report_output_dir",
+    "tsp_daily_report_history_file": "tsp_daily_report_history_file",
+    "tsp_daily_report_include_details": "tsp_daily_report_include_details",
     "map_output_file": "map_output_file",
     "routes_output_dir": "routes_output_dir",
     "route_maps_upload_mode": "route_maps_upload_mode",
@@ -375,7 +449,55 @@ def _api_commands_reference(
     trigger_endpoint: str,
     health_endpoint: str,
     tsp_endpoint: str,
+    tsp_report_endpoint: str,
+    shutdown_endpoint: str,
 ) -> Dict[str, Any]:
+    tsp_command = {
+        "method": "POST",
+        "url": f"{public_url}{tsp_endpoint}",
+        "description": "Подрежда текущ маршрут за един шофьор от текуща GPS позиция, optional крайна точка и списък клиенти. TSP service time и HTML картите имат отделни default настройки в GUI.",
+        "body_example": {
+            "driver_id": "1004501001",
+            "driver_location": "42.6977,23.3219",
+            "end_location": "42.7000,23.4000",
+            "service_time_minutes": 8,
+            "customers": [
+                {
+                    "id": "1",
+                    "name": "Клиент",
+                    "document": "0004384359",
+                    "gps": "42.6629,23.37682",
+                    "work_time": "08:00-13:00",
+                    "turnover": 120.50,
+                    "quantity": 5,
+                    "comment": "Обади се 10 мин преди доставка",
+                }
+            ],
+        },
+        "gui_defaults": {
+            "service_time_minutes": "api.tsp_default_service_time_minutes, ако body не подаде service_time_minutes",
+            "objective_metric": "api.tsp_objective_metric, ако body не подаде metric/objective",
+            "use_time_windows": "api.tsp_use_time_windows",
+            "time_window_wait_weight": "api.tsp_time_window_wait_weight",
+            "time_window_late_weight": "api.tsp_time_window_late_weight",
+            "enable_two_opt": "api.tsp_enable_two_opt",
+            "two_opt_max_passes": "api.tsp_two_opt_max_passes",
+            "generate_local_html_map": "api.tsp_generate_html_map",
+            "upload_html_map": "api.tsp_upload_html_map",
+            "worker_timeout_seconds": "api.tsp_worker_timeout_seconds, когато /tsp се изпълнява в отделен процес",
+        },
+        "settings_examples": [
+            {
+                "description": "Спира локалното HTML генериране само за TSP, без да пипа CVRP route картите.",
+                "settings": {"tsp_generate_map": False},
+            },
+            {
+                "description": "Пуска локалното HTML генериране само за TSP.",
+                "settings": {"tsp_generate_map": True},
+            },
+        ],
+    }
+
     return {
         "health": {
             "method": "GET",
@@ -406,10 +528,10 @@ def _api_commands_reference(
                     "time_limit_seconds": 180,
                     "output": {
                         "enable_excel_output": True,
-                        "excel_output_dir": r"H:\Hell_Bizant_files\Bizant_with_vratza",
+                        "excel_output_dir": r"D:\CVRP_Output\Run1",
                         "route_maps_upload_mode": "effect_upload",
-                        "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
-                        "route_maps_upload_token": "Effect-Bizante-Token",
+                        "route_maps_upload_url": "https://YOUR-UPLOAD-SERVER/upload-files.php",
+                        "route_maps_upload_token": "YOUR_UPLOAD_TOKEN",
                     },
                     "vehicles": [
                         {
@@ -444,32 +566,28 @@ def _api_commands_reference(
                 ],
             },
         },
-        "current_tsp_post": {
-            "method": "POST",
-            "url": f"{public_url}{tsp_endpoint}",
-            "description": "Подрежда текущ маршрут за един шофьор от текуща GPS позиция, optional крайна точка и списък клиенти. Връща реда на доставка и генерира индивидуална HTML карта.",
-            "body_example": {
-                "driver_id": "1004501001",
-                "driver_location": "42.6977,23.3219",
-                "end_location": "42.7000,23.4000",
-                "metric": "time",
-                "service_time_minutes": 8,
-                "upload_map": True,
-                "customers": [
-                    {
-                        "id": "1",
-                        "name": "Клиент",
-                        "order": "0004384359",
-                        "gps": "42.6629,23.37682",
-                        "work_time": "08:00-13:00",
-                        "turnover": 120.50,
-                        "quantity": 5,
-                        "comment": "Обади се 10 мин преди доставка",
-                    }
-                ],
-            },
+        "tsp_post": tsp_command,
+        "current_tsp_post": tsp_command,
+        "tsp_daily_report": {
+            "methods": ["GET", "POST"],
+            "url": f"{public_url}{tsp_report_endpoint}",
+            "description": "Генерира Excel отчет за всички TSP маршрути за дадена дата. Query/body date е optional във формат YYYY-MM-DD.",
+            "query_examples": [
+                f"{public_url}{tsp_report_endpoint}",
+                f"{public_url}{tsp_report_endpoint}?date=2026-05-29",
+            ],
+        },
+        "shutdown": {
+            "methods": ["GET", "POST"],
+            "url": f"{public_url}{shutdown_endpoint}",
+            "description": "Спира API сървъра/програмата. Ако има активен subprocess run, прави опит да го спре преди изход.",
+            "query_examples": [
+                f"{public_url}{shutdown_endpoint}",
+                f"{public_url}{solve_endpoint}?cmd=shutdown",
+            ],
         },
         "trigger_commands": sorted(_TRIGGER_COMMANDS),
+        "shutdown_commands": sorted(_SHUTDOWN_COMMANDS),
         "auth": "Ако api_key е зададен: X-CVRP-API-Key или Authorization: Bearer.",
     }
 
@@ -1242,6 +1360,94 @@ def _run_status_snapshot() -> Dict[str, Any]:
         return deepcopy(_RUN_STATUS)
 
 
+def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
+    public_url = _build_public_base_url(api_config, host, port)
+    api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
+    trigger_endpoint = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
+    health_endpoint = _normalise_endpoint(getattr(api_config, "health_endpoint", "/health"))
+    tsp_endpoint = _normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp"))
+    tsp_report_endpoint = _normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report"))
+    shutdown_endpoint = _normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown"))
+    run_status = _run_status_snapshot()
+    cvrp_running = bool(run_status.get("running"))
+    endpoints = {
+        "health": f"{public_url}{health_endpoint}",
+        "solve": f"{public_url}{api_endpoint}",
+        "run": f"{public_url}{trigger_endpoint}",
+        "tsp": f"{public_url}{tsp_endpoint}",
+        "tsp_report": f"{public_url}{tsp_report_endpoint}",
+        "shutdown": f"{public_url}{shutdown_endpoint}",
+    }
+
+    return {
+        "status": "ok",
+        "service": {
+            "name": "CVRP Optimizer API",
+            "server_time": _now_iso(),
+            "listen_url": f"http://{host}:{port}",
+            "public_url": public_url,
+        },
+        "endpoints": endpoints,
+        "capabilities": {
+            "solve": {
+                "method": "POST",
+                "description": "Пълен CVRP run с клиенти в JSON body.",
+            },
+            "run": {
+                "methods": ["GET", "POST"],
+                "description": "Стартира оптимизация с текущите настройки/input source.",
+                "single_active_run": True,
+            },
+            "tsp": {
+                "method": "POST",
+                "description": "Текущ маршрут за един шофьор от текуща GPS позиция.",
+                "available_while_cvrp_running": True,
+                "execution_now": "separate_process" if cvrp_running else "inline",
+                "execution_when_cvrp_running": "separate_process",
+                "default_service_time_minutes": getattr(api_config, "tsp_default_service_time_minutes", 8),
+                "objective_metric": getattr(api_config, "tsp_objective_metric", "time"),
+                "use_time_windows": bool(getattr(api_config, "tsp_use_time_windows", True)),
+                "time_window_wait_weight": float(getattr(api_config, "tsp_time_window_wait_weight", 1.0) or 1.0),
+                "time_window_late_weight": float(getattr(api_config, "tsp_time_window_late_weight", 20.0) or 20.0),
+                "enable_two_opt": bool(getattr(api_config, "tsp_enable_two_opt", True)),
+                "two_opt_max_passes": int(getattr(api_config, "tsp_two_opt_max_passes", 30) or 30),
+                "generate_local_html_map": bool(getattr(api_config, "tsp_generate_html_map", True)),
+                "upload_html_map": bool(getattr(api_config, "tsp_upload_html_map", True)),
+                "worker_timeout_seconds": int(getattr(api_config, "tsp_worker_timeout_seconds", 30) or 30),
+                "local_html_setting": "api.tsp_generate_html_map",
+                "local_html_aliases": ["tsp_generate_map", "tsp_generate_local_html", "tsp_local_html"],
+            },
+            "tsp_daily_report": {
+                "enabled": bool(getattr(api_config, "tsp_daily_report_enabled", False)),
+                "time": getattr(api_config, "tsp_daily_report_time", "18:00"),
+                "endpoint": endpoints["tsp_report"],
+                "today_report_file": tsp_daily_report_path(get_config()),
+                "include_details": bool(getattr(api_config, "tsp_daily_report_include_details", True)),
+            },
+        },
+        "current_run": run_status,
+        "commands": _api_commands_reference(
+            public_url,
+            api_endpoint,
+            trigger_endpoint,
+            health_endpoint,
+            tsp_endpoint,
+            tsp_report_endpoint,
+            shutdown_endpoint,
+        ),
+        "settings_schema": _settings_schema_reference(get_config()),
+        # Backward-compatible flat fields for older callers.
+        "listen_url": f"http://{host}:{port}",
+        "public_url": public_url,
+        "solve_url": endpoints["solve"],
+        "trigger_url": endpoints["run"],
+        "tsp_url": endpoints["tsp"],
+        "tsp_report_url": endpoints["tsp_report"],
+        "shutdown_url": endpoints["shutdown"],
+        "run_status": run_status,
+    }
+
+
 def _post_completion_callback(callback_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     callback_url = str(callback_url or "").strip()
     if not callback_url:
@@ -1341,6 +1547,8 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
     stdout_path = os.path.join(_api_logs_dir(), f"api_run_{run_id}.log")
     env = os.environ.copy()
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env.pop("_MEIPASS2", None)
 
     process = None
@@ -1433,6 +1641,193 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
             _RUN_STATUS["notification"] = notification
             status_snapshot = deepcopy(_RUN_STATUS)
         _persist_run_status(status_snapshot)
+
+
+def _cvrp_run_is_active() -> bool:
+    with _RUN_LOCK:
+        return bool(_RUN_STATUS.get("running"))
+
+
+def _tsp_worker_command(input_path: str, output_path: str) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--tsp-worker", input_path, output_path]
+
+    worker_py = os.path.join(os.getcwd(), "tsp_worker.py")
+    return [_child_python_executable(), worker_py, input_path, output_path]
+
+
+def _run_tsp_in_subprocess(payload: Dict[str, Any], query: Optional[Dict[str, list[str]]] = None) -> Dict[str, Any]:
+    api_config = get_config().api
+    timeout_seconds = int(getattr(api_config, "tsp_worker_timeout_seconds", 30) or 30)
+    timeout_seconds = max(1, timeout_seconds)
+    tsp_run_id = uuid.uuid4().hex[:12]
+    logs_dir = _api_logs_dir()
+    input_path = os.path.join(logs_dir, f"api_tsp_{tsp_run_id}_input.json")
+    output_path = os.path.join(logs_dir, f"api_tsp_{tsp_run_id}_result.json")
+    stdout_path = os.path.join(logs_dir, f"api_tsp_{tsp_run_id}.log")
+    command = _tsp_worker_command(input_path, output_path)
+
+    with open(input_path, "w", encoding="utf-8") as fh:
+        json.dump({"payload": payload, "query": query or {}}, fh, ensure_ascii=False, indent=2)
+
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.pop("_MEIPASS2", None)
+
+    try:
+        logger.info("TSP worker %s starting subprocess: %s", tsp_run_id, command)
+        with open(stdout_path, "a", encoding="utf-8", errors="replace") as stdout_log:
+            stdout_log.write(f"\n===== TSP worker {tsp_run_id} started {_now_iso()} =====\n")
+            stdout_log.write("Command: " + " ".join(command) + "\n")
+            stdout_log.flush()
+            completed = subprocess.run(
+                command,
+                cwd=os.getcwd(),
+                env=env,
+                stdout=stdout_log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_seconds,
+                **_hidden_process_kwargs(),
+            )
+            stdout_log.write(
+                f"===== TSP worker {tsp_run_id} finished {_now_iso()} exit_code={completed.returncode} =====\n"
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"TSP worker timed out after {timeout_seconds} seconds. Log: {stdout_path}") from exc
+
+    if completed.returncode != 0:
+        error = f"TSP worker exited with code {completed.returncode}. Log: {stdout_path}"
+        if os.path.exists(output_path):
+            try:
+                with open(output_path, "r", encoding="utf-8") as fh:
+                    worker_result = json.load(fh)
+                if worker_result.get("error"):
+                    error = f"{worker_result.get('error')} Log: {stdout_path}"
+            except Exception:
+                pass
+        raise RuntimeError(error)
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"TSP worker did not create result file. Log: {stdout_path}")
+
+    with open(output_path, "r", encoding="utf-8") as fh:
+        result = json.load(fh)
+
+    result["tsp_process"] = {
+        "mode": "subprocess",
+        "reason": "cvrp_run_active",
+        "run_id": tsp_run_id,
+        "process_log": stdout_path,
+        "exit_code": completed.returncode,
+    }
+    return result
+
+
+def _execute_tsp_request(payload: Dict[str, Any], query: Optional[Dict[str, list[str]]] = None) -> Dict[str, Any]:
+    if _cvrp_run_is_active():
+        result = _run_tsp_in_subprocess(payload, query)
+        _record_tsp_response(payload, query, result)
+        return result
+
+    config_override, applied_settings, ignored_settings = _build_request_config_override(payload, query)
+    result = solve_current_tsp_route(payload, config_override or get_config())
+    if applied_settings or ignored_settings:
+        result["settings_overrides"] = applied_settings
+        result["ignored_settings"] = ignored_settings
+    result["tsp_process"] = {
+        "mode": "inline",
+        "reason": "cvrp_idle",
+    }
+    _record_tsp_response(payload, query, result, config_override)
+    return result
+
+
+def _record_tsp_response(
+    payload: Dict[str, Any],
+    query: Optional[Dict[str, list[str]]],
+    result: Dict[str, Any],
+    config_override: Optional[MainConfig] = None,
+) -> None:
+    try:
+        active_config = config_override
+        if active_config is None:
+            active_config, _, _ = _build_request_config_override(payload, query)
+        record_tsp_result(active_config or get_config(), result, payload)
+    except Exception as exc:
+        logger.warning("Could not record TSP history: %s", exc)
+
+
+def _parse_tsp_report_time(raw: Any) -> Optional[tuple[int, int]]:
+    text = str(raw or "").strip()
+    try:
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _today_tsp_report_due(api_config) -> bool:
+    parsed = _parse_tsp_report_time(getattr(api_config, "tsp_daily_report_time", "18:00"))
+    if not parsed:
+        return False
+
+    now = datetime.now()
+    hour, minute = parsed
+    return (now.hour, now.minute) >= (hour, minute)
+
+
+def _generate_tsp_report_response(config: MainConfig, report_date: Optional[str] = None, source: str = "manual") -> Dict[str, Any]:
+    report_file = generate_tsp_daily_excel_report(config, report_date)
+    return {
+        "status": "ok",
+        "type": "tsp_daily_report",
+        "source": source,
+        "date": report_date or datetime.now().date().isoformat(),
+        "report_file": report_file,
+    }
+
+
+def _tsp_report_scheduler_loop() -> None:
+    global _TSP_REPORT_SCHEDULER_LAST_ATTEMPT
+
+    while True:
+        try:
+            config = get_config()
+            api_config = config.api
+            if bool(getattr(api_config, "tsp_daily_report_enabled", False)) and _today_tsp_report_due(api_config):
+                today = datetime.now().date().isoformat()
+                report_path = tsp_daily_report_path(config, today)
+                history_path = tsp_history_file(config)
+                report_mtime = os.path.getmtime(report_path) if os.path.exists(report_path) else 0
+                history_mtime = os.path.getmtime(history_path) if os.path.exists(history_path) else 0
+                refresh_key = f"{today}:{history_mtime}"
+                if _TSP_REPORT_SCHEDULER_LAST_ATTEMPT.get(today) != refresh_key and (
+                    not os.path.exists(report_path) or history_mtime > report_mtime
+                ):
+                    report_file = generate_tsp_daily_excel_report(config, today)
+                    _TSP_REPORT_SCHEDULER_LAST_ATTEMPT[today] = refresh_key
+                    logger.info("Generated scheduled TSP daily report: %s", report_file)
+        except Exception as exc:
+            logger.error("Scheduled TSP daily report failed: %s", exc, exc_info=True)
+
+        time.sleep(30)
+
+
+def _start_tsp_report_scheduler() -> None:
+    global _TSP_REPORT_SCHEDULER_STARTED
+
+    with _TSP_REPORT_SCHEDULER_LOCK:
+        if _TSP_REPORT_SCHEDULER_STARTED:
+            return
+        thread = threading.Thread(target=_tsp_report_scheduler_loop, name="TSPDailyReportScheduler", daemon=True)
+        thread.start()
+        _TSP_REPORT_SCHEDULER_STARTED = True
 
 
 def _start_default_run(
@@ -1553,6 +1948,88 @@ def _is_trigger_command(query: Dict[str, list[str]], payload: Any = None) -> boo
     return _command_from_query(query) in _TRIGGER_COMMANDS or _command_from_payload(payload) in _TRIGGER_COMMANDS
 
 
+def _is_shutdown_command(query: Dict[str, list[str]], payload: Any = None) -> bool:
+    return _command_from_query(query) in _SHUTDOWN_COMMANDS or _command_from_payload(payload) in _SHUTDOWN_COMMANDS
+
+
+def _terminate_process_tree(pid: Any) -> Dict[str, Any]:
+    try:
+        process_id = int(pid or 0)
+    except (TypeError, ValueError):
+        process_id = 0
+
+    if process_id <= 0:
+        return {"attempted": False, "reason": "no_process_id"}
+    if process_id == os.getpid():
+        return {"attempted": False, "reason": "own_process"}
+
+    try:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process_id), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            return {
+                "attempted": True,
+                "pid": process_id,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout.strip(),
+                "stderr": completed.stderr.strip(),
+            }
+
+        os.kill(process_id, 15)
+        return {"attempted": True, "pid": process_id, "returncode": 0}
+    except Exception as exc:
+        return {"attempted": True, "pid": process_id, "error": str(exc)}
+
+
+def _active_run_process_id() -> Optional[int]:
+    with _RUN_LOCK:
+        process_id = _RUN_STATUS.get("process_id")
+    try:
+        return int(process_id) if process_id else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _schedule_program_shutdown(server, delay_seconds: float = 0.35) -> None:
+    def shutdown_worker() -> None:
+        time.sleep(delay_seconds)
+        process_stop = _terminate_process_tree(_active_run_process_id())
+        if process_stop.get("attempted"):
+            logger.info("Shutdown requested: active run process stop result: %s", process_stop)
+        try:
+            server.shutdown()
+        except Exception as exc:
+            logger.warning("Server shutdown failed before process exit: %s", exc)
+        time.sleep(0.25)
+        logger.info("Exiting CVRP API process after shutdown request")
+        os._exit(0)
+
+    threading.Thread(target=shutdown_worker, name="CVRPApiShutdown", daemon=True).start()
+
+
+def _request_report_date(payload: Any = None, query: Optional[Dict[str, list[str]]] = None) -> Optional[str]:
+    raw_value = None
+    if isinstance(payload, dict):
+        raw_value = payload.get("report_date") or payload.get("date")
+    if raw_value is None and query:
+        values = query.get("report_date") or query.get("date")
+        if values:
+            raw_value = values[-1]
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise ValueError("Невалидна дата за TSP отчет. Използвай YYYY-MM-DD.") from exc
+
+
 class CVRPApiHandler(BaseHTTPRequestHandler):
     server_version = "CVRPApi/1.0"
 
@@ -1563,31 +2040,38 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         health_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "health_endpoint", "/health")))
         trigger_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run")))
+        tsp_report_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report")))
+        shutdown_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown")))
         if path == health_endpoint:
             host = self.server.server_address[0]
             port = self.server.server_address[1]
-            public_url = _build_public_base_url(api_config, host, port)
-            api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
-            trigger_endpoint_url = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
-            health_endpoint_url = _normalise_endpoint(getattr(api_config, "health_endpoint", "/health"))
-            tsp_endpoint_url = _normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp"))
+            self._send_json(200, _api_health_payload(api_config, host, port))
+            return
+
+        if path == shutdown_endpoint or _is_shutdown_command(query):
+            if (error := _auth_error(api_config, query, self.headers)):
+                self._send_json(401, {"status": "error", "error": error})
+                return
+            active_process_id = _active_run_process_id()
             self._send_json(200, {
-                "status": "ok",
-                "listen_url": f"http://{host}:{port}",
-                "public_url": public_url,
-                "solve_url": f"{public_url}{api_endpoint}",
-                "trigger_url": f"{public_url}{trigger_endpoint_url}",
-                "tsp_url": f"{public_url}{tsp_endpoint_url}",
-                "run_status": _run_status_snapshot(),
-                "commands": _api_commands_reference(
-                    public_url,
-                    api_endpoint,
-                    trigger_endpoint_url,
-                    health_endpoint_url,
-                    tsp_endpoint_url,
-                ),
-                "settings_schema": _settings_schema_reference(get_config()),
+                "status": "shutting_down",
+                "message": "CVRP API server/program shutdown scheduled.",
+                "active_run_process_id": active_process_id,
+                "will_attempt_to_stop_active_run_process": bool(active_process_id),
             })
+            _schedule_program_shutdown(self.server)
+            return
+
+        if path == tsp_report_endpoint:
+            if (error := _auth_error(api_config, query, self.headers)):
+                self._send_json(401, {"status": "error", "error": error})
+                return
+            try:
+                report_date = _request_report_date(query=query)
+                self._send_json(200, _generate_tsp_report_response(get_config(), report_date, source="api"))
+            except Exception as exc:
+                logger.exception("TSP report request failed")
+                self._send_json(500, {"status": "error", "error": str(exc)})
             return
 
         if path == trigger_endpoint or _is_trigger_command(query):
@@ -1607,20 +2091,40 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         api_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "api_endpoint", "/solve")))
         trigger_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run")))
         tsp_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp")))
+        tsp_report_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report")))
+        shutdown_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown")))
 
         try:
             payload = self._read_json_body(required=False)
+            if path == shutdown_endpoint or _is_shutdown_command(query, payload):
+                if (error := _auth_error(api_config, query, self.headers)):
+                    self._send_json(401, {"status": "error", "error": error})
+                    return
+                active_process_id = _active_run_process_id()
+                self._send_json(200, {
+                    "status": "shutting_down",
+                    "message": "CVRP API server/program shutdown scheduled.",
+                    "active_run_process_id": active_process_id,
+                    "will_attempt_to_stop_active_run_process": bool(active_process_id),
+                })
+                _schedule_program_shutdown(self.server)
+                return
+
+            if path == tsp_report_endpoint:
+                if (error := _auth_error(api_config, query, self.headers)):
+                    self._send_json(401, {"status": "error", "error": error})
+                    return
+                report_date = _request_report_date(payload, query)
+                self._send_json(200, _generate_tsp_report_response(get_config(), report_date, source="api"))
+                return
+
             if path == tsp_endpoint:
                 if (error := _auth_error(api_config, query, self.headers)):
                     self._send_json(401, {"status": "error", "error": error})
                     return
                 if payload is None:
                     raise ValueError("Empty request body")
-                config_override, applied_settings, ignored_settings = _build_request_config_override(payload, query)
-                result = solve_current_tsp_route(payload, config_override or get_config())
-                if applied_settings or ignored_settings:
-                    result["settings_overrides"] = applied_settings
-                    result["ignored_settings"] = ignored_settings
+                result = _execute_tsp_request(payload, query)
                 self._send_json(200, result)
                 return
 
@@ -1762,11 +2266,16 @@ def run_server(host: str | None = None, port: int | None = None):
     api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
     trigger_endpoint = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
     tsp_endpoint = _normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp"))
+    tsp_report_endpoint = _normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report"))
+    shutdown_endpoint = _normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown"))
     logger.info("CVRP API server listening on http://%s:%s", host, port)
     logger.info("Public/base URL: %s", public_url)
     logger.info("POST customer JSON to %s%s", public_url, api_endpoint)
     logger.info("Trigger configured run with GET/POST %s%s", public_url, trigger_endpoint)
     logger.info("POST current driver TSP JSON to %s%s", public_url, tsp_endpoint)
+    logger.info("TSP daily report endpoint: %s%s", public_url, tsp_report_endpoint)
+    logger.info("Shutdown endpoint: %s%s", public_url, shutdown_endpoint)
+    _start_tsp_report_scheduler()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
