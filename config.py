@@ -643,7 +643,7 @@ class RoutingConfig:
     enable_time_dependent: bool = False  # Дали да се използва time-dependent routing (само за Valhalla)
     departure_time: str = "08:00"  # Час на тръгване (HH:MM) за time-dependent routing
     enable_curbside_approach: bool = False  # Ако е True, маршрутите се строят така, че клиентът да е от правилната страна на улицата.
-    valhalla_preferred_side: str = "same"  # same = клиентът да е от страната на движение; either = без ограничение.
+    valhalla_preferred_side: str = "either"  # same = клиентът да е от страната на движение; either = без ограничение.
 
 
 @dataclass
@@ -663,7 +663,12 @@ class ValhallaConfig:
     # Truck-specific настройки (ако costing="auto")
     truck_height: float = 3.5  # Височина в метри
     truck_width: float = 2.5   # Ширина в метри
+    truck_length: float = 7.0  # Дължина в метри
     truck_weight: float = 10.0  # Тегло в тонове
+    truck_axle_load: float = 9.0  # Натоварване на ос в тонове
+    truck_axle_count: int = 2  # Брой оси
+    truck_hazmat: bool = False  # Опасен товар
+    truck_hgv_no_access_penalty: int = 43200  # Под 43200 позволява HGV no-access с глоба; 43200 = забранено.
 
 
 @dataclass
@@ -888,7 +893,7 @@ class OutputConfig:
     map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
     routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
     route_maps_upload_mode: str = "effect_upload" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
-    route_maps_upload_url: str = "https://effect.bg/dragon/hellbizante/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
+    route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
     route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
     route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
@@ -909,6 +914,8 @@ class OutputConfig:
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
     excel_bus_number_prefix: str = "10045010" # Префикс за номерата на бусове в Excel отчета.
     excel_bus_number_digits: int = 2 # Брой цифри след префикса: 01, 02, 03...
+    center_bus_numbering_enabled: bool = True # Ако е включено, CENTER_BUS започва от ID 1004501015 нагоре, а другите бусове си тръгват от 1004501001 нагоре.
+    center_bus_numbering_start_id: str = "1004501015" # Първият ID за CENTER_BUS при специалното номериране.
     
     # CSV файл с маршрути
     enable_csv_output: bool = True # Дали да се генерира CSV файл с маршрутите.
@@ -965,7 +972,7 @@ class PerformanceConfig:
 class APIConfig:
     """Настройки за HTTP API сървъра, който приема POST заявки от други програми."""
     api_host: str = "0.0.0.0"  # 0.0.0.0 = приема заявки от други компютри в мрежата.
-    api_port: int = 8088
+    api_port: int = 8087
     api_public_url: str = ""  # URL за извикване от друга програма, напр. http://10.10.100.134:8088 или https://domain.com/cvrp
     api_key: str = ""  # Ако е попълнено, /run и /solve изискват X-CVRP-API-Key или Authorization: Bearer.
     api_endpoint: str = "/solve"
@@ -984,6 +991,16 @@ class APIConfig:
     tsp_generate_html_map: bool = True  # Дали /tsp да генерира локална индивидуална HTML карта по подразбиране.
     tsp_upload_html_map: bool = True  # Дали /tsp да качва HTML картата по подразбиране; използва output route upload настройките.
     tsp_worker_timeout_seconds: int = 30  # Максимално време за отделен TSP worker процес, когато CVRP solver-ът работи.
+    tsp_valhalla_truck_profiles: str = ""  # Много TSP truck профили. GUI ги редактира като таблица; един профил на ред.
+    tsp_valhalla_truck_driver_ids: str = ""  # Driver/bus ID-та, за които /tsp използва Valhalla truck профил; разделени със запетая.
+    tsp_valhalla_truck_height: float = 3.5  # TSP truck височина в метри.
+    tsp_valhalla_truck_width: float = 2.5  # TSP truck ширина в метри.
+    tsp_valhalla_truck_length: float = 7.0  # TSP truck дължина в метри.
+    tsp_valhalla_truck_weight: float = 10.0  # TSP truck тегло в тонове.
+    tsp_valhalla_truck_axle_load: float = 9.0  # TSP truck натоварване на ос в тонове.
+    tsp_valhalla_truck_axle_count: int = 2  # TSP truck брой оси.
+    tsp_valhalla_truck_hazmat: bool = False  # TSP truck опасен товар.
+    tsp_valhalla_truck_hgv_no_access_penalty: int = 43200  # 43200 = не допуска пътища без HGV достъп.
     tsp_daily_report_enabled: bool = False  # Автоматичен дневен Excel отчет за всички /tsp маршрути.
     tsp_daily_report_time: str = "18:00"  # Час за автоматичния TSP дневен отчет във формат HH:MM.
     tsp_daily_report_output_dir: str = ""  # Папка за TSP отчетите. Ако е празно, използва output.excel_output_dir.
@@ -1007,7 +1024,7 @@ class APIConfig:
 @dataclass
 class SetDataConfig:
     """Настройки за връщане на готовите маршрути към Bizant чрез cmd=setData."""
-    enable_set_data_upload: bool = False  # Включва изпращане на резултата към setData след успешно решение.
+    enable_set_data_upload: bool = True  # Включва изпращане на резултата към setData след успешно решение.
     set_data_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за setData endpoint.
     set_data_http_method: str = "GET"  # HTTP метод за setData: GET или POST.
     set_data_command: str = "setData"  # cmd параметър.
@@ -1022,7 +1039,7 @@ class SetDataConfig:
     set_data_unserved_done_flag: str = "0"  # DoneFlag за необслужени. Празно = използва set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
-    set_data_unserved_bukva_template: str = "HOF-{id_plas_doc}"  # Шаблон за Bukva на необслужени клиенти.
+    set_data_unserved_bukva_template: str = "HOF1-{stop_number}"  # Шаблон за Bukva на необслужени клиенти.
     enable_make_group: bool = False  # Дали след успешни setData заявки да се изпрати cmd=makeGroup по склад.
     set_data_make_group_command: str = "makeGroup"  # cmd за групиране след успешни setData заявки.
     set_data_timeout_seconds: int = 30  # Таймаут за setData заявка.

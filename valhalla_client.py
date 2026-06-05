@@ -22,6 +22,41 @@ FALLBACK_ROAD_FACTOR = 1.3
 VALHALLA_CLIENT_FIX_VERSION = "2026-05-14-null-cell-v2"
 
 
+def build_valhalla_costing_options(valhalla_config) -> dict:
+    """Build Valhalla costing_options for the configured costing profile."""
+    if getattr(valhalla_config, "costing", "") != "truck":
+        return {}
+
+    option_names = (
+        "truck_height",
+        "truck_width",
+        "truck_length",
+        "truck_weight",
+        "truck_axle_load",
+        "truck_axle_count",
+        "truck_hazmat",
+        "truck_hgv_no_access_penalty",
+    )
+    valhalla_names = {
+        "truck_height": "height",
+        "truck_width": "width",
+        "truck_length": "length",
+        "truck_weight": "weight",
+        "truck_axle_load": "axle_load",
+        "truck_axle_count": "axle_count",
+        "truck_hazmat": "hazmat",
+        "truck_hgv_no_access_penalty": "hgv_no_access_penalty",
+    }
+    truck_options = {}
+    for attr_name in option_names:
+        value = getattr(valhalla_config, attr_name, None)
+        if value in (None, ""):
+            continue
+        truck_options[valhalla_names[attr_name]] = value
+
+    return {"costing_options": {"truck": truck_options}}
+
+
 class ValhallaClient:
     """Клиент за Valhalla API"""
     
@@ -74,18 +109,7 @@ class ValhallaClient:
     
     def _build_costing_options(self) -> dict:
         """Създава costing options за truck routing"""
-        if self.config.costing != "truck":
-            return {}
-        
-        return {
-            "costing_options": {
-                "truck": {
-                    "height": self.config.truck_height,
-                    "width": self.config.truck_width,
-                    "weight": self.config.truck_weight
-                }
-            }
-        }
+        return build_valhalla_costing_options(self.config)
 
     def _build_location(self, lat: float, lon: float) -> dict:
         location = {"lat": lat, "lon": lon}

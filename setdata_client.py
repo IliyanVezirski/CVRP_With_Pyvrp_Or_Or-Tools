@@ -9,6 +9,7 @@ import urllib.request
 from typing import Any, Dict, List
 
 from cvrp_solver import CVRPSolution
+from vehicle_numbering import format_route_bus_number, order_routes_for_output
 
 
 logger = logging.getLogger(__name__)
@@ -28,13 +29,13 @@ def _normalise_url_with_params(base_url: str, params: Dict[str, str]) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
-def _format_bus_number(output_config: Any, route_index: int) -> str:
-    prefix = str(getattr(output_config, "excel_bus_number_prefix", "10045010") or "")
-    try:
-        digits = int(getattr(output_config, "excel_bus_number_digits", 2) or 2)
-    except (TypeError, ValueError):
-        digits = 2
-    return f"{prefix}{route_index + 1:0{max(1, digits)}d}"
+def _format_bus_number(
+    output_config: Any,
+    route_index: int,
+    route: Any = None,
+    routes: Any = None,
+) -> str:
+    return format_route_bus_number(output_config, route_index, route=route, routes=routes)
 
 
 def _format_bukva(template: str, context: Dict[str, Any]) -> str:
@@ -117,9 +118,10 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
     output = config.output
     rows: List[Dict[str, str]] = []
 
-    for route_index, route in enumerate(solution.routes):
+    routes = order_routes_for_output(solution.routes)
+    for route_index, route in enumerate(routes):
         route_number = route_index + 1
-        bus_number = _format_bus_number(output, route_index)
+        bus_number = _format_bus_number(output, route_index, route, routes)
         vehicle_type = getattr(route.vehicle_type, "value", str(route.vehicle_type))
         vehicle_name = str(getattr(route, "vehicle_name", "") or "").strip()
         id_skld = resolve_route_id_skld(route, config)

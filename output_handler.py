@@ -26,6 +26,7 @@ from input_handler import (
     time_windows_to_seconds,
 )
 from osrm_client import get_distance_matrix_from_central_cache
+from vehicle_numbering import format_route_bus_number, order_routes_for_output
 
 try:
     from folium.plugins import PolyLineTextPath
@@ -196,13 +197,13 @@ def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_
         suffix += 1
 
 
-def _format_output_bus_number(output_config: OutputConfig, route_index: int) -> str:
-    prefix = str(getattr(output_config, "excel_bus_number_prefix", "10045010") or "")
-    try:
-        digits = int(getattr(output_config, "excel_bus_number_digits", 2) or 2)
-    except (TypeError, ValueError):
-        digits = 2
-    return f"{prefix}{route_index + 1:0{max(1, digits)}d}"
+def _format_output_bus_number(
+    output_config: OutputConfig,
+    route_index: int,
+    route: Optional[Route] = None,
+    routes: Optional[List[Route]] = None,
+) -> str:
+    return format_route_bus_number(output_config, route_index, route=route, routes=routes)
 
 
 # Цветове за всеки отделен автобус
@@ -927,10 +928,17 @@ class InteractiveMapGenerator:
 
         return ", ".join(documents)
 
-    def _route_delivery_order_html_comment(self, route: Route, route_number: int) -> str:
+    def _route_delivery_order_html_comment(
+        self,
+        route: Route,
+        route_number: int,
+        all_routes: Optional[List[Route]] = None,
+    ) -> str:
+        bus_number = _format_output_bus_number(self.config, route_number - 1, route, all_routes)
         lines = [
             "CVRP_ROUTE_DELIVERY_ORDER",
             f"route_number={_html_comment_safe(route_number)}",
+            f"bus_id={_html_comment_safe(bus_number)}",
             f"vehicle={_html_comment_safe(_route_vehicle_name(route))}",
             "delivery_order | customer_id | customer_name | document | delivery_comment",
         ]
@@ -1194,6 +1202,7 @@ class InteractiveMapGenerator:
         self,
         route: Route,
     ) -> Tuple[List[Tuple[float, float]], bool, str]:
+        route_valhalla_config = self._route_valhalla_config(route)
         route_depot = self._route_start_location(route)
         route_end = self._route_end_location(route)
         waypoints = [route_depot]
@@ -1205,16 +1214,18 @@ class InteractiveMapGenerator:
         if not route.customers:
             return waypoints, False, "Няма клиенти"
 
-        if not self.use_routing:
+        if not self.use_routing and route_valhalla_config is None:
             return waypoints, True, "Прави линии"
 
         engine_name = (
-            "Valhalla"
+            "Valhalla truck"
+            if route_valhalla_config is not None
+            else "Valhalla"
             if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value
             else "OSRM"
         )
         try:
-            route_geometry = self._get_full_route_geometry(waypoints)
+            route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
             if len(route_geometry) > 2:
                 return route_geometry, False, f"{engine_name} маршрут"
         except Exception as e:
@@ -1248,8 +1259,11 @@ class InteractiveMapGenerator:
         routes: List[Route],
         start_number: int = 1,
         include_start_in_customer_popups: bool = True,
+        all_routes: Optional[List[Route]] = None,
+        show_bus_ids: bool = True,
     ) -> List[Dict[str, object]]:
         google_routes = []
+        numbering_routes = all_routes or routes
         for route_idx, route in enumerate(routes):
             route_number = start_number + route_idx
             vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
@@ -1259,6 +1273,7 @@ class InteractiveMapGenerator:
                 "name": "Неизвестен",
             })
             vehicle_name = _route_vehicle_name(route)
+            bus_number = _format_output_bus_number(self.config, route_number - 1, route, numbering_routes)
             bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
             geometry, dashed, geometry_label = self._get_route_visual_geometry(route)
             schedule_by_index = self._route_schedule_by_index(route)
@@ -1274,20 +1289,23 @@ class InteractiveMapGenerator:
                 schedule_entry = schedule_by_index.get(client_number)
                 arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
                 departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
+                popup_lines = [
+                    f"<b>Клиент:</b> {html.escape(str(customer.name))}",
+                    f"<b>ID:</b> {html.escape(str(customer.id))}",
+                    f"<b>Ред в маршрута:</b> #{client_number}",
+                    f"<b>Обем:</b> {customer.volume:.2f} ст.",
+                    f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
+                    *self._schedule_popup_lines(
+                        schedule_entry,
+                        include_start=include_start_in_customer_popups,
+                    ),
+                    self._popup_action_buttons(navigation_url, street_view_url),
+                ]
+                if show_bus_ids:
+                    popup_lines.insert(0, f"<b>ID бус:</b> {html.escape(str(bus_number))}")
                 popup_html = self._html_popup(
                     f"Автобус {route_number} - {vehicle_name}",
-                    [
-                        f"<b>Клиент:</b> {html.escape(str(customer.name))}",
-                        f"<b>ID:</b> {html.escape(str(customer.id))}",
-                        f"<b>Ред в маршрута:</b> #{client_number}",
-                        f"<b>Обем:</b> {customer.volume:.2f} ст.",
-                        f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
-                        *self._schedule_popup_lines(
-                            schedule_entry,
-                            include_start=include_start_in_customer_popups,
-                        ),
-                        self._popup_action_buttons(navigation_url, street_view_url),
-                    ],
+                    popup_lines,
                     bus_color,
                 )
                 markers.append({
@@ -1305,16 +1323,19 @@ class InteractiveMapGenerator:
                     "departureTime": departure_time_text,
                 })
 
+            route_popup_lines = [
+                f"<b>{geometry_label}:</b> {'прави линии' if dashed else 'реална геометрия'}",
+                f"<b>Клиенти:</b> {len(route.customers)}",
+                f"<b>Разстояние:</b> {route.total_distance_km:.1f} км",
+                f"<b>Време:</b> {route.total_time_minutes:.0f} мин",
+                f"<b>Обем:</b> {route.total_volume:.1f} ст.",
+                f"<b>Геометрия:</b> {len(geometry)} точки",
+            ]
+            if show_bus_ids:
+                route_popup_lines.insert(0, f"<b>ID бус:</b> {html.escape(str(bus_number))}")
             popup_html = self._html_popup(
                 f"Автобус {route_number} - {vehicle_name}",
-                [
-                    f"<b>{geometry_label}:</b> {'прави линии' if dashed else 'реална геометрия'}",
-                    f"<b>Клиенти:</b> {len(route.customers)}",
-                    f"<b>Разстояние:</b> {route.total_distance_km:.1f} км",
-                    f"<b>Време:</b> {route.total_time_minutes:.0f} мин",
-                    f"<b>Обем:</b> {route.total_volume:.1f} ст.",
-                    f"<b>Геометрия:</b> {len(geometry)} точки",
-                ],
+                route_popup_lines,
                 bus_color,
             )
             google_routes.append({
@@ -1322,6 +1343,7 @@ class InteractiveMapGenerator:
                 "name": f"{vehicle_name} ({len(route.customers)} клиента)",
                 "color": bus_color,
                 "vehicleName": vehicle_name,
+                "startPoint": self._google_route_start_point(route),
                 "routeStartTime": route_start_time_text,
                 "routeEndTime": self._route_end_time_text(route),
                 "markers": markers,
@@ -1335,6 +1357,25 @@ class InteractiveMapGenerator:
                 "googleMissingCoords": len(route.customers) - len(markers),
             })
         return google_routes
+
+    def _should_show_route_start_marker(self, route: Route) -> bool:
+        return bool(getattr(route, "open_route", False) or getattr(route, "driver_id", ""))
+
+    def _google_route_start_point(self, route: Route) -> Optional[Dict[str, object]]:
+        if not self._should_show_route_start_marker(route):
+            return None
+        start = self._route_start_location(route)
+        if not start:
+            return None
+        driver_label = str(getattr(route, "driver_id", "") or _route_vehicle_name(route))
+        return {
+            "position": self._json_coords(start),
+            "title": "Начало",
+            "popup": self._html_popup("Начало", [
+                f"<b>Координати:</b> {start[0]:.6f}, {start[1]:.6f}",
+                f"<b>Шофьор:</b> {html.escape(driver_label)}",
+            ], "#188038"),
+        }
 
     def _depot_name(self, depot: Tuple[float, float]) -> str:
         locations = get_config().locations
@@ -1356,6 +1397,7 @@ class InteractiveMapGenerator:
         routes: List[Route],
         depot_locations: List[Tuple[float, float]],
         single_route_number: Optional[int] = None,
+        all_routes: Optional[List[Route]] = None,
     ) -> GoogleMapDocument:
         api_key = self._get_google_maps_api_key()
         if not api_key:
@@ -1388,6 +1430,8 @@ class InteractiveMapGenerator:
                 routes,
                 route_start,
                 include_start_in_customer_popups=single_route_number is None,
+                all_routes=all_routes,
+                show_bus_ids=single_route_number is not None,
             ),
             "singleRouteNumber": single_route_number,
             "totals": {
@@ -1398,7 +1442,7 @@ class InteractiveMapGenerator:
             },
         }
 
-        if get_center_zones(cfg.locations):
+        if get_center_zones(cfg.locations) and not any(self._should_show_route_start_marker(route) for route in routes):
             map_data["centerZone"] = self._center_zone_map_data(cfg.locations)
 
         data_json = json.dumps(map_data, ensure_ascii=False)
@@ -1662,6 +1706,26 @@ class InteractiveMapGenerator:
           infoWindow.setPosition(event.latLng);
           infoWindow.open(map);
         }});
+
+        if (route.startPoint) {{
+          const startMarker = new google.maps.Marker({{
+            position: route.startPoint.position,
+            map,
+            title: route.startPoint.title || "Начало",
+            label: {{ text: "S", color: "white", fontWeight: "bold" }},
+            zIndex: 10000,
+            icon: {{
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 14,
+              fillColor: "#188038",
+              fillOpacity: 1,
+              strokeColor: "#ffffff",
+              strokeWeight: 3
+            }}
+          }});
+          startMarker.addListener("click", () => infoWindow.setContent(route.startPoint.popup) || infoWindow.open(map, startMarker));
+          bounds.extend(route.startPoint.position);
+        }}
 
         const markerObjects = route.markers.map((point) => {{
           const marker = new google.maps.Marker({{
@@ -2057,10 +2121,11 @@ class InteractiveMapGenerator:
             logger.warning("📐 Използвам прави линии (Routing engine недостъпен)")
             
         # Взимаме всички уникални депа от маршрутите
+        display_routes = order_routes_for_output(solution.routes)
         unique_depots = {depot_location}  # Добавяме основното депо
         
         # Добавяме депата от маршрутите
-        for route in solution.routes:
+        for route in display_routes:
             if hasattr(route, 'depot_location') and route.depot_location:
                 unique_depots.add(route.depot_location)
             route_end = getattr(route, "end_location", None)
@@ -2071,7 +2136,7 @@ class InteractiveMapGenerator:
             return self._build_google_html(
                 "Интерактивна карта",
                 depot_location,
-                solution.routes,
+                display_routes,
                 list(unique_depots),
             )
         
@@ -2089,13 +2154,13 @@ class InteractiveMapGenerator:
 
         # Добавяне на маршрутите с OSRM геометрия
         if self.config.show_route_colors:
-            self._add_routes_to_map(route_map, solution.routes)
+            self._add_routes_to_map(route_map, display_routes)
 
         # GPS търсачка за временни пинове в общата карта
         self._add_coordinate_pin_search(route_map)
 
         # Добавяне на легенда
-        self._add_legend(route_map, solution.routes)
+        self._add_legend(route_map, display_routes)
 
         return route_map
     
@@ -2116,6 +2181,30 @@ class InteractiveMapGenerator:
         """Добавя маркер за едно депо (поддържа се за обратна съвместимост)"""
         self._add_depot_markers(route_map, [depot_location])
     
+    def _add_route_start_marker(self, route_map: folium.Map, route: Route, start_location: Optional[Tuple[float, float]] = None):
+        if not self._should_show_route_start_marker(route):
+            return
+        start = start_location or self._route_start_location(route)
+        if not start:
+            return
+        driver_label = html.escape(str(getattr(route, "driver_id", "") or _route_vehicle_name(route)))
+        popup_html = (
+            "<b>Начало</b><br>"
+            f"Координати: {start[0]:.6f}, {start[1]:.6f}<br>"
+            f"Шофьор: {driver_label}"
+        )
+        folium.CircleMarker(
+            location=start,
+            radius=10,
+            color="#ffffff",
+            weight=3,
+            fill=True,
+            fill_color="#188038",
+            fill_opacity=1,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip="Начало",
+        ).add_to(route_map)
+
     def _add_center_zone_circle(self, route_map: folium.Map, center_location: Tuple[float, float], radius_km: float):
         """Добавя кръг за център зоната"""
         folium.Circle(
@@ -2222,15 +2311,26 @@ class InteractiveMapGenerator:
             # Fallback към права линия
             return [start_coords, end_coords]
     
+    def _route_valhalla_config(self, route: Optional[Route]):
+        return getattr(route, "tsp_valhalla_config", None) if route is not None else None
+
+    def _valhalla_costing_options(self, valhalla_config) -> dict:
+        try:
+            from valhalla_client import build_valhalla_costing_options
+            return build_valhalla_costing_options(valhalla_config)
+        except Exception:
+            return {}
+
     def _get_valhalla_route_geometry(self, start_coords: Tuple[float, float],
-                                     end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
+                                     end_coords: Tuple[float, float],
+                                     valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава реална геометрия на маршрута от Valhalla Route API"""
         try:
             import requests
             import json
             from config import get_config
             
-            valhalla_config = get_config().valhalla
+            valhalla_config = valhalla_config or get_config().valhalla
             base_url = valhalla_config.base_url.rstrip('/')
             
             # Valhalla Route API заявка
@@ -2244,6 +2344,7 @@ class InteractiveMapGenerator:
                     "units": "kilometers"
                 }
             }
+            route_request.update(self._valhalla_costing_options(valhalla_config))
             
             route_url = f"{base_url}/route"
             response = requests.post(route_url, json=route_request, timeout=10)
@@ -2297,14 +2398,15 @@ class InteractiveMapGenerator:
         return decoded
     
     def _get_route_geometry(self, start_coords: Tuple[float, float],
-                           end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
+                           end_coords: Tuple[float, float],
+                           valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава геометрия на маршрута от избрания routing engine"""
-        if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value:
-            return self._get_valhalla_route_geometry(start_coords, end_coords)
+        if valhalla_config is not None or (self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value):
+            return self._get_valhalla_route_geometry(start_coords, end_coords, valhalla_config=valhalla_config)
         else:
             return self._get_osrm_route_geometry(start_coords, end_coords)
     
-    def _get_full_route_geometry(self, waypoints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _get_full_route_geometry(self, waypoints: List[Tuple[float, float]], valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава пълната геометрия за маршрут с множество точки.
         Ако има твърде много точки, използваме fallback за по-бърза работа.
         """
@@ -2320,7 +2422,7 @@ class InteractiveMapGenerator:
             full_geometry = []
             for i in range(len(waypoints) - 1):
                 # За всеки сегмент взимаме геометрията (или права линия при грешка)
-                segment_geometry = self._get_route_geometry(waypoints[i], waypoints[i+1])
+                segment_geometry = self._get_route_geometry(waypoints[i], waypoints[i+1], valhalla_config=valhalla_config)
                 if i > 0:
                     # Премахваме първата точка, за да няма дублиране
                     segment_geometry = segment_geometry[1:]
@@ -2328,19 +2430,19 @@ class InteractiveMapGenerator:
             return full_geometry
 
         # Използваме подходящия routing engine
-        if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value:
-            return self._get_full_route_geometry_valhalla(waypoints)
+        if valhalla_config is not None or (self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value):
+            return self._get_full_route_geometry_valhalla(waypoints, valhalla_config=valhalla_config)
         else:
             return self._get_full_route_geometry_osrm(waypoints)
     
-    def _get_full_route_geometry_valhalla(self, waypoints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _get_full_route_geometry_valhalla(self, waypoints: List[Tuple[float, float]], valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава пълната геометрия за маршрут с множество точки от Valhalla."""
         try:
             import requests
             import json
             from config import get_config
             
-            valhalla_config = get_config().valhalla
+            valhalla_config = valhalla_config or get_config().valhalla
             base_url = valhalla_config.base_url.rstrip('/')
             
             # Форматираме locations за Valhalla
@@ -2353,6 +2455,7 @@ class InteractiveMapGenerator:
                     "units": "kilometers"
                 }
             }
+            route_request.update(self._valhalla_costing_options(valhalla_config))
             
             route_url = f"{base_url}/route"
             response = requests.post(route_url, json=route_request, timeout=30)
@@ -2382,7 +2485,7 @@ class InteractiveMapGenerator:
             # Fallback към последователност от сегменти
             full_geometry = []
             for i in range(len(waypoints) - 1):
-                segment = self._get_valhalla_route_geometry(waypoints[i], waypoints[i + 1])
+                segment = self._get_valhalla_route_geometry(waypoints[i], waypoints[i + 1], valhalla_config=valhalla_config)
                 if i == 0:
                     full_geometry.extend(segment)
                 else:
@@ -2449,6 +2552,7 @@ class InteractiveMapGenerator:
                 'name': 'Неизвестен'
             })
             vehicle_name = _route_vehicle_name(route)
+            bus_number = _format_output_bus_number(self.config, route_idx, route, routes)
             
             # Всеки автобус получава уникален цвят
             bus_color = BUS_COLORS[route_idx % len(BUS_COLORS)]
@@ -2526,8 +2630,9 @@ class InteractiveMapGenerator:
                     marker.add_to(bus_layer)
             
             # Създаваме пълния маршрут: депо -> клиенти -> депо
-            if route.customers and self.use_routing:
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+            route_valhalla_config = self._route_valhalla_config(route)
+            if route.customers and (self.use_routing or route_valhalla_config is not None):
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 logger.info(f"🛣️ Получавам {engine_name} маршрут за Автобус {route_idx + 1} с {len(route.customers)} клиента")
                 
                 # Използваме старт/край от самия маршрут.
@@ -2542,11 +2647,11 @@ class InteractiveMapGenerator:
                 waypoints.append(route_end)
                 
                 # Определяме името на routing engine
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 
                 # Получаваме реалната геометрия
                 try:
-                    route_geometry = self._get_full_route_geometry(waypoints)
+                    route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
                     
                     if len(route_geometry) > 2:
                         # Създаваме popup с информация за маршрута
@@ -3811,8 +3916,13 @@ class InteractiveMapGenerator:
         '''
         route_map.add_child(SingleRouteGoogleSegmentsPanel(panel_html, panel_css))
     
-    def create_single_route_map(self, route: Route, route_number: int,
-                                depot_location: Tuple[float, float]) -> folium.Map:
+    def create_single_route_map(
+        self,
+        route: Route,
+        route_number: int,
+        depot_location: Tuple[float, float],
+        all_routes: Optional[List[Route]] = None,
+    ) -> folium.Map:
         """Създава интерактивна карта за един отделен маршрут"""
         logger.info(f"Създавам карта за маршрут {route_number}")
 
@@ -3839,19 +3949,21 @@ class InteractiveMapGenerator:
                 [route],
                 list(dict.fromkeys([route_depot, route_end])),
                 single_route_number=route_number,
+                all_routes=all_routes,
             )
-            setattr(route_document, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number))
+            setattr(route_document, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number, all_routes))
             return route_document
 
         route_map = self._create_folium_map(center)
 
         # Добавяме маркер за депото
         self._add_depot_markers(route_map, list(dict.fromkeys([route_depot, route_end])))
+        self._add_route_start_marker(route_map, route, route_depot)
 
         # Добавяме център зоната
         from config import get_config
         cfg = get_config()
-        if get_center_zones(cfg.locations):
+        if get_center_zones(cfg.locations) and not self._should_show_route_start_marker(route):
             self._add_center_zone_shape(route_map, cfg.locations)
 
         # Добавяме маршрута
@@ -3859,10 +3971,11 @@ class InteractiveMapGenerator:
             'color': 'gray', 'icon': 'circle', 'prefix': 'fa', 'name': 'Неизвестен'
         })
         vehicle_name = _route_vehicle_name(route)
+        bus_number = _format_output_bus_number(self.config, route_number - 1, route, all_routes)
         bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
 
         bus_layer = folium.FeatureGroup(
-            name=f"\U0001f68c {vehicle_name} ({len(route.customers)} клиента)")
+            name=f"\U0001f68c {vehicle_name} - {bus_number} ({len(route.customers)} клиента)")
         marker_entries = []
         schedule_by_index = self._route_schedule_by_index(route)
         route_start_time_text = self._route_start_time_text(route)
@@ -3969,10 +4082,11 @@ class InteractiveMapGenerator:
                     waypoints.append(customer.coordinates)
             waypoints.append(route_end)
 
-            if self.use_routing:
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+            route_valhalla_config = self._route_valhalla_config(route)
+            if self.use_routing or route_valhalla_config is not None:
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 try:
-                    route_geometry = self._get_full_route_geometry(waypoints)
+                    route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
                     if len(route_geometry) > 2:
                         polyline = folium.PolyLine(
                             route_geometry, color=bus_color, weight=4, opacity=0.8
@@ -4013,6 +4127,7 @@ class InteractiveMapGenerator:
             \U0001f68c Маршрут {route_number} - {vehicle_name}
         </h4>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4ca Клиенти: {len(route.customers)}</p>
+        <p style="margin: 3px 0; font-size: 12px;">ID бус: {html.escape(str(bus_number))}</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4cf Разстояние: {route.total_distance_km:.1f} км</p>
         <p style="margin: 3px 0; font-size: 12px;">\u23f1 Време: {route.total_time_minutes:.0f} мин</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} ст.</p>
@@ -4021,7 +4136,7 @@ class InteractiveMapGenerator:
         </div>
         '''
         route_map.get_root().add_child(folium.Element(legend_html))
-        setattr(route_map, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number))
+        setattr(route_map, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number, all_routes))
 
         return route_map
 
@@ -4204,7 +4319,7 @@ class ExcelExporter:
                 distance_to_center = self._calculate_distance_to_center(customer.coordinates, center_location) if customer.coordinates else 0.0
                 
                 data = [
-                    self._format_report_bus_number(i),  # Маршрут / номер бус
+                    self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
                     i + 1,  # Номер маршрут
                     vehicle_name,  # Превозно средство
                     j,  # Ред в маршрута
@@ -4470,7 +4585,7 @@ class ExcelExporter:
             start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
             
             data = [
-                self._format_report_bus_number(i),  # Маршрут / номер бус
+                self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
                 i + 1,  # Номер маршрут
                 vehicle_name,  # Тип бус
                 len(route.customers),  # Брой клиенти
@@ -4667,15 +4782,14 @@ class ExcelExporter:
         """Връща продължителност в часове за CVRP отчета."""
         return round(float(total_minutes or 0) / 60, 2)
 
-    def _format_report_bus_number(self, route_index: int) -> str:
+    def _format_report_bus_number(
+        self,
+        route_index: int,
+        route: Optional[Route] = None,
+        routes: Optional[List[Route]] = None,
+    ) -> str:
         """Форматира номера на буса за Excel отчетите."""
-        prefix = str(getattr(self.config, "excel_bus_number_prefix", "10045010") or "")
-        try:
-            digits = int(getattr(self.config, "excel_bus_number_digits", 2) or 2)
-        except (TypeError, ValueError):
-            digits = 2
-        digits = max(1, digits)
-        return f"{prefix}{route_index + 1:0{digits}d}"
+        return _format_output_bus_number(self.config, route_index, route=route, routes=routes)
 
     def _get_report_vehicle_name(self, vehicle_or_route, default="Неизвестен") -> str:
         """Име на превозното средство за CVRP отчета."""
@@ -4723,7 +4837,7 @@ class ExcelExporter:
             previous_stop_name = "Депо"
             for j, customer in enumerate(route.customers):
                 data.append({
-                    'ID бус': self._format_report_bus_number(i),
+                    'ID бус': self._format_report_bus_number(i, route, solution.routes),
                     'Маршрут': i + 1,
                     'Превозно средство': vehicle_name,
                     'Ред в маршрута': j + 1,
@@ -5138,6 +5252,7 @@ class OutputHandler:
                            depot_location: Tuple[float, float]) -> Dict[str, str]:
         """Генерира всички изходни файлове и връща речник с пътищата до тях"""
         logger.info("Започвам генериране на изходни файлове")
+        solution.routes = order_routes_for_output(solution.routes)
         output_files = {}
 
         # 1. Интерактивна карта (обща)
@@ -5166,7 +5281,7 @@ class OutputHandler:
                     for idx, route in enumerate(solution.routes):
                         route_number = idx + 1
                         try:
-                            single_map = map_gen.create_single_route_map(route, route_number, depot_location)
+                            single_map = map_gen.create_single_route_map(route, route_number, depot_location, solution.routes)
                             route_filename = _route_map_file_name(
                                 route,
                                 route_number,
@@ -5179,7 +5294,7 @@ class OutputHandler:
                             route_map_items.append(
                                 {
                                     "file_path": saved_route_file,
-                                    "bus_id": _format_output_bus_number(self.config, idx),
+                                    "bus_id": _format_output_bus_number(self.config, idx, route, solution.routes),
                                 }
                             )
                             generated_route_maps += 1

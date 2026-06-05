@@ -8,6 +8,7 @@ normal routes, and optionally uploads that map with the driver ID in pData2[].
 
 from __future__ import annotations
 
+from copy import deepcopy
 import html
 import logging
 import math
@@ -36,6 +37,9 @@ from output_handler import InteractiveMapGenerator, OutputHandler
 logger = logging.getLogger(__name__)
 
 _CUSTOMER_LIST_KEYS = ("customers", "clients", "orders", "data", "items", "records")
+_TSP_UPLOAD_URL_KEYS = ("html_upload_url", "map_upload_url", "upload_url", "route_maps_upload_url", "url")
+_TSP_UPLOAD_TOKEN_KEYS = ("html_upload_token", "map_upload_token", "upload_token", "route_maps_upload_token")
+_TSP_UPLOAD_MODE_KEYS = ("html_upload_mode", "map_upload_mode", "upload_mode", "route_maps_upload_mode")
 _DRIVER_ID_KEYS = ("driver_id", "driverId", "id_driver", "IdDriver", "id_shofior", "IdShofior")
 _DRIVER_NAME_KEYS = ("driver_name", "driverName", "name_driver", "DriverName")
 _DRIVER_LOCATION_KEYS = ("driver_location", "current_location", "currentLocation", "location", "gps", "GPS")
@@ -128,6 +132,7 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     two_opt_max_passes = _tsp_two_opt_max_passes(payload, active_config)
     vehicle_type = _vehicle_type(payload)
     vehicle_config = _vehicle_config_for_type(active_config, vehicle_type)
+    tsp_valhalla_config = _tsp_valhalla_truck_config(active_config, driver_id)
 
     matrix_locations = [start_location] + [c.coordinates for c in customers]
     end_node = None
@@ -135,7 +140,7 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         matrix_locations.append(end_location)
         end_node = len(matrix_locations) - 1
 
-    matrix = _build_distance_matrix(active_config, matrix_locations)
+    matrix = _build_distance_matrix(active_config, matrix_locations, tsp_valhalla_config)
     ordered_customers, route_node_order = _solve_open_tsp_order(
         customers,
         matrix,
@@ -175,13 +180,17 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     setattr(route, "open_route", True)
     setattr(route, "total_turnover", sum(float(getattr(customer, "turnover", 0) or 0) for customer in ordered_customers))
     setattr(route, "tsp_metric", metric)
+    if tsp_valhalla_config is not None:
+        setattr(route, "tsp_valhalla_config", tsp_valhalla_config)
+        setattr(route, "tsp_routing_profile", "valhalla_truck")
 
     map_file = None
     upload_summary = None
     if _tsp_generate_map_enabled(payload, active_config):
         map_file = _generate_tsp_map(active_config, route, driver_id)
         if _tsp_upload_map_enabled(payload, active_config):
-            upload_summary = OutputHandler(active_config.output)._upload_route_maps(
+            upload_config = _tsp_upload_output_config(payload, active_config)
+            upload_summary = OutputHandler(upload_config)._upload_route_maps(
                 [{"file_path": map_file, "bus_id": driver_id}]
             )
 
@@ -198,6 +207,8 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
             "two_opt_enabled": two_opt_enabled,
             "two_opt_max_passes": two_opt_max_passes,
             "service_time_minutes": service_time_minutes,
+            "routing_profile": "valhalla_truck" if tsp_valhalla_config is not None else "default",
+            "valhalla_truck": _tsp_valhalla_truck_settings_json(tsp_valhalla_config),
         },
         "start_location": _coords_dict(start_location),
         "end_location": _coords_dict(end_location) if end_location else None,
@@ -597,7 +608,7 @@ def _vehicle_config_for_type(config: MainConfig, vehicle_type: VehicleType) -> O
 
 def _service_time_minutes(payload: Dict[str, Any], config: MainConfig) -> float:
     value = _first_present(payload, "service_time_minutes", "service_minutes", "serviceTimeMinutes")
-    if value is not None:
+    if _clean_text(value):
         return max(0.0, _parse_float(value, default=0.0))
     api_config = getattr(config, "api", None)
     if api_config is not None and hasattr(api_config, "tsp_default_service_time_minutes"):
@@ -684,6 +695,11 @@ def _tsp_generate_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bo
         "tsp_local_html",
     )
     if value is None:
+        upload_value = _first_present(payload, "upload_map", "upload_html_map", "tsp_upload_map", "tsp_upload_html_map")
+        if upload_value is not None and _payload_bool({"value": upload_value}, "value", default=False):
+            return True
+        if _clean_text(_first_present(payload, *_TSP_UPLOAD_URL_KEYS)):
+            return True
         return default
     return _payload_bool({"value": value}, "value", default=default)
 
@@ -693,8 +709,31 @@ def _tsp_upload_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bool
     default = bool(getattr(api_config, "tsp_upload_html_map", True))
     value = _first_present(payload, "upload_map", "upload_html_map", "tsp_upload_map", "tsp_upload_html_map")
     if value is None:
+        if _clean_text(_first_present(payload, *_TSP_UPLOAD_URL_KEYS)):
+            return True
         return default
     return _payload_bool({"value": value}, "value", default=default)
+
+
+def _tsp_upload_output_config(payload: Dict[str, Any], config: MainConfig):
+    upload_config = deepcopy(config.output)
+
+    upload_url = _clean_text(_first_present(payload, *_TSP_UPLOAD_URL_KEYS))
+    if upload_url:
+        setattr(upload_config, "route_maps_upload_url", upload_url)
+        mode = str(getattr(upload_config, "route_maps_upload_mode", "") or "").strip().lower()
+        if mode in {"", "0", "false", "off", "none", "disabled"}:
+            setattr(upload_config, "route_maps_upload_mode", "effect_upload")
+
+    upload_token = _clean_text(_first_present(payload, *_TSP_UPLOAD_TOKEN_KEYS))
+    if upload_token:
+        setattr(upload_config, "route_maps_upload_token", upload_token)
+
+    upload_mode = _clean_text(_first_present(payload, *_TSP_UPLOAD_MODE_KEYS))
+    if upload_mode:
+        setattr(upload_config, "route_maps_upload_mode", upload_mode)
+
+    return upload_config
 
 
 def _start_time_minutes(payload: Dict[str, Any], config: MainConfig) -> int:
@@ -707,15 +746,154 @@ def _start_time_minutes(payload: Dict[str, Any], config: MainConfig) -> int:
     return now.hour * 60 + now.minute
 
 
-def _build_distance_matrix(config: MainConfig, locations: List[Tuple[float, float]]) -> DistanceMatrix:
+def _split_configured_ids(value: Any) -> set:
+    if value is None:
+        return set()
+    text = str(value).strip()
+    if not text:
+        return set()
+    return {part.strip().lower() for part in re.split(r"[,\s;]+", text) if part.strip()}
+
+
+def _parse_bool_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "да"}
+
+
+def _parse_tsp_truck_profiles(raw: Any) -> List[Dict[str, Any]]:
+    profiles = []
+    for line in str(raw or "").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        parts = [part.strip() for part in text.split("|")]
+        profile = {
+            "name": parts[0] if parts else "Truck profile",
+            "ids": "",
+            "height": 3.5,
+            "width": 2.5,
+            "length": 7.0,
+            "weight": 10.0,
+            "axle_load": 9.0,
+            "axle_count": 2,
+            "hazmat": False,
+            "hgv_no_access_penalty": 43200,
+        }
+        aliases = {
+            "driver_ids": "ids",
+            "drivers": "ids",
+            "bus_ids": "ids",
+            "h": "height",
+            "w": "width",
+            "l": "length",
+            "axles": "axle_count",
+            "hgv_penalty": "hgv_no_access_penalty",
+        }
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = aliases.get(key.strip().lower(), key.strip().lower())
+            value = value.strip()
+            if key == "ids":
+                profile["ids"] = value
+            elif key == "hazmat":
+                profile["hazmat"] = _parse_bool_value(value, False)
+            elif key in {"axle_count", "hgv_no_access_penalty"}:
+                profile[key] = int(round(_parse_float(value, profile[key])))
+            elif key in {"height", "width", "length", "weight", "axle_load"}:
+                profile[key] = _parse_float(value, profile[key])
+        if profile.get("ids"):
+            profiles.append(profile)
+    return profiles
+
+
+def _matching_tsp_truck_profile(api_config, driver_id: str) -> Optional[Dict[str, Any]]:
+    driver_key = str(driver_id or "").strip().lower()
+    for profile in _parse_tsp_truck_profiles(getattr(api_config, "tsp_valhalla_truck_profiles", "")):
+        if driver_key in _split_configured_ids(profile.get("ids")):
+            return profile
+    return None
+
+
+def _tsp_valhalla_truck_config(config: MainConfig, driver_id: str):
+    api_config = getattr(config, "api", None)
+    matched_profile = _matching_tsp_truck_profile(api_config, driver_id)
+    configured_ids = _split_configured_ids(getattr(api_config, "tsp_valhalla_truck_driver_ids", ""))
+    if matched_profile is None and (not configured_ids or str(driver_id).strip().lower() not in configured_ids):
+        return None
+
+    valhalla_config = deepcopy(getattr(config, "valhalla", None))
+    if valhalla_config is None:
+        return None
+
+    setattr(valhalla_config, "costing", "truck")
+    if matched_profile is not None:
+        setattr(valhalla_config, "truck_height", matched_profile.get("height", 3.5))
+        setattr(valhalla_config, "truck_width", matched_profile.get("width", 2.5))
+        setattr(valhalla_config, "truck_length", matched_profile.get("length", 7.0))
+        setattr(valhalla_config, "truck_weight", matched_profile.get("weight", 10.0))
+        setattr(valhalla_config, "truck_axle_load", matched_profile.get("axle_load", 9.0))
+        setattr(valhalla_config, "truck_axle_count", matched_profile.get("axle_count", 2))
+        setattr(valhalla_config, "truck_hazmat", matched_profile.get("hazmat", False))
+        setattr(valhalla_config, "truck_hgv_no_access_penalty", matched_profile.get("hgv_no_access_penalty", 43200))
+        setattr(valhalla_config, "truck_profile_name", matched_profile.get("name", "Truck profile"))
+    else:
+        field_map = {
+            "tsp_valhalla_truck_height": "truck_height",
+            "tsp_valhalla_truck_width": "truck_width",
+            "tsp_valhalla_truck_length": "truck_length",
+            "tsp_valhalla_truck_weight": "truck_weight",
+            "tsp_valhalla_truck_axle_load": "truck_axle_load",
+            "tsp_valhalla_truck_axle_count": "truck_axle_count",
+            "tsp_valhalla_truck_hazmat": "truck_hazmat",
+            "tsp_valhalla_truck_hgv_no_access_penalty": "truck_hgv_no_access_penalty",
+        }
+        for api_attr, valhalla_attr in field_map.items():
+            if hasattr(api_config, api_attr):
+                setattr(valhalla_config, valhalla_attr, getattr(api_config, api_attr))
+        setattr(valhalla_config, "truck_profile_name", "Default truck")
+
+    return valhalla_config
+
+
+def _tsp_valhalla_truck_settings_json(valhalla_config) -> Optional[Dict[str, Any]]:
+    if valhalla_config is None:
+        return None
+    return {
+        "profile_name": getattr(valhalla_config, "truck_profile_name", "Truck profile"),
+        "costing": getattr(valhalla_config, "costing", ""),
+        "height": getattr(valhalla_config, "truck_height", None),
+        "width": getattr(valhalla_config, "truck_width", None),
+        "length": getattr(valhalla_config, "truck_length", None),
+        "weight": getattr(valhalla_config, "truck_weight", None),
+        "axle_load": getattr(valhalla_config, "truck_axle_load", None),
+        "axle_count": getattr(valhalla_config, "truck_axle_count", None),
+        "hazmat": getattr(valhalla_config, "truck_hazmat", None),
+        "hgv_no_access_penalty": getattr(valhalla_config, "truck_hgv_no_access_penalty", None),
+    }
+
+
+def _build_distance_matrix(
+    config: MainConfig,
+    locations: List[Tuple[float, float]],
+    valhalla_config_override=None,
+) -> DistanceMatrix:
     routing_engine = getattr(getattr(config, "routing", None), "engine", RoutingEngine.OSRM)
-    is_valhalla = getattr(routing_engine, "value", routing_engine) == RoutingEngine.VALHALLA.value
+    is_valhalla = (
+        valhalla_config_override is not None
+        or getattr(routing_engine, "value", routing_engine) == RoutingEngine.VALHALLA.value
+    )
 
     if is_valhalla:
         try:
             from valhalla_client import ValhallaClient
 
-            client = ValhallaClient(getattr(config, "valhalla", None))
+            valhalla_config = valhalla_config_override or getattr(config, "valhalla", None)
+            client = ValhallaClient(valhalla_config)
             try:
                 if client.check_server_status():
                     return client.get_distance_matrix(locations)

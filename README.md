@@ -22,8 +22,10 @@
 - В общата карта има GPS търсачка за временни пинове по координати, с име и обем, ако са подадени.
 - Показва посока на движение по маршрутите с разредени стрелки.
 - Поддържа отделен `/tsp` режим за текущ маршрут на един шофьор: текуща GPS позиция, optional крайна точка, клиенти, работно време, оборот, количество и коментар.
+- Поддържа TSP Valhalla truck профили по ID на шофьор/бус: различни височина, ширина, дължина, тегло, оси и HGV настройки за различни групи шофьори.
 - Имената на TSP JSON полетата могат да се настройват от GUI, например ако външната система изпраща `Coord` вместо `gps` или `DriverNote` вместо `comment`.
 - Добавя дата на стартиране към имената на общата карта, Excel файловете и отделните route карти. CSV файлът остава без дата.
+- Може да стартира локална Valhalla в Docker и да обновява картата всеки ден чрез отделен update скрипт.
 - Има GUI за настройки и Windows Task Scheduler интеграция.
 - Може да работи като Python проект или да се build-не до `CVRP_Optimizer.exe`.
 
@@ -45,11 +47,15 @@
 | `cvrp_api_server.py` | HTTP API за `/health`, `/run`, `/solve` и `/tsp`. |
 | `current_tsp.py` | Отделен TSP режим за текущ маршрут на един шофьор. |
 | `setdata_client.py` | Връщане на резултата към Bizant чрез `setData` и `makeGroup`. |
+| `vehicle_numbering.py` | Номериране на route/bus ID-та в отчетите, картите и `setData`. |
 | `build_exe.py` | Автоматизиран build с PyInstaller. |
 | `start_cvrp.bat` | Стартира EXE, ако има; иначе стартира през `.venv`. |
 | `Settings.bat` | Отваря настройките през EXE или `.venv`. |
 | `start_api_server.bat` | Стартира API сървъра с видим прозорец. |
 | `start_api_server_hidden.bat` | Стартира API сървъра скрито, подходящо за автоматично стартиране. |
+| `start_valhalla.ps1` | PowerShell управление на локална Valhalla Docker инстанция. |
+| `start_valhalla.bat` | Удобен стартер за Valhalla с двоен клик. |
+| `update_valhalla.bat` | Нощно/ръчно обновяване на Valhalla картата в `C:\valhalla`. |
 
 ## Архитектура по модули
 
@@ -75,7 +81,7 @@ config.py / GUI
 
 `warehouse_manager.py` прави предварителното разпределение. Ако складовата логика е включена, част от заявките може да се отделят за склад според обем, близост, лимити и правила. Останалите клиенти влизат в solver-а.
 
-`osrm_client.py` и `valhalla_client.py` строят реалната матрица. Solver-ите не работят директно с GPS точки, а с таблица от разстояния и времена между депата и клиентите. OSRM е основният бърз режим с Table API и batch логика. Valhalla дава алтернатива с time-dependent/traffic възможности, но при липсващи клетки програмата има fallback, за да не пада целият run.
+`osrm_client.py` и `valhalla_client.py` строят реалната матрица. Solver-ите не работят директно с GPS точки, а с таблица от разстояния и времена между депата и клиентите. OSRM е основният бърз режим с Table API и batch логика. Valhalla дава алтернатива с time-dependent/traffic възможности и truck costing options. При липсващи клетки програмата има fallback, за да не пада целият run.
 
 `cvrp_solver.py` съдържа OR-Tools решението. То създава routing модел с capacity/time dimensions, стартови и крайни депа, възможност за пропускане на клиенти, center zone penalties, service time, time windows и предварително сметнати vehicle cost матрици, за да се намали Python callback overhead.
 
@@ -85,9 +91,11 @@ config.py / GUI
 
 `cvrp_api_server.py` е remote control слоят. Той стартира API сървър, показва реалния адрес през `/health`, приема `/run` за стартиране с текущата конфигурация, `/solve` за клиенти в JSON body и `/tsp` за текущ маршрут на един шофьор. Поддържа временни settings override-и само за конкретната заявка, callback URL, API key и скрит subprocess режим за `/run`, когато няма override-и.
 
-`current_tsp.py` е отделен от CVRP solver-ите. Той не разпределя клиенти между много бусове, а подрежда останалите клиенти на един шофьор от текуща позиция до optional крайна точка. Използва OSRM/Valhalla матрица, greedy подреждане с time-window awareness и 2-opt подобрение. После генерира индивидуална карта със същия механизъм като нормалните route карти и при upload изпраща `pData2[]=driver_id`.
+`current_tsp.py` е отделен от CVRP solver-ите. Той не разпределя клиенти между много бусове, а подрежда останалите клиенти на един шофьор от текуща позиция до optional крайна точка. Използва OSRM/Valhalla матрица, greedy подреждане с time-window awareness и 2-opt подобрение. Ако ID-то на шофьора съвпада с TSP truck профил, матрицата и route geometry се правят през Valhalla `truck`. После генерира индивидуална карта със същия механизъм като нормалните route карти и при upload изпраща `pData2[]=driver_id`.
 
 `setdata_client.py` подготвя и изпраща резултатите към Bizant. За обслужените клиенти строи редове с `IdPlasDoc`, `DoneFlag`, `IdSkld`, `Bukva` и `IdGrafik`. За необслужените има отделни настройки, включително отделен `DoneFlag`. След успешни `setData` заявки може да изпрати `makeGroup` по склад.
+
+`vehicle_numbering.py` централизира номерирането на бусовете за Excel, CSV, route карти, upload и `setData`. Когато специалното center bus номериране е включено, нормалните бусове започват от `1004501001`, а `CENTER_BUS` маршрутите се подреждат последни и започват от зададеното center ID.
 
 `main_exe.py` и `build_exe.py` са за EXE режима. `main_exe.py` избира дали да стартира основната програма, GUI настройките или API сървъра. `build_exe.py` генерира spec файл, hidden imports, version info, batch файлове и runtime файлове за разпространение.
 
@@ -428,6 +436,42 @@ OSRM е основният режим. Използва:
 
 При Valhalla липсващи клетки в матрицата вече не спират целия run. Програмата ги попълва с приблизителна fallback стойност по права линия с road factor и записва предупреждение в лога.
 
+### Локална Valhalla в Docker
+
+За локална Valhalla има готови стартови скриптове:
+
+```cmd
+start_valhalla.bat
+```
+
+Той създава или рестартира един named container `cvrp_valhalla`, пази данните в `C:\valhalla` и публикува API-то на:
+
+```text
+http://localhost:8002
+```
+
+Първото стартиране сваля картата и build-ва Valhalla tiles. Прогресът се гледа с:
+
+```cmd
+docker logs -f cvrp_valhalla
+```
+
+За нощно обновяване на картата има отделен скрипт:
+
+```cmd
+update_valhalla.bat --no-pause
+```
+
+Той спира контейнера, почиства старите Valhalla файлове в `C:\valhalla`, сваля новия `.osm.pbf`, стартира същия контейнер и чака `/status` да стане достъпен. Това може да се сложи в Windows Task Scheduler. Контейнерът се създава с `--restart unless-stopped`, така че Docker го стартира автоматично при старт на Docker Engine/Desktop.
+
+Ако трябва само ръчно да се пусне update режимът:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\start_valhalla.ps1" -UpdateMap
+```
+
+Ако Valhalla връща `null` клетки в `/sources_to_targets`, batch заявката може пак да е успешна. Това означава, че конкретна двойка точки няма валиден route според Valhalla/OSM правилата. Програмата попълва само тези клетки с fallback стойности и продължава.
+
 ## Изходни файлове
 
 Основни output директории:
@@ -483,6 +527,8 @@ CSV файлът не се променя по име, за да остане с
 - обем в стекове;
 - бутон `Навигация`;
 - клик върху клиент центрира картата и отваря popup.
+
+В общата карта ID-то на буса не се показва като отделен надпис, за да не се претрупва картата. Клиентските ID-та остават видими в popup-ите и отчетите. В индивидуалните route карти остава достатъчно информация за конкретния бус/маршрут.
 
 ## API режими
 
@@ -570,6 +616,16 @@ Body може да бъде директен списък или wrapper:
 
 Ако POST заявката не подаде `service_time_minutes`, `/tsp` използва стойността от GUI: `API сървър -> TSP оптимизация -> Обслужване (мин)`. В същата секция се управляват TSP целта `time/distance`, работното време, 2-opt подобрението и тежестите за чакане/закъснение.
 
+TSP може да използва Valhalla truck профил само за определени шофьори/бусове. В GUI секцията `API сървър -> TSP Valhalla truck профили` се добавят профили като таблица:
+
+- име на профил;
+- списък от driver/bus ID-та;
+- височина, ширина, дължина и тегло;
+- натоварване на ос, брой оси и опасен товар;
+- `hgv_no_access_penalty`.
+
+Когато `/tsp` получи `driver_id`, който присъства в някой truck профил, матрицата и линията на HTML картата се строят с Valhalla `truck`. Ако няма съвпадение, `/tsp` използва нормалния routing режим от конфигурацията. Профилите могат да се подават и през API/settings като `api.tsp_valhalla_truck_profiles` или краткия alias `tsp_truck_profiles`.
+
 Локалните HTML файлове за TSP се управляват само от `api.tsp_generate_html_map` или API alias `tsp_generate_map`/`tsp_local_html`. Това не спира нормалните CVRP route карти. Ако локалната TSP HTML карта е изключена, TSP пак връща JSON реда на доставка, но не създава файл и няма файл за upload.
 
 Ако в TSP заявката има няколко документа за един и същ клиент със същите GPS координати, `/tsp` използва същата настройка `input.enable_customer_document_grouping`. При включена настройка те стават едно посещение, количеството и оборотът се събират, а отделните документи се връщат в `delivery_order[].documents`.
@@ -640,6 +696,7 @@ curl -X POST "http://IP:8088/tsp" -H "Content-Type: application/json" -d "{\"dri
 | `osrm` | OSRM URL, profile, timeout, chunk size. |
 | `valhalla` | Valhalla URL, profile, timeout, batch настройки. |
 | `output` | карти, Excel, CSV, chart-ове, директории, upload на route карти. |
+| `api` | API host/port/key, TSP настройки, TSP HTML/upload, TSP truck профили и дневен TSP отчет. |
 | `set_data` | `setData`, DoneFlag, складове, необслужени клиенти, `makeGroup`. |
 
 За пълния списък извикай:
@@ -649,6 +706,35 @@ curl "http://IP:8088/health"
 ```
 
 В отговора има `commands` и `settings_schema`, които показват текущите endpoint-и, примерни body-та и всички позволени полета.
+
+Често използвани кратки aliases:
+
+```text
+tsp_truck_profiles              -> api.tsp_valhalla_truck_profiles
+tsp_truck_driver_ids            -> api.tsp_valhalla_truck_driver_ids
+tsp_truck_height                -> api.tsp_valhalla_truck_height
+tsp_truck_width                 -> api.tsp_valhalla_truck_width
+tsp_truck_length                -> api.tsp_valhalla_truck_length
+tsp_truck_weight                -> api.tsp_valhalla_truck_weight
+tsp_truck_axle_load             -> api.tsp_valhalla_truck_axle_load
+tsp_truck_axle_count            -> api.tsp_valhalla_truck_axle_count
+tsp_truck_hazmat                -> api.tsp_valhalla_truck_hazmat
+tsp_truck_hgv_no_access_penalty -> api.tsp_valhalla_truck_hgv_no_access_penalty
+```
+
+`tsp_truck_profiles` е текст с един профил на ред. GUI-то го редактира като таблица, но API може да го подаде и директно:
+
+```text
+Small truck | ids=1004501001,1004501002 | height=3.2 | width=2.3 | length=6.5 | weight=7.5 | axle_load=6.0 | axle_count=2 | hazmat=false | hgv_no_access_penalty=43200
+Big truck | ids=1004501010 | height=3.8 | width=2.55 | length=10.0 | weight=18.0 | axle_load=10.0 | axle_count=3 | hazmat=false | hgv_no_access_penalty=43200
+```
+
+За center bus numbering:
+
+```text
+output.center_bus_numbering_enabled
+output.center_bus_numbering_start_id
+```
 
 ## Upload на индивидуални карти
 
@@ -891,6 +977,7 @@ par: IdSkld
 - Текстът е променен от “автобуси” на “бусове”.
 - Excel отчетът показва ID на буса като `1004501001`, `1004501002`, `1004501003` и т.н.
 - Добавена е отделна колона за номер на маршрут `1`, `2`, `3`, `4`.
+- Ако `output.center_bus_numbering_enabled` е включено, `CENTER_BUS` маршрутите се подреждат последни и започват от `output.center_bus_numbering_start_id`, например `1004501015`. Останалите бусове продължават да започват от `1004501001`.
 - CSV файлът не е променян по тази логика.
 - В GUI има опции да се изключват Excel, CSV, карти и chart-ове поотделно.
 
@@ -913,9 +1000,23 @@ Build-ът включва основната програма, Settings GUI, API
 - Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
 - `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
 - Индивидуалните route HTML карти могат да се качват към URL от настройката `output.route_maps_upload_url` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
+- TSP може да избира Valhalla `truck` профил по `driver_id`, като профилите се настройват в GUI таблица или през `api.tsp_valhalla_truck_profiles`.
+- Локалната Valhalla може да се управлява през `start_valhalla.bat` и да се обновява нощно през `update_valhalla.bat --no-pause`.
+- Center bus ID правилото е отделна output настройка: center bus маршрутите могат да бъдат последни и да започват от зададен ID, без да променят клиентските ID-та.
 - OR-Tools използва предварително сметнати vehicle cost матрици за по-малко Python callback overhead.
 - PyVRP компресира еднаквите профили, без да губи различните депа на бусовете.
 - При Excel вход Враца бусовете не се изключват автоматично само защото липсва `IdSkld`; тази автоматична филтрация важи само за HTTP JSON вход.
+
+## Последна документационна проверка
+
+При последното сравнение между кода и README бяха допълнени липсващите описания за:
+
+- `vehicle_numbering.py` и специалното номериране на `CENTER_BUS`;
+- `start_valhalla.ps1`, `start_valhalla.bat` и `update_valhalla.bat`;
+- TSP Valhalla truck профили по `driver_id`;
+- API aliases за TSP truck профили;
+- поведението на общата карта, където bus ID надписите са скрити, но клиентските ID-та остават;
+- Valhalla fallback при `null` клетки в успешен batch.
 
 ### Пример `/run` с настройки
 

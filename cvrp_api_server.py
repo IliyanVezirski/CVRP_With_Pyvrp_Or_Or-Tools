@@ -29,6 +29,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -52,7 +53,7 @@ from config import (
 )
 from input_handler import InputHandler
 from main import run_optimization
-from current_tsp import solve_current_tsp_route
+from current_tsp import _parse_tsp_truck_profiles, solve_current_tsp_route
 from tsp_daily_report import (
     generate_tsp_daily_excel_report,
     record_tsp_result,
@@ -64,6 +65,9 @@ from tsp_daily_report import (
 logger = logging.getLogger(__name__)
 _TRIGGER_COMMANDS = {"run", "start", "trigger", "solve_config", "start_program"}
 _SHUTDOWN_COMMANDS = {"shutdown", "stop", "stop_program", "exit", "quit"}
+_REQUEST_BODY_LOG_LIMIT = 100_000
+_SENSITIVE_HEADER_NAMES = {"authorization", "x-cvrp-api-key", "api-key", "x-api-key"}
+_FORM_JSON_FIELD_NAMES = ("pData", "payload", "json", "data", "body")
 _RUN_LOCK = threading.Lock()
 _TSP_REPORT_SCHEDULER_LOCK = threading.Lock()
 _TSP_REPORT_SCHEDULER_STARTED = False
@@ -168,6 +172,18 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "tsp_upload_map": ("api", "tsp_upload_html_map"),
     "tsp_worker_timeout": ("api", "tsp_worker_timeout_seconds"),
     "tsp_worker_timeout_seconds": ("api", "tsp_worker_timeout_seconds"),
+    "tsp_truck_profiles": ("api", "tsp_valhalla_truck_profiles"),
+    "tsp_valhalla_truck_profiles": ("api", "tsp_valhalla_truck_profiles"),
+    "tsp_truck_driver_ids": ("api", "tsp_valhalla_truck_driver_ids"),
+    "tsp_valhalla_truck_driver_ids": ("api", "tsp_valhalla_truck_driver_ids"),
+    "tsp_truck_height": ("api", "tsp_valhalla_truck_height"),
+    "tsp_truck_width": ("api", "tsp_valhalla_truck_width"),
+    "tsp_truck_length": ("api", "tsp_valhalla_truck_length"),
+    "tsp_truck_weight": ("api", "tsp_valhalla_truck_weight"),
+    "tsp_truck_axle_load": ("api", "tsp_valhalla_truck_axle_load"),
+    "tsp_truck_axle_count": ("api", "tsp_valhalla_truck_axle_count"),
+    "tsp_truck_hazmat": ("api", "tsp_valhalla_truck_hazmat"),
+    "tsp_truck_hgv_no_access_penalty": ("api", "tsp_valhalla_truck_hgv_no_access_penalty"),
     "tsp_daily_report": ("api", "tsp_daily_report_enabled"),
     "tsp_daily_report_enabled": ("api", "tsp_daily_report_enabled"),
     "tsp_daily_report_time": ("api", "tsp_daily_report_time"),
@@ -272,6 +288,16 @@ _QUERY_SETTING_ALIASES = {
     "tsp_upload_map": "tsp_upload_map",
     "tsp_worker_timeout": "tsp_worker_timeout",
     "tsp_worker_timeout_seconds": "tsp_worker_timeout_seconds",
+    "tsp_truck_profiles": "tsp_truck_profiles",
+    "tsp_truck_driver_ids": "tsp_truck_driver_ids",
+    "tsp_truck_height": "tsp_truck_height",
+    "tsp_truck_width": "tsp_truck_width",
+    "tsp_truck_length": "tsp_truck_length",
+    "tsp_truck_weight": "tsp_truck_weight",
+    "tsp_truck_axle_load": "tsp_truck_axle_load",
+    "tsp_truck_axle_count": "tsp_truck_axle_count",
+    "tsp_truck_hazmat": "tsp_truck_hazmat",
+    "tsp_truck_hgv_no_access_penalty": "tsp_truck_hgv_no_access_penalty",
     "tsp_daily_report": "tsp_daily_report",
     "tsp_daily_report_enabled": "tsp_daily_report_enabled",
     "tsp_daily_report_time": "tsp_daily_report_time",
@@ -660,6 +686,21 @@ def _request_wants_inline_result(payload: Any, query: Optional[Dict[str, list[st
         query,
         {"return_result", "return_json", "wait", "sync", "include_result"},
     )
+
+
+def _request_wants_tsp_html_file(payload: Any, query: Optional[Dict[str, list[str]]]) -> bool:
+    if _request_bool_option(payload, query, {"return_json", "json_response", "response_json"}):
+        return False
+    response_type = _request_text_option(
+        payload,
+        query,
+        {"response", "response_type", "return_type", "format"},
+    ).lower()
+    if response_type in {"json", "application/json"}:
+        return False
+    if response_type in {"file", "html", "text/html", "html_file"}:
+        return True
+    return True
 
 
 def _request_callback_url(payload: Any, query: Optional[Dict[str, list[str]]]) -> str:
@@ -1414,6 +1455,41 @@ def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
                 "generate_local_html_map": bool(getattr(api_config, "tsp_generate_html_map", True)),
                 "upload_html_map": bool(getattr(api_config, "tsp_upload_html_map", True)),
                 "worker_timeout_seconds": int(getattr(api_config, "tsp_worker_timeout_seconds", 30) or 30),
+                "valhalla_truck": {
+                    "profiles": [
+                        {
+                            "name": profile.get("name", ""),
+                            "driver_ids": [
+                                item.strip()
+                                for item in re.split(r"[,;\s]+", str(profile.get("ids", "") or ""))
+                                if item.strip()
+                            ],
+                            "height": profile.get("height"),
+                            "width": profile.get("width"),
+                            "length": profile.get("length"),
+                            "weight": profile.get("weight"),
+                            "axle_load": profile.get("axle_load"),
+                            "axle_count": profile.get("axle_count"),
+                            "hazmat": bool(profile.get("hazmat", False)),
+                            "hgv_no_access_penalty": profile.get("hgv_no_access_penalty"),
+                        }
+                        for profile in _parse_tsp_truck_profiles(getattr(api_config, "tsp_valhalla_truck_profiles", ""))
+                    ],
+                    "enabled_for_driver_ids": [
+                        item.strip()
+                        for item in re.split(r"[,;\s]+", str(getattr(api_config, "tsp_valhalla_truck_driver_ids", "") or ""))
+                        if item.strip()
+                    ],
+                    "height": getattr(api_config, "tsp_valhalla_truck_height", 3.5),
+                    "width": getattr(api_config, "tsp_valhalla_truck_width", 2.5),
+                    "length": getattr(api_config, "tsp_valhalla_truck_length", 7.0),
+                    "weight": getattr(api_config, "tsp_valhalla_truck_weight", 10.0),
+                    "axle_load": getattr(api_config, "tsp_valhalla_truck_axle_load", 9.0),
+                    "axle_count": getattr(api_config, "tsp_valhalla_truck_axle_count", 2),
+                    "hazmat": bool(getattr(api_config, "tsp_valhalla_truck_hazmat", False)),
+                    "hgv_no_access_penalty": getattr(api_config, "tsp_valhalla_truck_hgv_no_access_penalty", 43200),
+                    "setting": "api.tsp_valhalla_truck_driver_ids",
+                },
                 "local_html_setting": "api.tsp_generate_html_map",
                 "local_html_aliases": ["tsp_generate_map", "tsp_generate_local_html", "tsp_local_html"],
             },
@@ -2125,6 +2201,8 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 if payload is None:
                     raise ValueError("Empty request body")
                 result = _execute_tsp_request(payload, query)
+                if _request_wants_tsp_html_file(payload, query) and self._send_tsp_html_file(result):
+                    return
                 self._send_json(200, result)
                 return
 
@@ -2158,6 +2236,16 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 result["settings_overrides"] = applied_settings
                 result["ignored_settings"] = ignored_settings
             self._send_json(200, result)
+        except json.JSONDecodeError as exc:
+            logger.exception("Invalid JSON request body")
+            self._send_json(400, {
+                "status": "error",
+                "error": "Invalid JSON request body",
+                "detail": str(exc),
+            })
+        except ValueError as exc:
+            logger.exception("Bad CVRP API request")
+            self._send_json(400, {"status": "error", "error": str(exc)})
         except Exception as exc:
             logger.exception("CVRP API request failed")
             self._send_json(500, {"status": "error", "error": str(exc)})
@@ -2231,8 +2319,13 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         })
 
     def _read_json_body(self, required: bool = True) -> Any:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+
         if length <= 0:
+            self._log_incoming_post_body("", 0)
             if required:
                 raise ValueError("Empty request body")
             return None
@@ -2243,7 +2336,86 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         if "charset=" in content_type:
             charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
 
-        return json.loads(raw.decode(charset))
+        try:
+            body_text = raw.decode(charset)
+        except UnicodeDecodeError:
+            body_text = raw.decode(charset, errors="replace")
+
+        self._log_incoming_post_body(body_text, length)
+        if self._is_form_urlencoded_request(content_type, body_text):
+            return self._read_form_json_body(body_text)
+
+        return json.loads(body_text)
+
+    def _is_form_urlencoded_request(self, content_type: str, body_text: str) -> bool:
+        content_type = (content_type or "").lower()
+        if "application/x-www-form-urlencoded" in content_type:
+            return True
+        stripped = body_text.lstrip()
+        return any(stripped.startswith(f"{name}=") for name in _FORM_JSON_FIELD_NAMES)
+
+    def _read_form_json_body(self, body_text: str) -> Any:
+        form_data = parse_qs(
+            body_text,
+            keep_blank_values=True,
+            strict_parsing=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+        lowered_keys = {str(key).strip().lower(): key for key in form_data.keys()}
+
+        for field_name in _FORM_JSON_FIELD_NAMES:
+            key = field_name if field_name in form_data else lowered_keys.get(field_name.lower())
+            if key is None:
+                continue
+
+            values = form_data.get(key) or []
+            json_text = next((str(value).strip() for value in values if str(value).strip()), "")
+            if not json_text:
+                raise ValueError(f"Form field {key} is empty")
+
+            logger.info(
+                "Decoded form JSON field: remote=%s path=%s field=%s decoded_body=%s",
+                self.client_address[0] if self.client_address else "",
+                self.path,
+                key,
+                self._body_for_log(json_text),
+            )
+            return json.loads(json_text)
+
+        logger.info(
+            "Form request did not contain a JSON payload field: remote=%s path=%s fields=%s",
+            self.client_address[0] if self.client_address else "",
+            self.path,
+            sorted(form_data.keys()),
+        )
+        raise ValueError("Form request body must contain JSON in pData field")
+
+    def _safe_request_headers(self) -> Dict[str, str]:
+        safe_headers: Dict[str, str] = {}
+        for name, value in self.headers.items():
+            if name.lower() in _SENSITIVE_HEADER_NAMES:
+                safe_headers[name] = "***"
+            else:
+                safe_headers[name] = value
+        return safe_headers
+
+    def _body_for_log(self, body_text: str) -> str:
+        if len(body_text) <= _REQUEST_BODY_LOG_LIMIT:
+            return body_text
+        omitted = len(body_text) - _REQUEST_BODY_LOG_LIMIT
+        return f"{body_text[:_REQUEST_BODY_LOG_LIMIT]}\n...<truncated {omitted} chars>"
+
+    def _log_incoming_post_body(self, body_text: str, content_length: int) -> None:
+        logger.info(
+            "Incoming POST request: remote=%s path=%s content_type=%r content_length=%s headers=%s body=%s",
+            self.client_address[0] if self.client_address else "",
+            self.path,
+            self.headers.get("Content-Type", ""),
+            content_length,
+            self._safe_request_headers(),
+            self._body_for_log(body_text),
+        )
 
     def _send_json(self, status_code: int, payload: Dict[str, Any]):
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -2252,6 +2424,23 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_tsp_html_file(self, result: Dict[str, Any]) -> bool:
+        map_file = str((result or {}).get("map_file") or "").strip()
+        if not map_file or not os.path.isfile(map_file):
+            return False
+
+        with open(map_file, "rb") as file_handle:
+            raw = file_handle.read()
+
+        filename = os.path.basename(map_file)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(raw)
+        return True
 
 
 def run_server(host: str | None = None, port: int | None = None):
