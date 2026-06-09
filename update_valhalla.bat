@@ -21,8 +21,6 @@ if errorlevel 1 (
 
 echo.
 echo Valhalla update command finished.
-echo To watch build progress:
-echo docker logs -f cvrp_valhalla
 echo.
 
-if /I not "%~1"=="--no-pause" pause
+exit /b 0

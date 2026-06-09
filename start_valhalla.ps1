@@ -218,41 +218,58 @@ function Start-NewValhallaContainer {
     docker @dockerArgs | Out-Null
 }
 
-function Wait-ValhallaStatus {
+function Get-ValhallaContainerPhase {
+    param([string]$Name)
+
+    if (-not $Name -or -not (Test-ContainerExists -Name $Name)) {
+        return "missing"
+    }
+
+    if (-not (Test-ContainerRunning -Name $Name)) {
+        return "stopped"
+    }
+
+    try {
+        $topOutput = docker top $Name 2>$null | Out-String
+    }
+    catch {
+        return "unknown"
+    }
+
+    if ($topOutput -match "valhalla_build_tiles|configure_valhalla|build_tiles") {
+        return "building"
+    }
+
+    if ($topOutput -match "valhalla_service|valhalla.*service") {
+        return "serving"
+    }
+
+    return "starting"
+}
+
+function Wait-ValhallaReady {
     param(
-        [string]$Url,
         [string]$ContainerName = "",
         [int]$Attempts = 60,
         [int]$DelaySeconds = 3
     )
 
-    $lastError = ""
-
     for ($i = 1; $i -le $Attempts; $i++) {
         if ($ContainerName -and (Test-ContainerExists -Name $ContainerName) -and -not (Test-ContainerRunning -Name $ContainerName)) {
-            Write-Host "Valhalla container stopped before /status became ready."
+            Write-Host "Valhalla container stopped before it became ready."
             Write-Host "Last container logs:"
             docker logs --tail 80 $ContainerName
             return $false
         }
 
-        try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
-            if ($response.StatusCode -eq 200) {
-                return $true
-            }
-            $lastError = "HTTP $($response.StatusCode)"
-        }
-        catch {
-            $lastError = $_.Exception.Message
+        $phase = Get-ValhallaContainerPhase -Name $ContainerName
+
+        if ($phase -eq "serving") {
+            return $true
         }
 
-        if ($i -eq 1 -or $i % 10 -eq 0) {
-            Write-Host "Waiting for Valhalla /status ($i/$Attempts). Last check: $lastError"
-            if ($ContainerName -and $i % 20 -eq 0) {
-                Write-Host "Recent Valhalla build logs:"
-                docker logs --tail 12 $ContainerName
-            }
+        if ($i -eq 1 -or $i % 60 -eq 0) {
+            Write-Host "Waiting for Valhalla to finish map build... ($i/$Attempts)"
         }
 
         Start-Sleep -Seconds $DelaySeconds
@@ -328,25 +345,18 @@ else {
         -ForceBuild ([bool]$ForceRebuild)
 }
 
-$statusUrl = "http://127.0.0.1:$Port/status"
-Write-Step "Checking Valhalla status"
+Write-Step "Waiting for Valhalla to be ready"
 
-if (Wait-ValhallaStatus -Url $statusUrl -ContainerName $ContainerName -Attempts $ReadyAttempts) {
-    Write-Host "Valhalla is ready: $statusUrl"
+if (Wait-ValhallaReady -ContainerName $ContainerName -Attempts $ReadyAttempts) {
+    Write-Host "Valhalla is ready."
 }
 else {
-    Write-Host "Valhalla container is running, but the API is not ready yet."
+    Write-Host "Valhalla container is running, but the service is not ready yet."
     Write-Host "It may still be downloading/building Bulgaria map tiles."
     Write-Host "Watch progress with:"
     Write-Host "  docker logs -f $ContainerName"
+    exit 1
 }
-
-Write-Host ""
-Write-Host "CVRP Valhalla base_url should be: http://localhost:$Port"
-Write-Host "To update map data manually:"
-Write-Host "  powershell -ExecutionPolicy Bypass -File .\start_valhalla.ps1 -UpdateMap"
-Write-Host "To recreate the container only:"
-Write-Host "  powershell -ExecutionPolicy Bypass -File .\start_valhalla.ps1 -Recreate"
 
 if ($FollowLogs) {
     Write-Step "Following container logs"

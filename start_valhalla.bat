@@ -12,8 +12,11 @@ echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%start_valhalla.ps1"
 
-echo.
-echo To watch first-build progress, run:
-echo docker logs -f cvrp_valhalla
-echo.
-pause
+if errorlevel 1 (
+    echo.
+    echo Valhalla start failed.
+    pause
+    exit /b 1
+)
+
+exit /b 0

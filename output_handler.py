@@ -1289,6 +1289,8 @@ class InteractiveMapGenerator:
                 schedule_entry = schedule_by_index.get(client_number)
                 arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
                 departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
+                has_time_window = self._customer_has_declared_time_window(customer)
+                has_comment = bool(str(getattr(customer, "delivery_comment", "") or "").strip())
                 popup_lines = [
                     f"<b>Клиент:</b> {html.escape(str(customer.name))}",
                     f"<b>ID:</b> {html.escape(str(customer.id))}",
@@ -1321,6 +1323,8 @@ class InteractiveMapGenerator:
                     "routeStartTime": route_start_time_text,
                     "arrivalTime": arrival_time_text,
                     "departureTime": departure_time_text,
+                    "hasTimeWindow": has_time_window,
+                    "hasComment": has_comment,
                 })
 
             route_popup_lines = [
@@ -1728,6 +1732,10 @@ class InteractiveMapGenerator:
         }}
 
         const markerObjects = route.markers.map((point) => {{
+          const hasRouteAttention = Boolean(MAP_DATA.singleRouteNumber && (point.hasTimeWindow || point.hasComment));
+          const markerStrokeColor = hasRouteAttention
+            ? (point.hasTimeWindow ? "#dc2626" : "#f59e0b")
+            : "#ffffff";
           const marker = new google.maps.Marker({{
             position: point.position,
             map,
@@ -1735,11 +1743,11 @@ class InteractiveMapGenerator:
             label: {{ text: String(point.number), color: "white", fontWeight: "bold" }},
             icon: {{
               path: google.maps.SymbolPath.CIRCLE,
-              scale: 13,
+              scale: hasRouteAttention ? 14 : 13,
               fillColor: route.color,
               fillOpacity: 1,
-              strokeColor: "#ffffff",
-              strokeWeight: 3
+              strokeColor: markerStrokeColor,
+              strokeWeight: hasRouteAttention ? 4 : 3
             }}
           }});
           marker.addListener("click", () => infoWindow.setContent(point.popup) || infoWindow.open(map, marker));
@@ -3993,6 +4001,7 @@ class InteractiveMapGenerator:
                 time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
                 has_time_window = self._customer_has_declared_time_window(customer)
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
+                has_comment = bool(delivery_comment)
                 quantity_value = getattr(customer, "quantity", None)
                 turnover_value = getattr(customer, "turnover", None)
                 try:
@@ -4009,21 +4018,41 @@ class InteractiveMapGenerator:
                     if turnover_float is not None and turnover_float != 0
                     else ""
                 )
+                marker_has_attention = has_time_window or has_comment
+                marker_border_color = "#dc2626" if has_time_window else "#f59e0b" if has_comment else "#ffffff"
+                marker_shadow = (
+                    "0 0 0 3px rgba(220,38,38,0.16), 0 2px 7px rgba(0,0,0,0.28)"
+                    if has_time_window
+                    else "0 0 0 3px rgba(245,158,11,0.18), 0 2px 7px rgba(0,0,0,0.28)"
+                    if has_comment
+                    else "0 1px 4px rgba(0,0,0,0.24)"
+                )
+                marker_badge_color = "#f59e0b" if has_time_window and has_comment else marker_border_color
+                marker_badge_html = (
+                    f'<span style="position:absolute;top:-4px;right:-4px;width:10px;height:10px;'
+                    f'border-radius:50%;background:{marker_badge_color};border:2px solid #fff;'
+                    f'box-shadow:0 1px 3px rgba(0,0,0,0.25);"></span>'
+                    if marker_has_attention
+                    else ""
+                )
                 icon_html = f'''
                 <div style="
                     background-color: {bus_color};
-                    border: 3px solid white;
+                    border: {'4px' if marker_has_attention else '3px'} solid {marker_border_color};
                     border-radius: 50%;
                     width: 30px;
                     height: 30px;
+                    box-sizing: border-box;
                     display: flex;
                     justify-content: center;
                     align-items: center;
+                    position: relative;
                     font-weight: bold;
                     font-size: 14px;
                     color: white;
                     text-shadow: 1px 1px 1px rgba(0,0,0,0.7);
-                ">{client_number}</div>
+                    box-shadow: {marker_shadow};
+                ">{client_number}{marker_badge_html}</div>
                 '''
                 popup_text = f"""
                 <div style="font-family: Arial, sans-serif;">
