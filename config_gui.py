@@ -531,7 +531,7 @@ class ConfigGUI:
                 "method": "POST",
                 "command": f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{self._api_json_compact(tsp_body).replace(chr(34), chr(92) + chr(34))}"',
                 "body": self._api_json_example(tsp_body),
-                "returns": "200 с ред на доставка, ETA, общо време/км, локална HTML карта и upload статус според TSP HTML настройките.",
+                "returns": "Ако TSP HTML и upload -> Отговор от /tsp = json: 200 JSON с ред на доставка, ETA, км/минути, map_file и upload статус. Ако е html: 200 text/html със самата карта като body. Локалният HTML файл се управлява отделно.",
             },
             {
                 "tab": health_path,
@@ -680,6 +680,7 @@ tsp_wait_weight                       -> api.tsp_time_window_wait_weight
 tsp_late_weight                       -> api.tsp_time_window_late_weight
 tsp_two_opt                           -> api.tsp_enable_two_opt
 tsp_two_opt_max_passes                -> api.tsp_two_opt_max_passes
+tsp_response_format                   -> api.tsp_response_format
 tsp_generate_map                      -> api.tsp_generate_html_map
 tsp_generate_local_html               -> api.tsp_generate_html_map
 tsp_local_html                        -> api.tsp_generate_html_map
@@ -4718,7 +4719,7 @@ setData не трябва да се пуска:
             r,
             "Текущ TSP:",
             f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"driver_id\\":\\"1004501001\\",\\"driver_location\\":\\"42.6977,23.3219\\",\\"end_location\\":\\"42.7000,23.4000\\",\\"service_time_minutes\\":8,\\"customers\\":[{{\\"id\\":\\"1\\",\\"document\\":\\"0004384359\\",\\"gps\\":\\"42.6629,23.37682\\",\\"quantity\\":5}}]}}"',
-            "Подрежда текущ маршрут за един шофьор от текущ GPS, optional крайна точка и списък клиенти; връща реда и генерира индивидуална карта.",
+            "Подрежда текущ маршрут за един шофьор; връща JSON или директно HTML карта според настройката TSP HTML и upload -> Отговор от /tsp.",
         )
         r = self._add_copyable_command(
             quick,
@@ -4838,10 +4839,13 @@ setData не трябва да се пуска:
             "TSP HTML и upload",
             "Тези настройки важат само за /tsp картите и не променят нормалните CVRP route карти.",
         )
+        self._add_field(tsp_html, r, "api.tsp_response_format", "Отговор от /tsp:", getattr(api, "tsp_response_format", "json"), "combo",
+                        options=["json", "html"],
+                        tooltip="json = връща реда и ETA като JSON. html = връща самия HTML на картата като response body. Това не управлява локалното записване на файл."); r += 1
         self._add_field(tsp_html, r, "api.tsp_generate_html_map", "Локална HTML карта:", getattr(api, "tsp_generate_html_map", True), "bool",
-                        tooltip="Само за /tsp. Ако е изключено, TSP връща JSON реда, но не създава локален HTML файл и няма какво да качи."); r += 1
+                        tooltip="Само за /tsp. Управлява дали да се записва HTML файл на диска. Не променя дали HTTP отговорът е JSON или HTML."); r += 1
         self._add_field(tsp_html, r, "api.tsp_upload_html_map", "Качвай HTML карта:", getattr(api, "tsp_upload_html_map", True), "bool",
-                        tooltip="Само за /tsp. Качването използва Output -> Route maps upload URL/token, но се включва/изключва отделно от нормалните route карти."); r += 1
+                        tooltip="Само за /tsp. Качването използва Output -> Route maps upload URL/token. Работи когато локалната TSP HTML карта е включена."); r += 1
 
         tsp_report, r = self._add_group(
             f,
@@ -4982,9 +4986,11 @@ POST {base_url}{tsp_path}
     are configurable in the "TSP полета във входната заявка" section.
   Defaults:
     Ако service_time_minutes липсва, /tsp използва "TSP оптимизация -> Обслужване (мин)".
-    Генерирането и качването на TSP HTML карта се управляват от отделните TSP checkbox-и в GUI.
+    Форматът на HTTP отговора се управлява от "TSP HTML и upload -> Отговор от /tsp".
+    Локалното записване и качването на TSP HTML карта са отделни настройки.
   Връща:
-    driver_id, ред на доставка, ETA, общи км/минути, HTML карта и upload статус, ако картите са включени.
+    При json: driver_id, ред на доставка, ETA, общи км/минути, map_file и upload статус.
+    При html: Content-Type text/html и самият HTML на картата като body, без задължително да се записва локален файл.
     Ако route_maps_upload_mode=effect_upload, картата се качва с pData2[]=driver_id.
   Пример:
     curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json" -d "{{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"service_time_minutes\":8,\"customers\":[{{\"id\":\"1\",\"document\":\"0004384359\",\"gps\":\"42.6629,23.37682\",\"quantity\":5}}]}}"
@@ -5606,6 +5612,7 @@ TSP имената на полетата се настройват от GUI:
             "api.tsp_time_window_late_weight": ("tsp_time_window_late_weight", "float"),
             "api.tsp_enable_two_opt": ("tsp_enable_two_opt", "bool"),
             "api.tsp_two_opt_max_passes": ("tsp_two_opt_max_passes", "int"),
+            "api.tsp_response_format": ("tsp_response_format", "str"),
             "api.tsp_generate_html_map": ("tsp_generate_html_map", "bool"),
             "api.tsp_upload_html_map": ("tsp_upload_html_map", "bool"),
             "api.tsp_worker_timeout_seconds": ("tsp_worker_timeout_seconds", "int"),

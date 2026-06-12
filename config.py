@@ -892,7 +892,7 @@ class OutputConfig:
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
     routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
-    route_maps_upload_mode: str = "effect_upload" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
+    route_maps_upload_mode: str = "legacy" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
     route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
@@ -918,11 +918,11 @@ class OutputConfig:
     center_bus_numbering_start_id: str = "1004501015" # Първият ID за CENTER_BUS при специалното номериране.
     
     # CSV файл с маршрути
-    enable_csv_output: bool = True # Дали да се генерира CSV файл с маршрутите.
+    enable_csv_output: bool = False # Дали да се генерира CSV файл с маршрутите.
     csv_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes.csv") # Път и име на CSV файла с маршрутите.
     
     # Графики и анализи
-    enable_charts: bool = True # Дали да се генерират PNG файлове с графики.
+    enable_charts: bool = False # Дали да се генерират PNG файлове с графики.
     charts_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/charts") # Директория за запис на графиките.
     efficiency_chart_file: str = "efficiency_analysis.png" # Графика с анализ на ефективността.
     route_comparison_file: str = "route_comparison.png" # Графика, сравняваща маршрутите.
@@ -988,7 +988,8 @@ class APIConfig:
     tsp_time_window_late_weight: float = 20.0  # Тежест на закъснението след работно време при TSP greedy подреждане.
     tsp_enable_two_opt: bool = True  # Включва 2-opt подобрение след първоначалното TSP подреждане.
     tsp_two_opt_max_passes: int = 30  # Максимален брой 2-opt обхода за TSP.
-    tsp_generate_html_map: bool = True  # Дали /tsp да генерира локална индивидуална HTML карта по подразбиране.
+    tsp_response_format: str = "html"  # json = /tsp връща JSON; html = /tsp връща HTML съдържанието на картата.
+    tsp_generate_html_map: bool = False  # Дали /tsp да генерира локална индивидуална HTML карта по подразбиране.
     tsp_upload_html_map: bool = True  # Дали /tsp да качва HTML картата по подразбиране; използва output route upload настройките.
     tsp_worker_timeout_seconds: int = 30  # Максимално време за отделен TSP worker процес, когато CVRP solver-ът работи.
     tsp_valhalla_truck_profiles: str = ""  # Много TSP truck профили. GUI ги редактира като таблица; един профил на ред.

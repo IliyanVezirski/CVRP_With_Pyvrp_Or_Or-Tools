@@ -163,6 +163,8 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "tsp_enable_two_opt": ("api", "tsp_enable_two_opt"),
     "tsp_two_opt": ("api", "tsp_enable_two_opt"),
     "tsp_two_opt_max_passes": ("api", "tsp_two_opt_max_passes"),
+    "tsp_response_format": ("api", "tsp_response_format"),
+    "tsp_return_format": ("api", "tsp_response_format"),
     "tsp_generate_html_map": ("api", "tsp_generate_html_map"),
     "tsp_generate_map": ("api", "tsp_generate_html_map"),
     "tsp_generate_local_html": ("api", "tsp_generate_html_map"),
@@ -279,6 +281,8 @@ _QUERY_SETTING_ALIASES = {
     "tsp_enable_two_opt": "tsp_enable_two_opt",
     "tsp_two_opt": "tsp_two_opt",
     "tsp_two_opt_max_passes": "tsp_two_opt_max_passes",
+    "tsp_response_format": "tsp_response_format",
+    "tsp_return_format": "tsp_return_format",
     "tsp_generate_html_map": "tsp_generate_html_map",
     "tsp_generate_map": "tsp_generate_map",
     "tsp_generate_local_html": "tsp_generate_local_html",
@@ -508,6 +512,7 @@ def _api_commands_reference(
             "time_window_late_weight": "api.tsp_time_window_late_weight",
             "enable_two_opt": "api.tsp_enable_two_opt",
             "two_opt_max_passes": "api.tsp_two_opt_max_passes",
+            "response_format": "api.tsp_response_format: json връща JSON, html връща HTML body на картата",
             "generate_local_html_map": "api.tsp_generate_html_map",
             "upload_html_map": "api.tsp_upload_html_map",
             "worker_timeout_seconds": "api.tsp_worker_timeout_seconds, когато /tsp се изпълнява в отделен процес",
@@ -688,19 +693,28 @@ def _request_wants_inline_result(payload: Any, query: Optional[Dict[str, list[st
     )
 
 
-def _request_wants_tsp_html_file(payload: Any, query: Optional[Dict[str, list[str]]]) -> bool:
+def _normalise_tsp_response_format(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"html", "text/html", "file", "html_file", "map", "map_html"}:
+        return "html"
+    return "json"
+
+
+def _request_tsp_response_format(payload: Any, query: Optional[Dict[str, list[str]]], api_config: Any) -> str:
     if _request_bool_option(payload, query, {"return_json", "json_response", "response_json"}):
-        return False
+        return "json"
     response_type = _request_text_option(
         payload,
         query,
-        {"response", "response_type", "return_type", "format"},
-    ).lower()
-    if response_type in {"json", "application/json"}:
-        return False
-    if response_type in {"file", "html", "text/html", "html_file"}:
-        return True
-    return True
+        {"response", "response_type", "return_type", "format", "tsp_response_format"},
+    )
+    if response_type:
+        return _normalise_tsp_response_format(response_type)
+    return _normalise_tsp_response_format(getattr(api_config, "tsp_response_format", "json"))
+
+
+def _request_wants_tsp_html_response(payload: Any, query: Optional[Dict[str, list[str]]], api_config: Any) -> bool:
+    return _request_tsp_response_format(payload, query, api_config) == "html"
 
 
 def _request_callback_url(payload: Any, query: Optional[Dict[str, list[str]]]) -> str:
@@ -1452,6 +1466,7 @@ def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
                 "time_window_late_weight": float(getattr(api_config, "tsp_time_window_late_weight", 20.0) or 20.0),
                 "enable_two_opt": bool(getattr(api_config, "tsp_enable_two_opt", True)),
                 "two_opt_max_passes": int(getattr(api_config, "tsp_two_opt_max_passes", 30) or 30),
+                "response_format": _normalise_tsp_response_format(getattr(api_config, "tsp_response_format", "json")),
                 "generate_local_html_map": bool(getattr(api_config, "tsp_generate_html_map", True)),
                 "upload_html_map": bool(getattr(api_config, "tsp_upload_html_map", True)),
                 "worker_timeout_seconds": int(getattr(api_config, "tsp_worker_timeout_seconds", 30) or 30),
@@ -2200,8 +2215,21 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                     return
                 if payload is None:
                     raise ValueError("Empty request body")
-                result = _execute_tsp_request(payload, query)
-                if _request_wants_tsp_html_file(payload, query) and self._send_tsp_html_file(result):
+                wants_html_response = _request_wants_tsp_html_response(payload, query, api_config)
+                tsp_payload = dict(payload) if isinstance(payload, dict) else payload
+                if wants_html_response:
+                    if not isinstance(tsp_payload, dict):
+                        raise ValueError("TSP заявката трябва да бъде JSON обект.")
+                    tsp_payload["_return_html_response"] = True
+                result = _execute_tsp_request(tsp_payload, query)
+                if wants_html_response:
+                    if self._send_tsp_html_response(result):
+                        return
+                    self._send_json(500, {
+                        "status": "error",
+                        "error": "TSP HTML response was requested, but no HTML map was generated.",
+                        "map_file": result.get("map_file"),
+                    })
                     return
                 self._send_json(200, result)
                 return
@@ -2425,7 +2453,21 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_tsp_html_file(self, result: Dict[str, Any]) -> bool:
+    def _send_tsp_html_response(self, result: Dict[str, Any]) -> bool:
+        html_text = str((result or {}).get("map_html") or "")
+        if html_text:
+            raw = html_text.encode("utf-8")
+            map_file = str((result or {}).get("map_file") or "").strip()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-CVRP-TSP-Response", "html")
+            if map_file:
+                self.send_header("X-CVRP-TSP-Map-File", os.path.basename(map_file))
+            self.end_headers()
+            self.wfile.write(raw)
+            return True
+
         map_file = str((result or {}).get("map_file") or "").strip()
         if not map_file or not os.path.isfile(map_file):
             return False
@@ -2437,7 +2479,8 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("X-CVRP-TSP-Response", "html")
+        self.send_header("X-CVRP-TSP-Map-File", filename)
         self.end_headers()
         self.wfile.write(raw)
         return True

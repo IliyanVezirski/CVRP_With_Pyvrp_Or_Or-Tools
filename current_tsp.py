@@ -185,16 +185,24 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         setattr(route, "tsp_routing_profile", "valhalla_truck")
 
     map_file = None
+    map_html = None
     upload_summary = None
-    if _tsp_generate_map_enabled(payload, active_config):
-        map_file = _generate_tsp_map(active_config, route, driver_id)
-        if _tsp_upload_map_enabled(payload, active_config):
-            upload_config = _tsp_upload_output_config(payload, active_config)
-            upload_summary = OutputHandler(upload_config)._upload_route_maps(
-                [{"file_path": map_file, "bus_id": driver_id}]
-            )
+    needs_html_response = _tsp_html_response_requested(payload)
+    needs_local_file = _tsp_generate_map_enabled(payload, active_config)
+    needs_upload = needs_local_file and _tsp_upload_map_enabled(payload, active_config)
+    if needs_html_response or needs_local_file or needs_upload:
+        map_gen, route_map = _create_tsp_map_document(active_config, route)
+        if needs_html_response:
+            map_html = _render_tsp_map_html(route_map)
+        if needs_local_file or needs_upload:
+            map_file = _save_tsp_map_document(active_config, map_gen, route_map, driver_id)
+            if needs_upload:
+                upload_config = _tsp_upload_output_config(payload, active_config)
+                upload_summary = OutputHandler(upload_config)._upload_route_maps(
+                    [{"file_path": map_file, "bus_id": driver_id}]
+                )
 
-    return {
+    result = {
         "status": "ok",
         "type": "current_tsp",
         "driver_id": driver_id,
@@ -223,6 +231,9 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         "map_upload": upload_summary,
         "delivery_order": [_schedule_entry_to_json(entry) for entry in schedule_entries],
     }
+    if map_html is not None:
+        result["map_html"] = map_html
+    return result
 
 
 def _first_present(record: Dict[str, Any], *names: str) -> Any:
@@ -1138,15 +1149,42 @@ def _format_customer_time_window(customer: Customer) -> str:
     return format_time_windows_minutes(customer_time_windows_minutes(customer))
 
 
-def _generate_tsp_map(config: MainConfig, route: Route, driver_id: str) -> str:
-    routes_dir = getattr(config.output, "routes_output_dir", "") or os.path.join(os.getcwd(), "output", "routes")
-    os.makedirs(routes_dir, exist_ok=True)
+def _tsp_html_response_requested(payload: Dict[str, Any]) -> bool:
+    return _payload_bool(payload, "_return_html_response", default=False)
+
+
+def _create_tsp_map_document(config: MainConfig, route: Route):
     map_gen = InteractiveMapGenerator(config.output)
     route_map = map_gen.create_single_route_map(route, 1, route.depot_location)
+    return map_gen, route_map
+
+
+def _render_tsp_map_html(route_map) -> str:
+    if hasattr(route_map, "html_content"):
+        rendered = str(getattr(route_map, "html_content", "") or "")
+    else:
+        rendered = route_map.get_root().render()
+
+    top_comment = str(getattr(route_map, "_cvrp_top_html_comment", "") or "")
+    if top_comment:
+        stripped = rendered.lstrip("\ufeff")
+        if not stripped.startswith(top_comment):
+            rendered = top_comment + stripped
+    return rendered
+
+
+def _save_tsp_map_document(config: MainConfig, map_gen: InteractiveMapGenerator, route_map, driver_id: str) -> str:
+    routes_dir = getattr(config.output, "routes_output_dir", "") or os.path.join(os.getcwd(), "output", "routes")
+    os.makedirs(routes_dir, exist_ok=True)
     date_stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     safe_driver_id = _safe_filename_stem(driver_id, "driver")
     file_path = os.path.join(routes_dir, f"current_tsp_{safe_driver_id}_{date_stamp}.html")
     return map_gen.save_map(route_map, file_path)
+
+
+def _generate_tsp_map(config: MainConfig, route: Route, driver_id: str) -> str:
+    map_gen, route_map = _create_tsp_map_document(config, route)
+    return _save_tsp_map_document(config, map_gen, route_map, driver_id)
 
 
 def _safe_filename_stem(value: str, fallback: str) -> str:
