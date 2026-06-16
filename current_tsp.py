@@ -17,7 +17,15 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from config import MainConfig, RoutingEngine, VehicleConfig, VehicleType, get_config
+from config import (
+    MainConfig,
+    RoutingEngine,
+    VehicleConfig,
+    VehicleType,
+    get_config,
+    get_traffic_multiplier,
+    get_traffic_zones,
+)
 from cvrp_solver import Route
 from input_handler import (
     Customer,
@@ -907,7 +915,7 @@ def _build_distance_matrix(
             client = ValhallaClient(valhalla_config)
             try:
                 if client.check_server_status():
-                    return client.get_distance_matrix(locations)
+                    return _apply_tsp_traffic_adjustment(config, client.get_distance_matrix(locations))
             finally:
                 client.close()
             logger.warning("Valhalla не е достъпна за текущ TSP; fallback към OSRM.")
@@ -916,9 +924,41 @@ def _build_distance_matrix(
 
     client = OSRMClient(getattr(config, "osrm", None))
     try:
-        return client.get_distance_matrix(locations)
+        return _apply_tsp_traffic_adjustment(config, client.get_distance_matrix(locations))
     finally:
         client.close()
+
+
+def _apply_tsp_traffic_adjustment(config: MainConfig, matrix: DistanceMatrix) -> DistanceMatrix:
+    traffic_zones = get_traffic_zones(getattr(config, "locations", None))
+    if not traffic_zones:
+        return matrix
+
+    adjusted_durations: List[List[float]] = []
+    adjusted_edges = 0
+    for from_idx, row in enumerate(matrix.durations):
+        adjusted_row: List[float] = []
+        from_coords = matrix.locations[from_idx] if from_idx < len(matrix.locations) else None
+        for to_idx, value in enumerate(row):
+            to_coords = matrix.locations[to_idx] if to_idx < len(matrix.locations) else None
+            multiplier = get_traffic_multiplier(getattr(config, "locations", None), from_coords, to_coords)
+            if from_idx != to_idx and multiplier > 1.0:
+                adjusted_edges += 1
+            adjusted_row.append(_safe_matrix_value(matrix.durations, from_idx, to_idx) * multiplier)
+        adjusted_durations.append(adjusted_row)
+
+    logger.info(
+        "TSP traffic zones applied: %s zones, %s directed edges adjusted",
+        len(traffic_zones),
+        adjusted_edges,
+    )
+    return DistanceMatrix(
+        distances=matrix.distances,
+        durations=adjusted_durations,
+        locations=matrix.locations,
+        sources=matrix.sources,
+        destinations=matrix.destinations,
+    )
 
 
 def _solve_open_tsp_order(
@@ -971,7 +1011,19 @@ def _solve_open_tsp_order(
         current = best_node
 
     if two_opt_enabled:
-        order = _two_opt_open_route(order, matrix, metric, end_node=end_node, max_passes=two_opt_max_passes)
+        order = _two_opt_open_route(
+            order,
+            customers,
+            matrix,
+            metric,
+            start_time_minutes=start_time_minutes,
+            service_time_minutes=service_time_minutes,
+            use_time_windows=use_time_windows,
+            wait_weight=wait_weight,
+            late_weight=late_weight,
+            end_node=end_node,
+            max_passes=two_opt_max_passes,
+        )
     return [customers[node - 1] for node in order], order
 
 
@@ -1018,8 +1070,14 @@ def _arrival_after_service_seconds(
 
 def _two_opt_open_route(
     order: List[int],
+    customers: List[Customer],
     matrix: DistanceMatrix,
     metric: str,
+    start_time_minutes: int,
+    service_time_minutes: float,
+    use_time_windows: bool,
+    wait_weight: float,
+    late_weight: float,
     end_node: Optional[int] = None,
     max_passes: int = 30,
 ) -> List[int]:
@@ -1027,7 +1085,18 @@ def _two_opt_open_route(
         return order
 
     best = list(order)
-    best_cost = _open_route_cost(best, matrix, metric, end_node=end_node)
+    best_cost = _open_route_cost(
+        best,
+        matrix,
+        metric,
+        end_node=end_node,
+        customers=customers,
+        start_time_minutes=start_time_minutes,
+        service_time_minutes=service_time_minutes,
+        use_time_windows=use_time_windows,
+        wait_weight=wait_weight,
+        late_weight=late_weight,
+    )
     improved = True
     passes = 0
     while improved and passes < max_passes:
@@ -1036,7 +1105,18 @@ def _two_opt_open_route(
         for i in range(len(best) - 2):
             for j in range(i + 2, len(best)):
                 candidate = best[:i] + list(reversed(best[i : j + 1])) + best[j + 1 :]
-                candidate_cost = _open_route_cost(candidate, matrix, metric, end_node=end_node)
+                candidate_cost = _open_route_cost(
+                    candidate,
+                    matrix,
+                    metric,
+                    end_node=end_node,
+                    customers=customers,
+                    start_time_minutes=start_time_minutes,
+                    service_time_minutes=service_time_minutes,
+                    use_time_windows=use_time_windows,
+                    wait_weight=wait_weight,
+                    late_weight=late_weight,
+                )
                 if candidate_cost + 0.001 < best_cost:
                     best = candidate
                     best_cost = candidate_cost
@@ -1052,12 +1132,36 @@ def _open_route_cost(
     matrix: DistanceMatrix,
     metric: str,
     end_node: Optional[int] = None,
+    customers: Optional[List[Customer]] = None,
+    start_time_minutes: int = 0,
+    service_time_minutes: float = 0.0,
+    use_time_windows: bool = False,
+    wait_weight: float = 1.0,
+    late_weight: float = 20.0,
 ) -> float:
     if not order:
         return 0.0
-    cost = _matrix_cost(matrix, 0, order[0], metric)
-    for left, right in zip(order, order[1:]):
-        cost += _matrix_cost(matrix, left, right, metric)
+    cost = 0.0
+    current_node = 0
+    current_clock_seconds = float(start_time_minutes) * 60
+
+    for node in order:
+        cost += _matrix_cost(matrix, current_node, node, metric)
+        travel_seconds = _safe_matrix_value(matrix.durations, current_node, node)
+        current_clock_seconds += travel_seconds
+
+        if use_time_windows and customers and 0 <= node - 1 < len(customers):
+            customer = customers[node - 1]
+            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            if windows:
+                _, wait_seconds, _, status = choose_time_window_for_arrival(current_clock_seconds, windows)
+                late_seconds = max(0.0, current_clock_seconds - windows[-1][1]) if status == "След работно време" else 0.0
+                cost += wait_seconds * wait_weight + late_seconds * late_weight
+                current_clock_seconds += wait_seconds
+
+        current_clock_seconds += service_time_minutes * 60
+        current_node = node
+
     if end_node is not None:
         cost += _matrix_cost(matrix, order[-1], end_node, metric)
     return cost
