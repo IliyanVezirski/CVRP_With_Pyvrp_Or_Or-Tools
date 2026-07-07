@@ -52,6 +52,18 @@ def _resolve_runtime_path(base_dir: Path, configured_path: str, default_relative
 
     candidate = Path(raw_path)
     if candidate.is_absolute():
+        normalised = str(candidate).replace("/", "\\").lower()
+        stale_markers = (
+            "\\users\\shaman\\documents\\new project 2\\cvrp_with_pyvrp_or_or-tools\\",
+            "\\programming\\bizant 2.0\\cvrp-ortools-optimizer\\",
+        )
+        if any(marker in normalised for marker in stale_markers):
+            logging.warning(
+                "Relocating old bundled path %s to %s",
+                configured_path,
+                base_dir / default_relative_path,
+            )
+            return str(base_dir / default_relative_path)
         return str(candidate)
 
     return str((base_dir / candidate).resolve())

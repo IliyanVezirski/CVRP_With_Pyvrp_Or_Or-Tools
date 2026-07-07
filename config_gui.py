@@ -333,6 +333,121 @@ class ConfigGUI:
                 row=row, column=2, sticky="nw", padx=(10, 4), pady=6
             )
 
+    def _add_text_field(self, parent, row, key, label, value, height=4, tooltip=""):
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text=label, anchor="w", width=28, wraplength=230, style="Surface.TLabel").grid(
+            row=row, column=0, sticky="nw", padx=(8, 12), pady=6
+        )
+        text_frame = ttk.Frame(parent, style="Surface.TFrame")
+        text_frame.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        text_frame.columnconfigure(0, weight=1)
+        widget = tk.Text(text_frame, width=40, height=height, wrap="none", relief="solid", borderwidth=1)
+        widget.insert("1.0", "" if value is None else str(value))
+        widget.grid(row=0, column=0, sticky="we")
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        widget.configure(yscrollcommand=scrollbar.set)
+        self._bind_text_editing(widget)
+        self.widgets[key] = widget
+
+        if tooltip:
+            ttk.Label(parent, text=tooltip, style="Hint.TLabel", wraplength=330).grid(
+                row=row, column=2, sticky="nw", padx=(10, 4), pady=6
+            )
+
+    def _add_note_row(self, parent, row, text):
+        ttk.Label(parent, text=text, style="Hint.TLabel", wraplength=900, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="we", padx=8, pady=(2, 8)
+        )
+
+    def _web_gui_users_widget(self):
+        widget = self.widgets.get("api.web_gui_users")
+        return widget if isinstance(widget, tk.Text) else None
+
+    def _parse_web_gui_users_widget(self):
+        widget = self._web_gui_users_widget()
+        if widget is None:
+            return {}
+        users = {}
+        for line in widget.get("1.0", "end-1c").replace(";", "\n").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            username, password = line.split(":", 1)
+            username = username.strip()
+            if username:
+                users[username] = password.strip()
+        return users
+
+    def _set_web_gui_users_widget(self, users):
+        widget = self._web_gui_users_widget()
+        if widget is None:
+            return
+        text = "\n".join(f"{username}:{password}" for username, password in users.items())
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+
+    def _add_or_update_web_gui_user(self):
+        username = self.web_gui_username_var.get().strip()
+        password = self.web_gui_password_var.get().strip()
+        if not username or not password:
+            messagebox.showwarning("Липсва поле", "Попълни потребител и парола.")
+            return
+        if ":" in username:
+            messagebox.showwarning("Невалиден потребител", "Потребителското име не трябва да съдържа двоеточие (:).")
+            return
+        users = self._parse_web_gui_users_widget()
+        users[username] = password
+        self._set_web_gui_users_widget(users)
+        self.web_gui_password_var.set("")
+        self._set_status(f"Потребителят '{username}' е добавен/обновен. Натисни 'Запази', за да остане в config.py.")
+
+    def _delete_web_gui_user(self):
+        username = self.web_gui_username_var.get().strip()
+        if not username:
+            messagebox.showwarning("Липсва потребител", "Напиши потребителя, който искаш да изтриеш.")
+            return
+        users = self._parse_web_gui_users_widget()
+        if username not in users:
+            messagebox.showinfo("Няма такъв потребител", f"'{username}' не е намерен в списъка.")
+            return
+        users.pop(username, None)
+        self._set_web_gui_users_widget(users)
+        self.web_gui_password_var.set("")
+        self._set_status(f"Потребителят '{username}' е изтрит. Натисни 'Запази', за да остане промяната в config.py.")
+
+    def _add_web_gui_user_controls(self, parent, row):
+        ttk.Label(parent, text="Добави човек:", anchor="w", width=28, wraplength=230, style="Surface.TLabel").grid(
+            row=row, column=0, sticky="nw", padx=(8, 12), pady=6
+        )
+        box = ttk.Frame(parent, style="Surface.TFrame")
+        box.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        box.columnconfigure(1, weight=1)
+        box.columnconfigure(3, weight=1)
+
+        self.web_gui_username_var = tk.StringVar()
+        self.web_gui_password_var = tk.StringVar()
+        ttk.Label(box, text="Потребител", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+        username_entry = ttk.Entry(box, textvariable=self.web_gui_username_var, width=18)
+        username_entry.grid(row=0, column=1, sticky="we", padx=(0, 10), pady=2)
+        ttk.Label(box, text="Парола", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=2)
+        password_entry = ttk.Entry(box, textvariable=self.web_gui_password_var, width=18, show="*")
+        password_entry.grid(row=0, column=3, sticky="we", pady=2)
+        ttk.Button(box, text="Добави/обнови", command=self._add_or_update_web_gui_user).grid(
+            row=1, column=0, columnspan=2, sticky="we", padx=(0, 6), pady=(6, 0)
+        )
+        ttk.Button(box, text="Изтрий", command=self._delete_web_gui_user).grid(
+            row=1, column=2, columnspan=2, sticky="we", pady=(6, 0)
+        )
+        self._bind_text_editing(username_entry)
+        self._bind_text_editing(password_entry)
+        ttk.Label(
+            parent,
+            text="Бутоните променят списъка отдолу. После натисни общия бутон 'Запази', за да се запише постоянно.",
+            style="Hint.TLabel",
+            wraplength=330,
+        ).grid(row=row, column=2, sticky="nw", padx=(10, 4), pady=6)
+
     def _add_group(self, parent, title, hint=""):
         group = ttk.LabelFrame(parent, text=title, padding=(14, 12))
         group.pack(fill="x", expand=True, padx=2, pady=(0, 14))
@@ -4781,6 +4896,46 @@ setData не трябва да се пуска:
             tooltip="По желание. Ако е попълнен, /run и /solve искат header X-CVRP-API-Key.",
         )
 
+        web_gui, r = self._add_group(
+            f,
+            "Уеб управление от други компютри",
+            "Това отваря удобен browser екран за старт, прогрес, логове, бусове и основни настройки. Ползва същия порт като API сървъра.",
+        )
+        self._add_note_row(
+            web_gui,
+            r,
+            "Най-често попълваш само: 1) път за отваряне, например /hell; "
+            "2) име в мрежата, например bizant; 3) потребители за вход. "
+            f"Портът идва от полето API порт по-горе. Пример: http://bizant:{getattr(api, 'api_port', 8088)}/hell",
+        ); r += 1
+        self._add_field(web_gui, r, "api.web_gui_enabled", "Пусни уеб управлението:", getattr(api, "web_gui_enabled", True), "bool",
+                        tooltip="Когато е включено, можеш да отвориш управлението от browser на друг компютър."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_endpoint", "Път за отваряне:", getattr(api, "web_gui_endpoint", "/ui"),
+                        tooltip="Краткото име след порта. Примери: /ui, /hell, /cvrp. Не е целият адрес."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_public_host", "Име в мрежата:", getattr(api, "web_gui_public_host", ""),
+                        tooltip="Напиши само името или IP-то, например bizant или 10.10.10.155. Празно = програмата сама показва IP-то на машината."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_public_url", "Готов външен адрес:", getattr(api, "web_gui_public_url", ""),
+                        tooltip="Обикновено остави празно. Попълва се само при Cloudflare/reverse proxy, например https://firma.example.com/hell."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_title", "Име на този сървър:", getattr(api, "web_gui_title", "CVRP Optimizer"),
+                        tooltip="Това име се вижда най-отгоре в уеб екрана, например София, Враца или Тестова машина."); r += 1
+        self._add_text_field(
+            web_gui,
+            r,
+            "api.web_gui_users",
+            "Потребители за вход:",
+            getattr(api, "web_gui_users", "admin:admin"),
+            height=5,
+            tooltip="По един човек на ред: username:password. Пример: admin:StrongPass или office:1234. Смени admin:admin преди реална употреба.",
+        ); r += 1
+        self._add_web_gui_user_controls(web_gui, r); r += 1
+        self._add_note_row(
+            web_gui,
+            r,
+            "Как да го четеш: ако API портът е 8087, пътят е /hell и името в мрежата е bizant, "
+            "адресът за отваряне ще бъде http://bizant:8087/hell. "
+            "Полето 'Готов външен адрес' прескача тази логика и се използва директно.",
+        ); r += 1
+
         endpoints, r = self._add_group(
             f,
             "Endpoint-и",
@@ -5605,6 +5760,12 @@ TSP имената на полетата се настройват от GUI:
             "api.tsp_report_endpoint": ("tsp_report_endpoint", "str"),
             "api.shutdown_endpoint": ("shutdown_endpoint", "str"),
             "api.health_endpoint": ("health_endpoint", "str"),
+            "api.web_gui_enabled": ("web_gui_enabled", "bool"),
+            "api.web_gui_endpoint": ("web_gui_endpoint", "str"),
+            "api.web_gui_title": ("web_gui_title", "str"),
+            "api.web_gui_users": ("web_gui_users", "str"),
+            "api.web_gui_public_host": ("web_gui_public_host", "str"),
+            "api.web_gui_public_url": ("web_gui_public_url", "str"),
             "api.tsp_default_service_time_minutes": ("tsp_default_service_time_minutes", "int"),
             "api.tsp_objective_metric": ("tsp_objective_metric", "str"),
             "api.tsp_use_time_windows": ("tsp_use_time_windows", "bool"),

@@ -23,13 +23,18 @@ and uses the same endpoint in visible and hidden API server modes.
 from __future__ import annotations
 
 import argparse
+import base64
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 from datetime import datetime
+import html
+import hmac
+import importlib
 import json
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -42,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
+import config as config_module
 from config import (
     MainConfig,
     RoutingEngine,
@@ -72,6 +78,7 @@ _RUN_LOCK = threading.Lock()
 _TSP_REPORT_SCHEDULER_LOCK = threading.Lock()
 _TSP_REPORT_SCHEDULER_STARTED = False
 _TSP_REPORT_SCHEDULER_LAST_ATTEMPT: Dict[str, str] = {}
+_CONFIG_RELOAD_LOCK = threading.Lock()
 _RUN_STATUS: Dict[str, Any] = {
     "running": False,
     "status": "idle",
@@ -84,6 +91,7 @@ _RUN_STATUS: Dict[str, Any] = {
     "ignored_settings": [],
     "callback_url": None,
     "notification": None,
+    "stop_requested": False,
 }
 
 _SETTINGS_CONTAINER_KEYS = ("settings", "config", "options", "overrides")
@@ -1379,6 +1387,695 @@ def _build_request_config_override(payload: Any = None, query: Optional[Dict[str
     return request_config if applied else None, applied, ignored
 
 
+_WEB_GUI_CVRP_FIELDS = {
+    "solver_type",
+    "objective_metric",
+    "time_limit_seconds",
+    "allow_customer_skipping",
+    "enable_parallel_solving",
+    "num_workers",
+    "first_solution_strategy",
+    "local_search_metaheuristic",
+    "lns_time_limit_seconds",
+    "lns_num_nodes",
+    "lns_num_arcs",
+    "use_full_propagation",
+    "search_lambda_coefficient",
+    "global_start_time_minutes",
+    "enable_customer_time_windows",
+    "pyvrp_seed",
+    "pyvrp_seed_base",
+    "pyvrp_num_neighbours",
+    "pyvrp_ils_no_improvement",
+    "pyvrp_ils_history_length",
+    "pyvrp_use_extended_operators",
+    "pyvrp_min_perturbations",
+    "pyvrp_max_perturbations",
+    "pyvrp_display_progress",
+}
+_WEB_GUI_API_FIELDS = {
+    "web_gui_enabled",
+    "web_gui_endpoint",
+    "web_gui_title",
+    "web_gui_users",
+    "web_gui_public_host",
+    "web_gui_public_url",
+}
+
+
+def _web_gui_endpoint(api_config) -> str:
+    return _normalise_path(_normalise_endpoint(getattr(api_config, "web_gui_endpoint", "/ui")))
+
+
+def _web_gui_public_url(api_config, host: str, port: int) -> str:
+    explicit_url = str(getattr(api_config, "web_gui_public_url", "") or "").strip().rstrip("/")
+    if explicit_url:
+        return explicit_url
+
+    endpoint = _web_gui_endpoint(api_config)
+    public_host = str(getattr(api_config, "web_gui_public_host", "") or "").strip()
+    if public_host:
+        parsed = urlparse(public_host if "://" in public_host else f"http://{public_host}")
+        scheme = parsed.scheme or "http"
+        netloc = parsed.netloc or parsed.path.strip("/")
+        path_prefix = parsed.path.rstrip("/") if parsed.netloc else ""
+        has_port = "]:" in netloc if netloc.startswith("[") else ":" in netloc
+        if netloc and not has_port and not (scheme == "http" and port == 80) and not (scheme == "https" and port == 443):
+            netloc = f"{netloc}:{port}"
+        base = f"{scheme}://{netloc}{path_prefix}".rstrip("/")
+        return f"{base}{endpoint}"
+
+    return f"{_build_public_base_url(api_config, host, port)}{endpoint}"
+
+
+def _web_gui_enabled(api_config) -> bool:
+    return bool(getattr(api_config, "web_gui_enabled", True))
+
+
+def _is_web_gui_path(path: str, api_config) -> bool:
+    if not _web_gui_enabled(api_config):
+        return False
+    base = _web_gui_endpoint(api_config)
+    path = _normalise_path(path)
+    return path == base or path.startswith(f"{base}/")
+
+
+def _web_gui_subpath(path: str, api_config) -> str:
+    base = _web_gui_endpoint(api_config)
+    path = _normalise_path(path)
+    if path == base:
+        return "/"
+    return path[len(base):] or "/"
+
+
+def _parse_web_gui_users(raw_value: Any) -> Dict[str, str]:
+    users: Dict[str, str] = {}
+    raw_text = str(raw_value or "").replace(";", "\n")
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        username, password = line.split(":", 1)
+        username = username.strip()
+        password = password.strip()
+        if username:
+            users[username] = password
+    return users
+
+
+def _extract_basic_auth(headers) -> tuple[str, str]:
+    auth_header = str(headers.get("Authorization", "") or "").strip()
+    if not auth_header.lower().startswith("basic "):
+        return "", ""
+    encoded = auth_header.split(" ", 1)[1].strip()
+    try:
+        decoded = base64.b64decode(encoded).decode("utf-8")
+    except Exception:
+        return "", ""
+    if ":" not in decoded:
+        return "", ""
+    username, password = decoded.split(":", 1)
+    return username, password
+
+
+def _web_gui_auth_error(api_config, headers) -> Optional[str]:
+    users = _parse_web_gui_users(getattr(api_config, "web_gui_users", ""))
+    if not users:
+        return "No web GUI users are configured"
+
+    username, password = _extract_basic_auth(headers)
+    if not username:
+        return "Missing web GUI login"
+
+    expected_password = users.get(username)
+    if expected_password is None:
+        return "Invalid web GUI login"
+    if hmac.compare_digest(str(expected_password), str(password)):
+        return None
+    return "Invalid web GUI login"
+
+
+def _coords_to_text(coords: Any) -> str:
+    if not coords:
+        return ""
+    try:
+        return f"{float(coords[0])}, {float(coords[1])}"
+    except Exception:
+        return ""
+
+
+def _vehicle_to_web_dict(vehicle: VehicleConfig) -> Dict[str, Any]:
+    return {
+        "vehicle_type": getattr(getattr(vehicle, "vehicle_type", None), "value", str(getattr(vehicle, "vehicle_type", ""))),
+        "name": str(getattr(vehicle, "name", "") or ""),
+        "enabled": bool(getattr(vehicle, "enabled", True)),
+        "count": int(getattr(vehicle, "count", 0) or 0),
+        "capacity": int(getattr(vehicle, "capacity", 0) or 0),
+        "fixed_cost": int(getattr(vehicle, "fixed_cost", 0) or 0),
+        "max_distance_km": getattr(vehicle, "max_distance_km", None),
+        "max_time_hours": int(getattr(vehicle, "max_time_hours", 8) or 8),
+        "service_time_minutes": int(getattr(vehicle, "service_time_minutes", 8) or 8),
+        "max_customers_per_route": getattr(vehicle, "max_customers_per_route", None),
+        "start_location": _coords_to_text(getattr(vehicle, "start_location", None)),
+        "end_location": _coords_to_text(getattr(vehicle, "end_location", None)),
+        "start_time_minutes": int(getattr(vehicle, "start_time_minutes", 480) or 480),
+    }
+
+
+def _reload_config_from_disk():
+    """Reload config.py so the web GUI reflects desktop GUI changes."""
+    global MainConfig, RoutingEngine, CenterZoneConfig, TrafficZoneConfig, VehicleConfig, VehicleType, get_config
+
+    with _CONFIG_RELOAD_LOCK:
+        module = importlib.reload(config_module)
+        MainConfig = module.MainConfig
+        RoutingEngine = module.RoutingEngine
+        CenterZoneConfig = module.CenterZoneConfig
+        TrafficZoneConfig = module.TrafficZoneConfig
+        VehicleConfig = module.VehicleConfig
+        VehicleType = module.VehicleType
+        get_config = module.get_config
+        return module.get_config()
+
+
+def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True) -> Dict[str, Any]:
+    cfg = _reload_config_from_disk() if refresh_from_disk else get_config()
+    logger.info("Web GUI config loaded: %s vehicles from config.py", len(cfg.vehicles or []))
+    api_config = cfg.api
+    web_endpoint = _web_gui_endpoint(api_config)
+    web_url = _web_gui_public_url(api_config, host, port)
+    cvrp = cfg.cvrp
+    api_users = _parse_web_gui_users(getattr(api_config, "web_gui_users", ""))
+
+    return {
+        "status": "ok",
+        "app_name": str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"),
+        "web_gui": {
+            "enabled": bool(getattr(api_config, "web_gui_enabled", True)),
+            "endpoint": web_endpoint,
+            "url": web_url,
+            "users": sorted(api_users.keys()),
+        },
+        "api": {
+            "public_url": _build_public_base_url(api_config, host, port),
+            "run_endpoint": _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run")),
+            "health_endpoint": _normalise_endpoint(getattr(api_config, "health_endpoint", "/health")),
+        },
+        "cvrp": {
+            field_name: getattr(cvrp, field_name)
+            for field_name in sorted(_WEB_GUI_CVRP_FIELDS)
+            if hasattr(cvrp, field_name)
+        },
+        "vehicles": [_vehicle_to_web_dict(vehicle) for vehicle in (cfg.vehicles or [])],
+        "vehicle_types": [
+            vehicle_type.value
+            for vehicle_type in VehicleType
+            if vehicle_type not in (VehicleType.WAREHOUSE, VehicleType.DISABLED)
+        ],
+        "run_status": _run_status_snapshot(),
+    }
+
+
+def _python_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if value is None:
+        return "None"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, float):
+        return repr(float(value))
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _tuple_literal(coords: Any) -> str:
+    if not coords:
+        return "None"
+    try:
+        return f"({float(coords[0])}, {float(coords[1])})"
+    except Exception:
+        return "None"
+
+
+def _replace_class_field_literal(content: str, class_name: str, field_name: str, value: Any) -> str:
+    class_pattern = rf'(class\s+{re.escape(class_name)}\s*:\s*.*?)(?=\n@dataclass|\nclass\s+|\Z)'
+
+    def replace_in_class(match):
+        class_block = match.group(1)
+        field_pattern = rf'(?m)^(\s*{re.escape(field_name)}\s*:\s*[^=\n]+=\s*)(.*?)(\s*(?:#.*)?$)'
+        return re.sub(
+            field_pattern,
+            lambda field_match: f"{field_match.group(1)}{_python_literal(value)}{field_match.group(3)}",
+            class_block,
+            count=1,
+        )
+
+    return re.sub(class_pattern, replace_in_class, content, count=1, flags=re.S)
+
+
+def _optional_int_literal(value: Any) -> str:
+    if value in (None, ""):
+        return "None"
+    return str(int(value))
+
+
+def _vehicle_config_literal(vehicle: VehicleConfig) -> str:
+    vehicle_type = getattr(vehicle, "vehicle_type", VehicleType.INTERNAL_BUS)
+    if not isinstance(vehicle_type, VehicleType):
+        vehicle_type = _parse_vehicle_type(vehicle_type)
+
+    return "\n".join([
+        "            VehicleConfig(",
+        f"                vehicle_type=VehicleType.{vehicle_type.name},",
+        f"                capacity={int(getattr(vehicle, 'capacity', 0) or 0)},",
+        f"                count={int(getattr(vehicle, 'count', 0) or 0)},",
+        f"                name={_python_literal(getattr(vehicle, 'name', ''))},",
+        f"                fixed_cost={int(getattr(vehicle, 'fixed_cost', 0) or 0)},",
+        f"                max_distance_km={_optional_int_literal(getattr(vehicle, 'max_distance_km', None))},",
+        f"                max_time_hours={int(getattr(vehicle, 'max_time_hours', 8) or 8)},",
+        f"                service_time_minutes={int(getattr(vehicle, 'service_time_minutes', 8) or 8)},",
+        f"                enabled={'True' if bool(getattr(vehicle, 'enabled', True)) else 'False'},",
+        f"                max_customers_per_route={_optional_int_literal(getattr(vehicle, 'max_customers_per_route', None))},",
+        f"                start_location={_tuple_literal(getattr(vehicle, 'start_location', None))},",
+        f"                end_location={_tuple_literal(getattr(vehicle, 'end_location', None))},",
+        f"                start_time_minutes={int(getattr(vehicle, 'start_time_minutes', 480) or 480)},",
+        f"                tsp_depot_location={_tuple_literal(getattr(vehicle, 'tsp_depot_location', None) or getattr(vehicle, 'start_location', None))}",
+        "            ),",
+    ])
+
+
+def _replace_vehicles_list_literal(content: str, vehicles: list[VehicleConfig]) -> str:
+    if not vehicles:
+        return content
+    vehicles_block = "\n".join(_vehicle_config_literal(vehicle) for vehicle in vehicles)
+    pattern = r'(def _create_default_vehicles\(self\)\s*->\s*List\[VehicleConfig\]:.*?return\s*)\[.*?\n        \]'
+    return re.sub(pattern, lambda match: f"{match.group(1)}[\n{vehicles_block}\n        ]", content, count=1, flags=re.S)
+
+
+def _backup_config_py(config_path: str) -> str:
+    backup_dir = os.path.join(os.path.dirname(config_path), "config_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"config_web_gui_{timestamp}.py")
+    shutil.copy2(config_path, backup_path)
+    return backup_path
+
+
+def _persist_web_gui_config(config_obj: MainConfig) -> str:
+    config_path = os.path.abspath(config_module.__file__)
+    with open(config_path, "r", encoding="utf-8") as file_handle:
+        content = file_handle.read()
+
+    backup_path = _backup_config_py(config_path)
+
+    for field_name in sorted(_WEB_GUI_API_FIELDS):
+        if hasattr(config_obj.api, field_name):
+            content = _replace_class_field_literal(content, "APIConfig", field_name, getattr(config_obj.api, field_name))
+    for field_name in sorted(_WEB_GUI_CVRP_FIELDS):
+        if hasattr(config_obj.cvrp, field_name):
+            content = _replace_class_field_literal(content, "CVRPConfig", field_name, getattr(config_obj.cvrp, field_name))
+    content = _replace_vehicles_list_literal(content, list(config_obj.vehicles or []))
+
+    tmp_path = f"{config_path}.webgui.tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="") as file_handle:
+        file_handle.write(content)
+    os.replace(tmp_path, config_path)
+    return backup_path
+
+
+def _apply_web_gui_config_save(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Web GUI save body must be a JSON object")
+
+    config_obj = deepcopy(get_config())
+    applied: list[str] = []
+
+    app_name = payload.get("app_name")
+    if app_name is not None:
+        config_obj.api.web_gui_title = str(app_name or "").strip() or "CVRP Optimizer"
+        applied.append("api.web_gui_title")
+
+    api_payload = payload.get("api")
+    if isinstance(api_payload, dict):
+        for field_name, raw_value in api_payload.items():
+            if field_name not in _WEB_GUI_API_FIELDS or not hasattr(config_obj.api, field_name):
+                continue
+            current_value = getattr(config_obj.api, field_name)
+            setattr(config_obj.api, field_name, _coerce_setting_value("api", field_name, raw_value, current_value))
+            applied.append(f"api.{field_name}")
+
+    cvrp_payload = payload.get("cvrp")
+    if isinstance(cvrp_payload, dict):
+        for field_name, raw_value in cvrp_payload.items():
+            if field_name not in _WEB_GUI_CVRP_FIELDS or not hasattr(config_obj.cvrp, field_name):
+                continue
+            if raw_value is None and field_name != "pyvrp_seed":
+                continue
+            current_value = getattr(config_obj.cvrp, field_name)
+            setattr(config_obj.cvrp, field_name, _coerce_setting_value("cvrp", field_name, raw_value, current_value))
+            applied.append(f"cvrp.{field_name}")
+
+    if "vehicles" in payload:
+        vehicle_items = payload.get("vehicles")
+        if not isinstance(vehicle_items, list):
+            raise ValueError("vehicles must be a JSON list")
+        normalised_items = []
+        existing_vehicles = list(config_obj.vehicles or [])
+        for item in vehicle_items:
+            item = dict(item or {})
+            if not item.get("start_location") and not item.get("start_depot_name") and not item.get("depot"):
+                item["start_location"] = config_obj.locations.depot_location
+            normalised_items.append(item)
+        vehicles: list[VehicleConfig] = []
+        for index, item in enumerate(normalised_items):
+            raw_original_index = item.pop("_original_index", index)
+            try:
+                original_index = int(raw_original_index)
+            except (TypeError, ValueError):
+                original_index = index
+            template = existing_vehicles[original_index] if 0 <= original_index < len(existing_vehicles) else None
+            vehicles.append(_vehicle_from_payload(config_obj, item, template))
+        config_obj.vehicles = vehicles
+        applied.append("vehicles.replace")
+
+    backup_path = _persist_web_gui_config(config_obj)
+    config_module.config_manager.config = config_obj
+    return {
+        "status": "saved",
+        "applied": applied,
+        "backup_file": backup_path,
+    }
+
+
+def _tail_text_file(path: str, max_chars: int = 50000, max_lines: int = 250) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as file_handle:
+            file_handle.seek(0, os.SEEK_END)
+            size = file_handle.tell()
+            file_handle.seek(max(0, size - max_chars))
+            text = file_handle.read().decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if len(lines) > max_lines:
+            text = "\n".join(lines[-max_lines:])
+        return text
+    except Exception as exc:
+        return f"Could not read {path}: {exc}"
+
+
+def _web_gui_logs_payload() -> Dict[str, Any]:
+    logs_dir = _api_logs_dir()
+    run_status = _run_status_snapshot()
+    run_id = str(run_status.get("run_id") or "").strip()
+    files = {
+        "api": os.path.join(logs_dir, "cvrp_api_server.log"),
+    }
+    if run_id:
+        files["run"] = os.path.join(logs_dir, f"api_run_{run_id}.log")
+    return {
+        "status": "ok",
+        "run_status": run_status,
+        "logs": {
+            name: {
+                "path": path,
+                "tail": _tail_text_file(path),
+            }
+            for name, path in files.items()
+        },
+    }
+
+
+def _web_gui_html(api_config, host: str, port: int) -> str:
+    base_path = _web_gui_endpoint(api_config)
+    data_json = json.dumps({
+        "apiBase": f"{base_path}/api",
+        "title": str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"),
+    }, ensure_ascii=False)
+    return f"""<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"))}</title>
+  <style>
+    :root {{ --bg:#f3f5f8; --surface:#fff; --line:#d8dee8; --text:#172033; --muted:#64748b; --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; font-family: Segoe UI, Arial, sans-serif; background:var(--bg); color:var(--text); }}
+    header {{ background:var(--surface); border-bottom:1px solid var(--line); padding:16px 22px; display:flex; gap:16px; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:5; }}
+    h1 {{ margin:0; font-size:21px; font-weight:700; }}
+    h2 {{ margin:0 0 12px; font-size:16px; }}
+    .muted {{ color:var(--muted); font-size:12px; }}
+    main {{ padding:18px 22px 28px; display:grid; grid-template-columns: 1fr; gap:16px; }}
+    section {{ background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:16px; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
+    label {{ display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }}
+    input, select {{ width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; font:inherit; }}
+    input[type="checkbox"] {{ width:auto; }}
+    .actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    button {{ border:1px solid #cbd5e1; background:#fff; border-radius:6px; padding:8px 12px; cursor:pointer; font-weight:600; }}
+    button.primary {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
+    button.danger {{ color:var(--bad); }}
+    .pill {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e2e8f0; font-size:12px; }}
+    .pill.ok {{ background:#dcfce7; color:var(--ok); }}
+    .pill.bad {{ background:#fee2e2; color:var(--bad); }}
+    .vehicles-wrap {{ border:1px solid #e5e7eb; border-radius:8px; background:#f8fafc; padding:10px; overflow-x:auto; }}
+    .vehicle-list {{ display:flex; flex-direction:column; gap:10px; }}
+    .vehicle-row {{ display:flex; flex-wrap:wrap; gap:10px 12px; align-items:end; background:#fff; border:1px solid #dbe3ef; border-radius:8px; padding:12px; width:max-content; max-width:100%; }}
+    .vehicle-field {{ flex:0 0 auto; }}
+    .vehicle-field.type {{ width:126px; }}
+    .vehicle-field.name {{ width:170px; }}
+    .vehicle-field.active {{ width:84px; }}
+    .vehicle-field.small {{ width:78px; }}
+    .vehicle-field.medium {{ width:96px; }}
+    .vehicle-field.service {{ width:108px; }}
+    .vehicle-field.gps {{ width:215px; }}
+    .vehicle-field label {{ margin:0 0 4px; font-size:11px; font-weight:700; color:#475569; }}
+    .vehicle-field input, .vehicle-field select {{ min-width:0; padding:7px 8px; }}
+    .vehicle-field.checkbox {{ display:flex; gap:8px; align-items:center; min-height:58px; }}
+    .vehicle-field.checkbox label {{ margin:0; }}
+    .vehicle-actions {{ display:flex; align-items:end; min-height:58px; flex:0 0 82px; }}
+    @media (max-width: 760px) {{ .vehicle-row {{ width:100%; }} .vehicle-field.type, .vehicle-field.name, .vehicle-field.active, .vehicle-field.small, .vehicle-field.medium, .vehicle-field.service, .vehicle-field.gps, .vehicle-actions {{ width:100%; flex-basis:100%; }} }}
+    .logs-panel {{ max-width:1200px; }}
+    pre {{ white-space:pre; overflow:auto; width:100%; max-width:100%; max-height:300px; padding:12px; background:#0f172a; color:#dbeafe; border-radius:6px; font:11px/1.35 Consolas, "Courier New", monospace; }}
+    .full {{ grid-column:1 / -1; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="pageTitle">CVRP Optimizer</h1>
+      <div class="muted" id="serverLine">Зареждам...</div>
+    </div>
+    <div class="actions">
+      <span id="statusPill" class="pill">status</span>
+      <button onclick="loadAll()">Обнови</button>
+      <button class="primary" onclick="saveConfig()">Запази постоянно</button>
+      <button onclick="startRun()">Стартирай</button>
+      <button class="danger" onclick="stopRun()">Спри run</button>
+      <button class="danger" onclick="shutdownProgram()">Спри API</button>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>Превозни средства</h2>
+      <div class="actions" style="margin-bottom:10px">
+        <button onclick="addVehicle()">Добави бус</button>
+        <span class="muted">Промените влизат в config.py само след "Запази постоянно".</span>
+      </div>
+      <div class="vehicles-wrap">
+        <div id="vehiclesBody" class="vehicle-list"></div>
+      </div>
+    </section>
+    <section class="full logs-panel">
+      <h2>Прогрес и логове</h2>
+      <div class="actions" style="margin-bottom:10px">
+        <button onclick="loadLogs()">Обнови последните редове</button>
+        <span class="muted" id="lastSaved"></span>
+      </div>
+      <div class="muted" id="runDetails" style="margin-bottom:10px"></div>
+      <pre id="logsBox">Няма заредени логове.</pre>
+    </section>
+  </main>
+  <script>
+    const bootstrap = {data_json};
+    const pagePath = window.location.pathname.replace(/\/$/, "");
+    bootstrap.apiBase = (pagePath || "{base_path}") + "/api";
+    let state = null;
+    let vehicleTypes = ["internal_bus", "center_bus", "external_bus", "special_bus", "vratza_bus"];
+    let logsTimer = null;
+
+    function $(id) {{ return document.getElementById(id); }}
+    function value(id) {{ return $(id).value; }}
+    function intOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; }}
+    function numberOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }}
+
+    async function apiFetch(path, options={{}}) {{
+      const response = await fetch(bootstrap.apiBase + path, Object.assign({{cache:"no-store"}}, options));
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    }}
+
+    function setStatus(runStatus) {{
+      const running = !!(runStatus && runStatus.running);
+      $("statusPill").textContent = running ? "работи" : "idle";
+      $("statusPill").className = "pill " + (running ? "ok" : "");
+      $("runDetails").textContent = runStatus
+        ? `status=${{runStatus.status || "idle"}} | run_id=${{runStatus.run_id || "-"}} | start=${{runStatus.started_at || "-"}} | finish=${{runStatus.finished_at || "-"}} | error=${{runStatus.error || "-"}}`
+        : "";
+      setLogsLive(running);
+    }}
+
+    function setLogsLive(active) {{
+      if (active && !logsTimer) {{
+        logsTimer = setInterval(() => loadLogs(false), 2000);
+      }} else if (!active && logsTimer) {{
+        clearInterval(logsTimer);
+        logsTimer = null;
+      }}
+    }}
+
+    function renderConfig(data) {{
+      state = data;
+      vehicleTypes = data.vehicle_types || vehicleTypes;
+      $("pageTitle").textContent = data.app_name || bootstrap.title;
+      $("serverLine").textContent = (data.web_gui && data.web_gui.url ? data.web_gui.url : "") + " | users: " + ((data.web_gui && data.web_gui.users || []).join(", ") || "-");
+      renderVehicles((data.vehicles || []).map((v, i) => Object.assign({{_original_index:i}}, v)));
+      setStatus(data.run_status || {{}});
+    }}
+
+    function renderVehicles(vehicles) {{
+      const tbody = $("vehiclesBody");
+      tbody.innerHTML = "";
+      vehicles.forEach((vehicle, index) => tbody.appendChild(vehicleRow(vehicle, index)));
+    }}
+
+    function vehicleRow(vehicle, index) {{
+      const row = document.createElement("div");
+      row.className = "vehicle-row";
+      row.dataset.index = index;
+      row.dataset.originalIndex = vehicle._original_index ?? "";
+      row.innerHTML = `
+        <div class="vehicle-field type"><label>Тип</label><select data-field="vehicle_type">${{vehicleTypes.map(t => `<option value="${{t}}">${{t}}</option>`).join("")}}</select></div>
+        <div class="vehicle-field name"><label>Име</label><input data-field="name"></div>
+        <div class="vehicle-field checkbox active"><input data-field="enabled" type="checkbox"><label>Активен</label></div>
+        <div class="vehicle-field small"><label>Брой</label><input data-field="count" type="number" min="0"></div>
+        <div class="vehicle-field medium"><label>Капацитет</label><input data-field="capacity" type="number" min="0"></div>
+        <div class="vehicle-field medium"><label>Цена</label><input data-field="fixed_cost" type="number"></div>
+        <div class="vehicle-field medium"><label>Макс. часове</label><input data-field="max_time_hours" type="number"></div>
+        <div class="vehicle-field service"><label>Обслужване</label><input data-field="service_time_minutes" type="number"></div>
+        <div class="vehicle-field gps"><label>Старт GPS</label><input data-field="start_location" placeholder="lat, lon"></div>
+        <div class="vehicle-field gps"><label>Край GPS</label><input data-field="end_location" placeholder="празно = депо"></div>
+        <div class="vehicle-actions"><button class="danger" onclick="this.closest('.vehicle-row').remove()">Изтрий</button></div>
+      `;
+      for (const [key, val] of Object.entries(vehicle)) {{
+        const input = row.querySelector(`[data-field="${{key}}"]`);
+        if (!input) continue;
+        if (input.type === "checkbox") input.checked = !!val;
+        else input.value = val ?? "";
+      }}
+      return row;
+    }}
+
+    function addVehicle() {{
+      const tbody = $("vehiclesBody");
+      tbody.appendChild(vehicleRow({{
+        vehicle_type:"internal_bus", name:"", enabled:true, count:1, capacity:320, fixed_cost:0,
+        max_time_hours:8, service_time_minutes:8, start_location:"", end_location:"", _original_index:""
+      }}, tbody.children.length));
+    }}
+
+    function collectVehicles() {{
+      return Array.from($("vehiclesBody").querySelectorAll(".vehicle-row")).map(row => {{
+        const get = name => row.querySelector(`[data-field="${{name}}"]`);
+        return {{
+          _original_index: row.dataset.originalIndex,
+          vehicle_type: get("vehicle_type").value,
+          name: get("name").value,
+          enabled: get("enabled").checked,
+          count: intOrNull(get("count").value) || 0,
+          capacity: intOrNull(get("capacity").value) || 0,
+          fixed_cost: intOrNull(get("fixed_cost").value) || 0,
+          max_time_hours: intOrNull(get("max_time_hours").value) || 8,
+          service_time_minutes: intOrNull(get("service_time_minutes").value) || 8,
+          start_location: get("start_location").value,
+          end_location: get("end_location").value || null,
+        }};
+      }});
+    }}
+
+    function collectPayload() {{
+      return {{
+        vehicles: collectVehicles(),
+      }};
+    }}
+
+    async function loadAll() {{
+      const data = await apiFetch("/config");
+      renderConfig(data);
+      await loadLogs(false);
+    }}
+
+    async function saveConfig() {{
+      const result = await apiFetch("/config", {{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body:JSON.stringify(collectPayload())
+      }});
+      $("lastSaved").textContent = "Запазено: " + new Date().toLocaleTimeString() + " | backup: " + (result.backup_file || "");
+      await loadAll();
+    }}
+
+    async function startRun() {{
+      const result = await apiFetch("/run", {{method:"POST"}});
+      setStatus(result.run || {{}});
+      setLogsLive(true);
+      await loadLogs();
+    }}
+
+    async function stopRun() {{
+      if (!confirm("Да спра ли само активния run? API сървърът ще остане включен.")) return;
+      const result = await apiFetch("/stop-run", {{method:"POST"}});
+      $("lastSaved").textContent = result.message || "Заявено е спиране на активния run.";
+      setStatus(result.run || {{}});
+      await loadLogs(false);
+    }}
+
+    async function shutdownProgram() {{
+      if (!confirm("Сигурен ли си, че искаш да спреш API сървъра и активния run, ако има такъв?")) return;
+      const result = await apiFetch("/shutdown", {{method:"POST"}});
+      $("lastSaved").textContent = result.message || "Спирането е заявено.";
+      setStatus({{status:"shutting_down", running:false}});
+    }}
+
+    async function loadLogs(showErrors=true) {{
+      try {{
+        const data = await apiFetch("/logs");
+        setStatus(data.run_status || {{}});
+        const parts = [];
+        for (const [name, info] of Object.entries(data.logs || {{}})) {{
+          parts.push("===== " + name + " | " + info.path + " =====\\n" + (info.tail || ""));
+        }}
+        const logsBox = $("logsBox");
+        logsBox.textContent = parts.join("\\n\\n") || "Няма логове.";
+        logsBox.scrollTop = logsBox.scrollHeight;
+        logsBox.scrollLeft = 0;
+      }} catch (err) {{
+        if (showErrors) $("logsBox").textContent = String(err);
+      }}
+    }}
+
+    loadAll().catch(err => {{
+      $("serverLine").textContent = String(err);
+      $("logsBox").textContent = String(err);
+    }});
+    setInterval(() => apiFetch("/status").then(d => {{
+      setStatus(d.run_status || {{}});
+    }}).catch(() => null), 5000);
+  </script>
+</body>
+</html>"""
+
+
 def _auth_error(api_config, query: Optional[Dict[str, list[str]]], headers) -> Optional[str]:
     expected = str(getattr(api_config, "api_key", "") or "").strip()
     if not expected:
@@ -1432,6 +2129,7 @@ def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
         "tsp": f"{public_url}{tsp_endpoint}",
         "tsp_report": f"{public_url}{tsp_report_endpoint}",
         "shutdown": f"{public_url}{shutdown_endpoint}",
+        "web_gui": _web_gui_public_url(api_config, host, port) if _web_gui_enabled(api_config) else None,
     }
 
     return {
@@ -1666,21 +2364,28 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
                     }
                 )
                 status_snapshot = deepcopy(_RUN_STATUS)
+                stop_requested_after_start = bool(_RUN_STATUS.get("stop_requested")) and _RUN_STATUS.get("run_id") == run_id
             _persist_run_status(status_snapshot)
+            if stop_requested_after_start:
+                stop_result = _terminate_process_tree(process.pid)
+                logger.info("Run %s stop was requested before PID was available. Stop result: %s", run_id, stop_result)
             exit_code = process.wait()
             stdout_log.write(f"===== API run {run_id} finished {_now_iso()} exit_code={exit_code} =====\n")
 
         finished_at = _now_iso()
-        success = exit_code == 0
+        with _RUN_LOCK:
+            stop_requested = bool(_RUN_STATUS.get("stop_requested")) and _RUN_STATUS.get("run_id") == run_id
+        success = exit_code == 0 and not stop_requested
         result_summary = _run_status_result_for_process(exit_code, command)
         with _RUN_LOCK:
             _RUN_STATUS.update(
                 {
                     "running": False,
-                    "status": "completed" if success else "failed",
+                    "status": "stopped" if stop_requested else ("completed" if success else "failed"),
                     "finished_at": finished_at,
-                    "error": None if success else f"CVRP process exited with code {exit_code}",
+                    "error": "Run stopped by user request" if stop_requested else (None if success else f"CVRP process exited with code {exit_code}"),
                     "result": result_summary if success else None,
+                    "process_id": None,
                 }
             )
             status_snapshot = deepcopy(_RUN_STATUS)
@@ -1689,7 +2394,7 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
         notification = _post_completion_callback(
             callback_url,
             {
-                "status": "completed" if success else "failed",
+                "status": "stopped" if stop_requested else ("completed" if success else "failed"),
                 "success": success,
                 "run_id": run_id,
                 "finished_at": finished_at,
@@ -1713,6 +2418,7 @@ def _default_run_subprocess_worker(run_id: str, callback_url: str = ""):
                     "finished_at": finished_at,
                     "error": str(exc),
                     "result": None,
+                    "process_id": None,
                 }
             )
             status_snapshot = deepcopy(_RUN_STATUS)
@@ -1947,6 +2653,9 @@ def _start_default_run(
                 "callback_url": callback_url or None,
                 "notification": None,
                 "execution_mode": "subprocess" if use_subprocess else "in_process",
+                "process_id": None,
+                "process_log": None,
+                "stop_requested": False,
             }
         )
         status_snapshot = deepcopy(_RUN_STATUS)
@@ -1985,6 +2694,9 @@ def _run_inline(
                 "ignored_settings": ignored_settings or [],
                 "callback_url": None,
                 "notification": None,
+                "process_id": None,
+                "process_log": None,
+                "stop_requested": False,
             }
         )
 
@@ -2087,6 +2799,45 @@ def _active_run_process_id() -> Optional[int]:
         return None
 
 
+def _stop_active_run() -> Dict[str, Any]:
+    with _RUN_LOCK:
+        if not _RUN_STATUS.get("running"):
+            return {
+                "status": "idle",
+                "message": "No active CVRP run.",
+                "run": deepcopy(_RUN_STATUS),
+                "process_stop": {"attempted": False, "reason": "no_active_run"},
+            }
+
+        process_id = _RUN_STATUS.get("process_id")
+        execution_mode = str(_RUN_STATUS.get("execution_mode") or "")
+        _RUN_STATUS.update(
+            {
+                "status": "stopping",
+                "stop_requested": True,
+                "error": "Run stop requested",
+            }
+        )
+        status_snapshot = deepcopy(_RUN_STATUS)
+    _persist_run_status(status_snapshot)
+
+    process_stop = _terminate_process_tree(process_id)
+    if not process_stop.get("attempted") and execution_mode != "subprocess":
+        message = "Stop requested, but this run is not a subprocess and cannot be force-stopped safely."
+    elif not process_stop.get("attempted"):
+        message = "Stop requested. The process ID is not available yet; it will be stopped when available."
+    else:
+        message = "Stop requested for active CVRP run. API server remains active."
+
+    logger.info("Active CVRP run stop requested. Result: %s", process_stop)
+    return {
+        "status": "stopping" if status_snapshot.get("running") else "stopped",
+        "message": message,
+        "run": _run_status_snapshot(),
+        "process_stop": process_stop,
+    }
+
+
 def _schedule_program_shutdown(server, delay_seconds: float = 0.35) -> None:
     def shutdown_worker() -> None:
         time.sleep(delay_seconds)
@@ -2133,6 +2884,10 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         trigger_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run")))
         tsp_report_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report")))
         shutdown_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown")))
+        if _is_web_gui_path(path, api_config):
+            self._handle_web_gui_get(path, query, api_config)
+            return
+
         if path == health_endpoint:
             host = self.server.server_address[0]
             port = self.server.server_address[1]
@@ -2184,6 +2939,10 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         tsp_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_endpoint", "/tsp")))
         tsp_report_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "tsp_report_endpoint", "/tsp-report")))
         shutdown_endpoint = _normalise_path(_normalise_endpoint(getattr(api_config, "shutdown_endpoint", "/shutdown")))
+
+        if _is_web_gui_path(path, api_config):
+            self._handle_web_gui_post(path, query, api_config)
+            return
 
         try:
             payload = self._read_json_body(required=False)
@@ -2276,6 +3035,75 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "error": str(exc)})
         except Exception as exc:
             logger.exception("CVRP API request failed")
+            self._send_json(500, {"status": "error", "error": str(exc)})
+
+    def _handle_web_gui_get(self, path: str, query: Dict[str, list[str]], api_config) -> None:
+        if (error := _web_gui_auth_error(api_config, self.headers)):
+            self._send_web_auth_required(error)
+            return
+
+        subpath = _web_gui_subpath(path, api_config)
+        host = self.server.server_address[0]
+        port = self.server.server_address[1]
+
+        if subpath in {"/", ""}:
+            self._send_html(200, _web_gui_html(api_config, host, port))
+            return
+        if subpath == "/api/config":
+            self._send_json(200, _web_gui_config_payload(host, port))
+            return
+        if subpath == "/api/status":
+            self._send_json(200, {
+                "status": "ok",
+                "run_status": _run_status_snapshot(),
+                "server_time": _now_iso(),
+            })
+            return
+        if subpath == "/api/logs":
+            self._send_json(200, _web_gui_logs_payload())
+            return
+
+        self._send_json(404, {"status": "error", "error": "Unknown web GUI endpoint"})
+
+    def _handle_web_gui_post(self, path: str, query: Dict[str, list[str]], api_config) -> None:
+        if (error := _web_gui_auth_error(api_config, self.headers)):
+            self._send_web_auth_required(error)
+            return
+
+        subpath = _web_gui_subpath(path, api_config)
+        if subpath == "/api/run":
+            self._handle_trigger_run(query=query, payload=None, allow_inline_result=False)
+            return
+        if subpath == "/api/stop-run":
+            self._send_json(200, _stop_active_run())
+            return
+        if subpath == "/api/shutdown":
+            active_process_id = _active_run_process_id()
+            self._send_json(200, {
+                "status": "shutting_down",
+                "message": "CVRP API server/program shutdown scheduled.",
+                "active_run_process_id": active_process_id,
+                "will_attempt_to_stop_active_run_process": bool(active_process_id),
+            })
+            _schedule_program_shutdown(self.server)
+            return
+
+        try:
+            payload = self._read_json_body(required=True)
+            if subpath == "/api/config":
+                result = _apply_web_gui_config_save(payload)
+                host = self.server.server_address[0]
+                port = self.server.server_address[1]
+                result["config"] = _web_gui_config_payload(host, port)
+                self._send_json(200, result)
+                return
+
+            self._send_json(404, {"status": "error", "error": "Unknown web GUI endpoint"})
+        except json.JSONDecodeError as exc:
+            logger.exception("Invalid web GUI JSON request body")
+            self._send_json(400, {"status": "error", "error": "Invalid JSON request body", "detail": str(exc)})
+        except Exception as exc:
+            logger.exception("Web GUI request failed")
             self._send_json(500, {"status": "error", "error": str(exc)})
 
     def log_message(self, fmt: str, *args):
@@ -2448,6 +3276,23 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
     def _send_json(self, status_code: int, payload: Dict[str, Any]):
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_html(self, status_code: int, html_text: str):
+        raw = str(html_text or "").encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_web_auth_required(self, message: str):
+        raw = json.dumps({"status": "unauthorized", "error": message}, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="CVRP Web GUI"')
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()

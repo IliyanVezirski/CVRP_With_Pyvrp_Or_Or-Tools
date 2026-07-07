@@ -21,7 +21,10 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Helper функция за създаване на абсолютни пътища
 def _abs_path(relative_path: str) -> str:
-    return os.path.join(PROJECT_ROOT, relative_path)
+    path = os.path.expandvars(os.path.expanduser(str(relative_path or "")))
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path)
 
 
 def build_ordered_depots(
@@ -697,7 +700,7 @@ class OSRMConfig:
 class InputConfig:
     """Конфигурации за обработка на входните данни от Excel файл или HTTP JSON."""
     input_source: str = "http_json"  # Източник на данни: "excel" или "http_json"
-    excel_file_path: str = _abs_path("C:\\Users\\shaman\\Documents\\New project 2\\CVRP_With_Pyvrp_Or_Or-Tools\\data/input.xlsx") # Път до входния Excel файл.
+    excel_file_path: str = _abs_path("data/input.xlsx") # Път до входния Excel файл.
     json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
     json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
     json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
@@ -890,8 +893,8 @@ class OutputConfig:
     """Конфигурации за генериране на изходни файлове (карти, Excel отчети, графики)."""
     # Интерактивна карта
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
-    map_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/interactive_map.html") # Път и име на файла за картата.
-    routes_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes") # Директория за отделните HTML карти на маршрутите.
+    map_output_file: str = _abs_path("output/interactive_map.html") # Път и име на файла за картата.
+    routes_output_dir: str = _abs_path("output/routes") # Директория за отделните HTML карти на маршрутите.
     route_maps_upload_mode: str = "legacy" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
@@ -908,7 +911,7 @@ class OutputConfig:
     
     # Excel файлове
     enable_excel_output: bool = True # Дали да се генерира Excel CVRP отчет.
-    excel_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/excel") # Директория за запис на Excel отчетите.
+    excel_output_dir: str = _abs_path("output/excel") # Директория за запис на Excel отчетите.
     warehouse_excel_file: str = "warehouse_orders.xlsx" # Име на файла с необслужените клиенти (за склада).
     routes_excel_file: str = "vehicle_routes.xlsx" # Име на файла с детайли за всеки маршрут.
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
@@ -919,11 +922,11 @@ class OutputConfig:
     
     # CSV файл с маршрути
     enable_csv_output: bool = False # Дали да се генерира CSV файл с маршрутите.
-    csv_output_file: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/routes.csv") # Път и име на CSV файла с маршрутите.
+    csv_output_file: str = _abs_path("output/routes.csv") # Път и име на CSV файла с маршрутите.
     
     # Графики и анализи
     enable_charts: bool = False # Дали да се генерират PNG файлове с графики.
-    charts_output_dir: str = _abs_path("C:\\Programming\\Bizant 2.0\\cvrp-ortools-optimizer\\output/charts") # Директория за запис на графиките.
+    charts_output_dir: str = _abs_path("output/charts") # Директория за запис на графиките.
     efficiency_chart_file: str = "efficiency_analysis.png" # Графика с анализ на ефективността.
     route_comparison_file: str = "route_comparison.png" # Графика, сравняваща маршрутите.
     volume_distribution_file: str = "volume_distribution.png" # Графика с разпределението на обемите.
@@ -972,7 +975,7 @@ class PerformanceConfig:
 class APIConfig:
     """Настройки за HTTP API сървъра, който приема POST заявки от други програми."""
     api_host: str = "0.0.0.0"  # 0.0.0.0 = приема заявки от други компютри в мрежата.
-    api_port: int = 8087
+    api_port: int = 8084
     api_public_url: str = ""  # URL за извикване от друга програма, напр. http://10.10.100.134:8088 или https://domain.com/cvrp
     api_key: str = ""  # Ако е попълнено, /run и /solve изискват X-CVRP-API-Key или Authorization: Bearer.
     api_endpoint: str = "/solve"
@@ -981,6 +984,12 @@ class APIConfig:
     tsp_report_endpoint: str = "/tsp-report"  # Генерира дневен Excel отчет за TSP маршрутите.
     shutdown_endpoint: str = "/shutdown"  # Спира API сървъра/програмата; ползвай с API key при отдалечен достъп.
     health_endpoint: str = "/health"
+    web_gui_enabled: bool = True
+    web_gui_endpoint: str = "/hell"
+    web_gui_title: str = "CVRP Optimizer"
+    web_gui_users: str = "iliyan:482253"
+    web_gui_public_host: str = "bizant"
+    web_gui_public_url: str = "http://bizant/hell"
     tsp_default_service_time_minutes: int = 8  # TSP service time по подразбиране, ако POST не подаде service_time_minutes.
     tsp_objective_metric: str = "time"  # TSP цел по подразбиране: time или distance.
     tsp_use_time_windows: bool = True  # Дали TSP подреждането да отчита работното време на клиентите.
@@ -1025,7 +1034,7 @@ class APIConfig:
 @dataclass
 class SetDataConfig:
     """Настройки за връщане на готовите маршрути към Bizant чрез cmd=setData."""
-    enable_set_data_upload: bool = True  # Включва изпращане на резултата към setData след успешно решение.
+    enable_set_data_upload: bool = False  # Включва изпращане на резултата към setData след успешно решение.
     set_data_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за setData endpoint.
     set_data_http_method: str = "GET"  # HTTP метод за setData: GET или POST.
     set_data_command: str = "setData"  # cmd параметър.
@@ -1036,7 +1045,7 @@ class SetDataConfig:
     set_data_id_grafik: str = ""  # IdGrafik параметър.
     set_data_id_grafik_template: str = "{bus_number}"  # Шаблон за IdGrafik. По подразбиране е номерът на буса от Excel.
     set_data_bukva_template: str = "БХ{route_number}-{stop_number}"  # Шаблон за Bukva, напр. БХ1-1.
-    enable_unserved_set_data_upload: bool = True  # Дали да се изпращат и необслужените клиенти към setData.
+    enable_unserved_set_data_upload: bool = False  # Дали да се изпращат и необслужените клиенти към setData.
     set_data_unserved_done_flag: str = "0"  # DoneFlag за необслужени. Празно = използва set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
@@ -1085,67 +1094,35 @@ class MainConfig:
         return [
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
-                capacity=385,
-                count=6,
-                name="Маршрут",
+                capacity=4200,
+                count=5,
+                name="Благоевград общо",
                 fixed_cost=0,
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=8,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),
+                start_location=(42.006031278165295, 23.085359288631953),
                 end_location=None,
                 start_time_minutes=480,
-                tsp_depot_location=(42.695785029219415, 23.23165887245312)
-            ),
-            VehicleConfig(
-                vehicle_type=VehicleType.CENTER_BUS,
-                capacity=320,
-                count=1,
-                name="Център",
-                fixed_cost=0,
-                max_distance_km=None,
-                max_time_hours=8,
-                service_time_minutes=8,
-                enabled=True,
-                max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),
-                end_location=None,
-                start_time_minutes=510,
                 tsp_depot_location=(42.695785029219415, 23.23165887245312)
             ),
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
-                capacity=320,
+                capacity=5000,
                 count=1,
-                name="Доп. бус",
+                name="БЛ Камион",
                 fixed_cost=0,
                 max_distance_km=None,
                 max_time_hours=8,
-                service_time_minutes=8,
+                service_time_minutes=10,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.695785029219415, 23.23165887245312),
+                start_location=(42.006031278165295, 23.085359288631953),
                 end_location=None,
                 start_time_minutes=480,
                 tsp_depot_location=(42.695785029219415, 23.23165887245312)
-            ),
-            VehicleConfig(
-                vehicle_type=VehicleType.VRATZA_BUS,
-                capacity=385,
-                count=3,
-                name="Враца",
-                fixed_cost=0,
-                max_distance_km=None,
-                max_time_hours=8,
-                service_time_minutes=8,
-                enabled=True,
-                max_customers_per_route=None,
-                start_location=(43.221042895146915, 23.5344026186417),
-                end_location=None,
-                start_time_minutes=480,
-                tsp_depot_location=(43.221042895146915, 23.5344026186417)
             ),
         ]
 

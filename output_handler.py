@@ -131,6 +131,81 @@ def _route_vehicle_name(route: Route, default: str = "Неизвестен") -> 
     return _fallback_vehicle_name(route.vehicle_type, default)
 
 
+def _normalise_vehicle_name(value: object) -> str:
+    return " ".join(str(value or "").strip().split()).casefold()
+
+
+def _vehicle_count(vehicle_config) -> int:
+    try:
+        return max(0, int(getattr(vehicle_config, "count", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _vehicle_display_name_candidates(vehicle_config) -> List[str]:
+    name = str(getattr(vehicle_config, "name", "") or "").strip()
+    if not name:
+        return []
+
+    names = [name]
+    count = _vehicle_count(vehicle_config)
+    if count > 1:
+        names.extend(f"{name} {idx}" for idx in range(1, count + 1))
+    return names
+
+
+def _vehicle_config_for_route(route: Optional[Route]):
+    """Return the exact configured vehicle used by a route when possible."""
+    if route is None:
+        return None
+
+    vehicle_configs = get_config().vehicles or []
+    route_type_value = _vehicle_type_value(getattr(route, "vehicle_type", ""))
+
+    try:
+        route_vehicle_id = int(getattr(route, "vehicle_id"))
+    except (TypeError, ValueError):
+        route_vehicle_id = None
+
+    id_candidate = None
+    if route_vehicle_id is not None:
+        current_id = 0
+        for vehicle_config in vehicle_configs:
+            if not getattr(vehicle_config, "enabled", True):
+                continue
+            count = _vehicle_count(vehicle_config)
+            if current_id <= route_vehicle_id < current_id + count:
+                id_candidate = vehicle_config
+                if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) == route_type_value:
+                    return vehicle_config
+                break
+            current_id += count
+
+    route_name = _normalise_vehicle_name(getattr(route, "vehicle_name", ""))
+    if route_name:
+        for vehicle_config in vehicle_configs:
+            if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) != route_type_value:
+                continue
+            names = {_normalise_vehicle_name(name) for name in _vehicle_display_name_candidates(vehicle_config)}
+            if route_name in names:
+                return vehicle_config
+
+    if id_candidate is not None:
+        return id_candidate
+
+    for vehicle_config in vehicle_configs:
+        if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) == route_type_value:
+            return vehicle_config
+    return None
+
+
+def _route_start_time_minutes(route: Route) -> int:
+    vehicle_config = _vehicle_config_for_route(route)
+    if vehicle_config and hasattr(vehicle_config, "start_time_minutes"):
+        return int(getattr(vehicle_config, "start_time_minutes", 0) or 0)
+    return int(getattr(get_config().cvrp, "global_start_time_minutes", 480) or 480)
+
+
 def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
     schedule_entries = getattr(route, "schedule_entries", None) or []
     if not schedule_entries:
@@ -1014,8 +1089,8 @@ class InteractiveMapGenerator:
         if stored_entries:
             return stored_entries
 
-        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        start_time_minutes = _route_start_time_minutes(route)
+        vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
         service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
@@ -1086,7 +1161,7 @@ class InteractiveMapGenerator:
             stored_entries = _stored_route_schedule_entries(route)
             if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
                 return self._format_time_hh_mm(int(round(float(stored_entries[0]["start_time_minutes"]))))
-            return self._format_time_hh_mm(self._get_start_time_for_vehicle(route.vehicle_type))
+            return self._format_time_hh_mm(_route_start_time_minutes(route))
         except Exception:
             return ""
 
@@ -1097,7 +1172,7 @@ class InteractiveMapGenerator:
             if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
                 start_minutes = float(stored_entries[0]["start_time_minutes"])
             else:
-                start_minutes = float(self._get_start_time_for_vehicle(route.vehicle_type))
+                start_minutes = float(_route_start_time_minutes(route))
 
             total_route_minutes = float(getattr(route, "total_time_minutes", 0) or 0)
             if total_route_minutes > 0:
@@ -4504,7 +4579,7 @@ class ExcelExporter:
             if vehicle_seen_key not in vehicle_types_seen:
                 vehicle_types_seen.add(vehicle_seen_key)
                 vehicle_name = self._get_report_vehicle_name(route, route.vehicle_type.value)
-                start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+                start_time_minutes = _route_start_time_minutes(route)
                 
                 data = [
                     vehicle_name,
@@ -4605,13 +4680,13 @@ class ExcelExporter:
             avg_distance_to_center = sum(distances_to_center) / len(distances_to_center) if distances_to_center else 0
             
             # Капацитет използване (трябва да вземем capacity от config)
-            vehicle_config = self._get_vehicle_config(route.vehicle_type)
+            vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
             capacity_usage = 0
             if vehicle_config and vehicle_config.capacity > 0:
                 capacity_usage = (route.total_volume / vehicle_config.capacity * 100)
             
             # Изчисляваме стартово време за този тип превозно средство
-            start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+            start_time_minutes = _route_start_time_minutes(route)
             
             data = [
                 self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
@@ -4671,8 +4746,8 @@ class ExcelExporter:
         if stored_entries:
             return stored_entries
 
-        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        start_time_minutes = _route_start_time_minutes(route)
+        vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
         service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
@@ -5006,7 +5081,7 @@ class ChartGenerator:
         labels = []
         usages = []
         for i, route in enumerate(solution.routes):
-            vc = self._get_vehicle_config(route.vehicle_type)
+            vc = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
             cap = vc.capacity if vc else 1
             usage = (route.total_volume / cap * 100) if cap > 0 else 0
             labels.append(f"М{i+1}")
