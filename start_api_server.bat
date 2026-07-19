@@ -12,8 +12,8 @@ echo Default listen address is configured in config.py / Settings.
 echo Use 0.0.0.0 to accept requests from other computers.
 echo.
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
-    "%APP_DIR%CVRP_Optimizer.exe" --server
+if exist "%APP_DIR%Bizant.exe" (
+    "%APP_DIR%Bizant.exe" --server
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     "%APP_DIR%.venv\Scripts\python.exe" "%APP_DIR%cvrp_api_server.py"
 ) else (
@@ -30,7 +30,7 @@ if exist "%APP_DIR%CVRP_Optimizer.exe" (
     )
 
     echo Python not found.
-    echo Install Python or build/copy CVRP_Optimizer.exe first.
+    echo Install Python or build/copy Bizant.exe first.
     pause
     exit /b 1
 )

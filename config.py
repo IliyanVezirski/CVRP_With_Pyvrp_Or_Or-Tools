@@ -12,6 +12,13 @@ from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 
 
+# Public solver identifiers shared by the desktop GUI, Web/API validation and
+# the runtime dispatcher.  The stable PyVRP backend intentionally remains the
+# default; the experimental backend is executed by an isolated sidecar.
+CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "or_tools", "vroom", "vrp")
+PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental"})
+
+
 # --- Path Configuration ---
 # Определяне на основната директория на проекта.
 # __file__ е пътят до текущия файл (config.py).
@@ -30,6 +37,7 @@ def _abs_path(relative_path: str) -> str:
 def build_ordered_depots(
     main_depot: Tuple[float, float],
     vehicle_configs: Optional[List[Any]] = None,
+    include_reload_locations: bool = False,
 ) -> List[Tuple[float, float]]:
     """Връща единния ред на депата за матрици и solver-и."""
     def _normalise_coords(coords: Any) -> Optional[Tuple[float, float]]:
@@ -54,7 +62,11 @@ def build_ordered_depots(
     for vehicle_config in vehicle_configs or []:
         if not getattr(vehicle_config, "enabled", False):
             continue
-        for attr_name in ("start_location", "end_location"):
+        location_attrs = ["start_location", "end_location"]
+        if include_reload_locations:
+            location_attrs.append("reload_location")
+
+        for attr_name in location_attrs:
             location = _normalise_coords(getattr(vehicle_config, attr_name, None))
             if location and _coord_key(location) not in seen:
                 extra_depots.append(location)
@@ -87,15 +99,19 @@ class VehicleConfig:
     vehicle_type: VehicleType  # Тип на превозното средство (от VehicleType enum)
     capacity: int              # Максимален капацитет/обем (в стекове, грамове или друга единица)
     count: int                 # Брой налични превозни средства от този тип
+    config_id: str = ""        # Stable unique key for this configuration row and its physical vehicles.
     name: str = ""             # Име на буса за отчети и карти. При count > 1 се показва като "Име 1", "Име 2"...
     fixed_cost: int = 40000    # Цена/глоба за използване на един бус. По-висока стойност намалява броя използвани бусове.
-    max_distance_km: Optional[int] = None  # Максимален пробег в километри за един маршрут. None означава без лимит.
-    max_time_hours: int = 8    # Максимално време за работа по един маршрут в часове (включва пътуване и обслужване).
+    max_distance_km: Optional[int] = None  # Максимален дневен пробег на физическия бус. None означава без лимит.
+    max_time_hours: int = 8    # Максимално дневно работно време (включва пътуване, обслужване и презареждане).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
     enabled: bool = True       # Дали този тип превозно средство е активно и може да се използва от solver-а.
     start_location: Optional[Tuple[float, float]] = None  # Персонална начална точка (депо) за този тип. Ако е None, използва се главното депо.
     end_location: Optional[Tuple[float, float]] = None  # Персонална крайна точка за този тип. Ако е None, маршрутът завършва в стартовото депо.
-    max_customers_per_route: Optional[int] = None # Максимален брой клиенти, които могат да бъдат обслужени в един маршрут. None = без ограничение.
+    max_customers_per_route: Optional[int] = None # Legacy fallback; новите настройки използват max_customers_per_day.
+    reload_location: Optional[Tuple[float, float]] = None  # Reload depot between trips. None uses the start depot.
+    reload_time_minutes: int = 30  # Loading time between trips; not charged before the first or after the last trip.
+    max_customers_per_day: Optional[int] = None  # Cumulative physical-vehicle customer limit across all trips for the day.
     start_time_minutes: int = 480  # Стартово време в минути от 00:00 (8:00 = 480 минути)
     tsp_depot_location: Optional[Tuple[float, float]] = None  # Депо за TSP оптимизация. Ако е None, използва start_location или главното депо.
 
@@ -108,6 +124,7 @@ class TrafficZoneConfig:
     radius_km: float
     duration_multiplier: float
     enabled: bool = True
+    show_on_map: bool = False  # Opt-in visualisation only; it does not disable the traffic rule.
 
 
 @dataclass
@@ -119,6 +136,7 @@ class CenterZoneConfig:
     radius_km: float = 1.0
     polygon: List[Tuple[float, float]] = field(default_factory=lambda: [])
     enabled: bool = True
+    show_on_map: bool = True  # Controls visualisation only; solver rules remain active.
     enable_priority: bool = True
     enable_restrictions: bool = True
     priority_vehicle_types: List[str] = field(default_factory=lambda: [VehicleType.CENTER_BUS.value])
@@ -136,6 +154,35 @@ class CenterZoneConfig:
         VehicleType.SPECIAL_BUS.value: 40000.0,
         VehicleType.VRATZA_BUS.value: 40000.0,
     })
+
+
+def _coerce_center_zone_config(value: Any, index: Optional[int] = None) -> CenterZoneConfig:
+    """Restore a nested center zone after ``dataclasses.asdict()``.
+
+    Parallel solver workers receive ``LocationConfig`` as a plain dictionary.
+    ``asdict()`` also turns every nested ``CenterZoneConfig`` into a dictionary,
+    so dynamically added zones must be rebuilt before reaching the solver.
+    """
+    if isinstance(value, CenterZoneConfig):
+        return value
+    if not isinstance(value, dict):
+        suffix = f" at index {index}" if index is not None else ""
+        raise TypeError(f"Invalid center zone{suffix}: expected CenterZoneConfig or dict")
+
+    payload = dict(value)
+    center_coords = payload.get("center_coords")
+    if center_coords is not None:
+        payload["center_coords"] = tuple(center_coords)
+    payload["polygon"] = [tuple(point) for point in (payload.get("polygon") or [])]
+    payload["priority_vehicle_types"] = list(payload.get("priority_vehicle_types") or [])
+    payload["restricted_vehicle_types"] = list(payload.get("restricted_vehicle_types") or [])
+    payload["vehicle_penalties"] = dict(payload.get("vehicle_penalties") or {})
+
+    try:
+        return CenterZoneConfig(**payload)
+    except (TypeError, ValueError) as exc:
+        suffix = f" at index {index}" if index is not None else ""
+        raise ValueError(f"Invalid center zone{suffix}: {exc}") from exc
 
 
 @dataclass
@@ -189,6 +236,7 @@ class LocationConfig:
         (42.70035998, 23.2969594)
     ])  # Точки на полигона: [(lat, lon), ...]
     center_zone_radius_km: float = 1.9  # Радиус на център зоната в километри
+    show_center_zone_on_map: bool = True  # Показва само очертанието на основната зона в картата.
     center_zones: List[CenterZoneConfig] = field(default_factory=lambda: [])
     enable_center_zone_priority: bool = True  # Дали да се прилага приоритет за център зоната
     
@@ -204,9 +252,19 @@ class LocationConfig:
     # Параметри за градски трафик (задръствания в София)
     city_center_coords: Tuple[float, float] = (42.6977, 23.3219)  # Център на София (площад Независимост)
     city_traffic_radius_km: float = 10.0  # Радиус на градската зона с трафик (км)
-    city_traffic_duration_multiplier: float = 1.55 # Множител за време в града (1.35 = +35% заради трафик)
+    city_traffic_duration_multiplier: float = 1.45 # Множител за време в града (1.35 = +35% заради трафик)
     enable_city_traffic_adjustment: bool = True  # Дали да се прилага корекция за градски трафик
+    show_city_traffic_zone_on_map: bool = False  # Показва само очертанието на основната трафик зона.
     traffic_zones: List[TrafficZoneConfig] = field(default_factory=lambda: [])
+
+    def __post_init__(self) -> None:
+        # ``main.run_optimization()`` uses asdict() before spawning workers.
+        # Rehydrate nested zones immediately so every solver backend sees the
+        # same dynamically configured circle and polygon zones.
+        self.center_zones = [
+            _coerce_center_zone_config(zone, index)
+            for index, zone in enumerate(self.center_zones or [])
+        ]
 
 
 def _distance_km(coord1: Optional[Tuple[float, float]], coord2: Tuple[float, float]) -> float:
@@ -264,6 +322,7 @@ def _legacy_center_zone(location_config: LocationConfig) -> Optional[CenterZoneC
     center = getattr(location_config, "center_location", None)
     radius = float(getattr(location_config, "center_zone_radius_km", 0) or 0)
     zone_kwargs = {
+        "show_on_map": bool(getattr(location_config, "show_center_zone_on_map", True)),
         "enable_priority": bool(getattr(location_config, "enable_center_zone_priority", True)),
         "enable_restrictions": bool(getattr(location_config, "enable_center_zone_restrictions", True)),
         "priority_vehicle_types": [VehicleType.CENTER_BUS.value],
@@ -326,9 +385,8 @@ def get_center_zones(
         if legacy and (include_disabled or getattr(legacy, "enabled", True)):
             zones.append(legacy)
 
-    for zone in getattr(location_config, "center_zones", []) or []:
-        if not isinstance(zone, CenterZoneConfig):
-            continue
+    for index, raw_zone in enumerate(getattr(location_config, "center_zones", []) or []):
+        zone = _coerce_center_zone_config(raw_zone, index)
         if not include_disabled and not getattr(zone, "enabled", True):
             continue
         zones.append(zone)
@@ -499,6 +557,7 @@ def get_traffic_zones(location_config: Optional[LocationConfig]) -> List[Traffic
                 radius_km=float(legacy_radius),
                 duration_multiplier=float(legacy_multiplier),
                 enabled=True,
+                show_on_map=bool(getattr(location_config, "show_city_traffic_zone_on_map", False)),
             )
         )
 
@@ -510,6 +569,7 @@ def get_traffic_zones(location_config: Optional[LocationConfig]) -> List[Traffic
                 radius_km=float(zone.get("radius_km", 0) or 0),
                 duration_multiplier=float(zone.get("duration_multiplier", 1.0) or 1.0),
                 enabled=bool(zone.get("enabled", True)),
+                show_on_map=bool(zone.get("show_on_map", False)),
             )
         if (
             getattr(zone, "enabled", True)
@@ -700,7 +760,7 @@ class OSRMConfig:
 class InputConfig:
     """Конфигурации за обработка на входните данни от Excel файл или HTTP JSON."""
     input_source: str = "http_json"  # Източник на данни: "excel" или "http_json"
-    excel_file_path: str = _abs_path("data/input.xlsx") # Път до входния Excel файл.
+    excel_file_path: str = _abs_path("D:\\Iliyan\\bizant_source\\data/input.xlsx") # Път до входния Excel файл.
     json_url: str = "http://sio.effect.bg:7080/lubiv_Bizant"  # URL за HTTP JSON източник (използва се когато input_source="http_json")
     json_http_method: str = "GET"  # HTTP метод за JSON източника: "GET" или "POST".
     json_command: str = "getData"  # Стойност за cmd параметъра при HTTP JSON заявка.
@@ -717,6 +777,8 @@ class InputConfig:
     json_id_skld_field: str = "IdSkld"  # Име на JSON полето с оригиналния склад на заявката.
     json_time_window_field: str = "WorkTime"  # Име на JSON полето с работно време във формат "08:00 - 16:00".
     json_delivery_comment_field: str = "DeliveryComment"  # Име на JSON полето с коментар/инструкция за доставката.
+    json_service_time_field: str = "ServiceTimeMinutes"  # Optional време за обслужване на конкретния клиент в минути.
+    json_mandatory_field: str = "Mandatory"  # Optional true/false флаг: клиентът не може да бъде пропуснат от solver-а.
     json_override_date: str = ""  # Конкретна дата (DD/MM/YYYY). Ако е празно, автоматично се изчислява следващият работен ден.
     json_timeout_seconds: int = 30  # Таймаут за HTTP заявката в секунди.
     gps_column: str = "GpsData"         # Име на колоната с GPS координатите на клиентите.
@@ -726,6 +788,7 @@ class InputConfig:
     document_column: str = "Фактура"  # Име на колоната с номер на документа/поръчката.
     time_window_column: str = "Работно време"  # Excel колона с работно време във формат "08:00 - 16:00".
     delivery_comment_column: str = "Коментар доставка"  # Excel колона с коментар/инструкция за доставката.
+    mandatory_column: str = "Задължителен"  # Optional Excel колона: true/false, 1/0 или да/не.
     enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
@@ -738,24 +801,31 @@ class WarehouseConfig:
     sort_by_volume: bool = True        # Дали заявките да се сортират по обем (от най-малък към най-голям) преди обработка
     sort_by_distance: bool = True      # Дали да се сортират по разстояние за клиенти с еднакъв обем (от най-далечен към най-близък)
     check_max_bus_capacity: bool = True # Проверява дали клиент надвишава капацитета на най-големия наличен бус
-    max_bus_customer_volume: float = 100.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
+    max_bus_customer_volume: float = 160.0 # Максимален обем на клиент (стекове), над който се изпращат към склада, а не към бусовете
     capacity_toleranse: float = 1.0 # Толеранс на капацитета на превозните средства.
 @dataclass
 class CVRPConfig:
     """
     Конфигурация за CVRP (Capacitated Vehicle Routing Problem) решателя.
     Тези настройки контролират всеки аспект на процеса на оптимизация.
-    Поддържа OR-Tools и PyVRP солвъри.
+    Поддържа OR-Tools, PyVRP, VROOM и експерименталния VRP-Rust солвър.
     """
-    solver_type: str = "pyvrp"  # Тип солвър: "or_tools" или "pyvrp"
+    solver_type: str = "pyvrp_experimental"  # "pyvrp", "pyvrp_experimental", "or_tools", "vroom" или "vrp".
     algorithm: str = "or_tools"  # Основен алгоритъм. В момента се поддържа само "or_tools".
+    enable_multiple_trips: bool = True  # Globally enables dynamic extra trips within each physical vehicle's daily limits.
 
     # --- Основни параметри на търсенето ---
-    time_limit_seconds: int = 300
+    time_limit_seconds: int = 360
     # Описание: Максимално време в секунди, което solver-ът има за намиране на решение.
 
-    objective_metric: str = "time"
+    objective_metric: str = "distance"
     # Описание: Какво минимизира solver-ът. "distance" = най-къси километри, "time" = най-кратко време по OSRM/Valhalla duration матрицата.
+
+    time_objective_include_waiting: bool = True
+    # Описание: Важи само при objective_metric="distance". True = минимизира целия работен ден
+    # (пътуване + обслужване + чакане + презареждане); False = старото поведение без
+    # директна цена за чакането. При True fitness е само времето в секунди. Реалните
+    # метри не участват в целта и остават само за ограниченията и отчетите.
 
     first_solution_strategy: str = "PARALLEL_CHEAPEST_INSERTION"
     # Описание: Стратегия за намиране на първоначално решение. SAVINGS е по-бърза от AUTOMATIC.
@@ -833,29 +903,78 @@ class CVRPConfig:
     customer_time_window_default_end_minutes: int = 1439
     # Описание: Default край на прозореца, когато клиентът няма работно време (1439 = 23:59).
     
-    num_workers: int = 6
+    num_workers: int = -1
     # Описание: Брой паралелни процеси. -1 означава да се използват всички ядра без едно.
 
-    pyvrp_seed_base: int = 1
+    pyvrp_seed_base: int = 10
     # Описание: Seed за PyVRP, когато pyvrp_seed е None. В паралелен режим worker-ите използват pyvrp_seed_base, pyvrp_seed_base+1...
     pyvrp_seed: Optional[int] = None
     # Описание: Ако е зададен, single mode използва точно този seed. В паралелен режим worker-ите използват pyvrp_seed, pyvrp_seed+1...
 
-    pyvrp_num_neighbours: int = 150
+    pyvrp_num_neighbours: int = 75
     # Описание: Размер на granular neighbourhood-а на PyVRP. По-голяма стойност = по-бавно, но по-добър шанс за качество при две депа.
-    pyvrp_ils_no_improvement: int = 650000
+    pyvrp_weight_wait_time: float = 0.2
+    # Описание: Тежест на чакането в PyVRP proximity оценката.
+    pyvrp_symmetric_proximity: bool = True
+    # Описание: Дали neighbourhood proximity оценката да е симетрична.
+    pyvrp_ils_no_improvement: int = 10000
     # Описание: Брой ILS итерации без подобрение преди restart. По-високо = по-търпеливо търсене.
-    pyvrp_ils_history_length: int = 800
+    pyvrp_ils_history_length: int = 100
     # Описание: Late-acceptance history length за ILS.
     pyvrp_exhaustive_on_best: bool = True
     # Описание: По-скъпо локално търсене при ново най-добро решение.
     pyvrp_use_extended_operators: bool = True
     # Описание: Добавя по-тежки PyVRP move operators (Exchange30/31/32/33, SwapStar, SwapRoutes).
-    pyvrp_min_perturbations: int = 2
-    pyvrp_max_perturbations: int = 70
+    pyvrp_min_perturbations: int = 1
+    pyvrp_max_perturbations: int = 25
     # Описание: Сила на perturbation при restart-и. По-високо помага да излезе от лош локален оптимум.
     pyvrp_display_progress: bool = True
     # Описание: Ако е True, PyVRP печата собствен progress output през solve().
+    pyvrp_display_interval_seconds: float = 5.0
+    # Описание: Интервал между PyVRP progress съобщенията.
+
+    pyvrp_use_library_penalty_defaults: bool = True
+    # True = използва проверените penalty defaults на инсталираната PyVRP версия.
+    pyvrp_penalty_solutions_between_updates: int = 500
+    pyvrp_penalty_increase: float = 1.5
+    pyvrp_penalty_decrease: float = 0.9
+    pyvrp_penalty_target_feasible: float = 0.65
+    pyvrp_penalty_feas_tolerance: float = 0.05
+    pyvrp_penalty_min: float = 0.1
+    pyvrp_penalty_max: float = 100000.0
+    # Полетата по-горе се използват само когато pyvrp_use_library_penalty_defaults=False.
+
+    # --- Experimental PyVRP 0.14 sidecar ---
+    pyvrp_next_worker_path: str = ""
+    # Празно = runtime-ът търси стандартния companion worker до приложението.
+    pyvrp_next_worker_timeout_seconds: int = 0
+    # 0 = time_limit_seconds плюс безопасен startup/IPC резерв.
+    pyvrp_next_fallback_to_stable: bool = False
+    # Ако sidecar-ът липсва/се провали, разрешава изричен fallback към стабилния PyVRP 0.13.
+
+    # --- Official VROOM 1.15 sidecar ---
+    vroom_worker_path: str = ""
+    # Празно = използва .venv-vroom при source run или companion worker до EXE-то.
+    vroom_worker_timeout_seconds: int = 0
+    # 0 = time_limit_seconds плюс безопасен резерв за startup и JSON IPC.
+    vroom_threads: int = 0
+    # 0 = автоматично всички логически ядра без едно. VROOM се стартира без външни parallel workers.
+    vroom_exploration_level: int = 5
+    # Официален VROOM quality параметър 0..5. 5 е най-задълбоченото търсене.
+
+    # --- Experimental reinterpretcat/vrp 1.24 sidecar ---
+    vrp_worker_path: str = ""
+    # Празно = използва .venv-vrp-rust при source run или companion worker до EXE-то.
+    vrp_worker_timeout_seconds: int = 0
+    # 0 = time_limit_seconds плюс безопасен резерв за startup и JSON IPC.
+    vrp_threads: int = 0
+    # 0 = автоматично всички логически ядра. Външният parallel solve се изключва.
+    # The GUI and API accept at most one trillion generations.  This remains
+    # effectively unlimited because time_limit_seconds normally stops first.
+    vrp_max_generations: int = 1000000000000
+    # Горна граница на поколенията; реалният край обикновено се определя от time_limit_seconds.
+    vrp_log_progress: bool = True
+    # Препраща progress изхода на VRP-Rust към общия лог в реално време.
 
     parallel_first_solution_strategies: List[str] = field(default_factory=lambda: [
         "PARALLEL_CHEAPEST_INSERTION",
@@ -893,9 +1012,9 @@ class OutputConfig:
     """Конфигурации за генериране на изходни файлове (карти, Excel отчети, графики)."""
     # Интерактивна карта
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
-    map_output_file: str = _abs_path("output/interactive_map.html") # Път и име на файла за картата.
-    routes_output_dir: str = _abs_path("output/routes") # Директория за отделните HTML карти на маршрутите.
-    route_maps_upload_mode: str = "legacy" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
+    map_output_file: str = _abs_path("D:\\Iliyan\\bizant_source\\output/interactive_map.html") # Път и име на файла за картата.
+    routes_output_dir: str = _abs_path("D:\\Iliyan\\bizant_source\\output/routes") # Директория за отделните HTML карти на маршрутите.
+    route_maps_upload_mode: str = "disabled" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
     route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
@@ -911,22 +1030,24 @@ class OutputConfig:
     
     # Excel файлове
     enable_excel_output: bool = True # Дали да се генерира Excel CVRP отчет.
-    excel_output_dir: str = _abs_path("output/excel") # Директория за запис на Excel отчетите.
+    excel_output_dir: str = _abs_path("D:\\Iliyan\\bizant_source\\output/excel") # Директория за запис на Excel отчетите.
     warehouse_excel_file: str = "warehouse_orders.xlsx" # Име на файла с необслужените клиенти (за склада).
     routes_excel_file: str = "vehicle_routes.xlsx" # Име на файла с детайли за всеки маршрут.
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
     excel_bus_number_prefix: str = "10045010" # Префикс за номерата на бусове в Excel отчета.
     excel_bus_number_digits: int = 2 # Брой цифри след префикса: 01, 02, 03...
+    saturday_excel_bus_number_prefix: str = "100450121" # Префикс за бусове при HTTP /run_saturday.
+    saturday_excel_bus_number_digits: int = 1 # Брой цифри след съботния префикс.
     center_bus_numbering_enabled: bool = True # Ако е включено, CENTER_BUS започва от ID 1004501015 нагоре, а другите бусове си тръгват от 1004501001 нагоре.
     center_bus_numbering_start_id: str = "1004501015" # Първият ID за CENTER_BUS при специалното номериране.
     
     # CSV файл с маршрути
     enable_csv_output: bool = False # Дали да се генерира CSV файл с маршрутите.
-    csv_output_file: str = _abs_path("output/routes.csv") # Път и име на CSV файла с маршрутите.
+    csv_output_file: str = _abs_path("D:\\Iliyan\\bizant_source\\output/routes.csv") # Път и име на CSV файла с маршрутите.
     
     # Графики и анализи
     enable_charts: bool = False # Дали да се генерират PNG файлове с графики.
-    charts_output_dir: str = _abs_path("output/charts") # Директория за запис на графиките.
+    charts_output_dir: str = _abs_path("D:\\Iliyan\\bizant_source\\output/charts") # Директория за запис на графиките.
     efficiency_chart_file: str = "efficiency_analysis.png" # Графика с анализ на ефективността.
     route_comparison_file: str = "route_comparison.png" # Графика, сравняваща маршрутите.
     volume_distribution_file: str = "volume_distribution.png" # Графика с разпределението на обемите.
@@ -975,21 +1096,30 @@ class PerformanceConfig:
 class APIConfig:
     """Настройки за HTTP API сървъра, който приема POST заявки от други програми."""
     api_host: str = "0.0.0.0"  # 0.0.0.0 = приема заявки от други компютри в мрежата.
-    api_port: int = 8084
+    api_port: int = 8070
     api_public_url: str = ""  # URL за извикване от друга програма, напр. http://10.10.100.134:8088 или https://domain.com/cvrp
     api_key: str = ""  # Ако е попълнено, /run и /solve изискват X-CVRP-API-Key или Authorization: Bearer.
     api_endpoint: str = "/solve"
     trigger_endpoint: str = "/run"  # Стартира оптимизацията с текущата конфигурация, без POST payload с клиенти.
+    saturday_trigger_endpoint: str = "/run_saturday"  # Run за съботата от текущата седмица със съботния префикс за бусове.
     tsp_endpoint: str = "/tsp"  # Подрежда текущ TSP маршрут за един шофьор с текуща GPS позиция и optional крайна точка.
     tsp_report_endpoint: str = "/tsp-report"  # Генерира дневен Excel отчет за TSP маршрутите.
     shutdown_endpoint: str = "/shutdown"  # Спира API сървъра/програмата; ползвай с API key при отдалечен достъп.
     health_endpoint: str = "/health"
     web_gui_enabled: bool = True
     web_gui_endpoint: str = "/hell"
-    web_gui_title: str = "CVRP Optimizer"
-    web_gui_users: str = "iliyan:482253"
+    web_gui_title: str = "Bizant 2.0"
+    # Legacy bootstrap input, kept empty after migration. Web users are managed
+    # in data/web_gui_auth.json from the Desktop GUI; missing storage fails closed.
+    web_gui_users: str = ""
     web_gui_public_host: str = "bizant"
     web_gui_public_url: str = "http://bizant/hell"
+    # Forwarded/X-Forwarded-For is trusted only when the direct peer matches
+    # one of these IPs/CIDRs (normally a reverse proxy on the same machine).
+    web_gui_trusted_proxy_ips: str = "127.0.0.1,::1"
+    # Canonical JSON preset used only by runs started from the Web GUI.
+    # The public /run API deliberately ignores this field.
+    web_gui_run_defaults_json: str = "{\"output\":{\"charts_output_dir\":\"D:\\\\Iliyan\\\\bizant_source\\\\output/charts\",\"csv_output_file\":\"D:\\\\Iliyan\\\\bizant_source\\\\output/routes.csv\",\"efficiency_excel_file\":\"efficiency_report.xlsx\",\"enable_charts\":false,\"enable_csv_output\":false,\"enable_excel_output\":true,\"enable_interactive_map\":true,\"excel_output_dir\":\"G:\\\\Hell\\\\Bizant_2.0\\\\output\",\"folium_tiles\":\"Esri.WorldStreetMap\",\"map_output_file\":\"G:\\\\Hell\\\\Bizant_2.0\\\\output/interactive_map.html\",\"map_provider\":\"osm\",\"route_maps_upload_bus_id_field\":\"pData2[]\",\"route_maps_upload_file_field\":\"files[]\",\"route_maps_upload_mode\":\"disabled\",\"route_maps_upload_timeout_seconds\":60,\"route_maps_upload_token_field\":\"pData\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizant/upload-files.php\",\"routes_excel_file\":\"vehicle_routes.xlsx\",\"routes_output_dir\":\"G:\\\\Hell\\\\Bizant_2.0\\\\output/routes\",\"warehouse_excel_file\":\"warehouse_orders.xlsx\"},\"set_data\":{\"enable_make_group\":false,\"enable_set_data_upload\":false,\"enable_unserved_set_data_upload\":false,\"set_data_bukva_template\":\"БХ{route_number}-{stop_number}\",\"set_data_command\":\"setData\",\"set_data_depot_id_skld_map\":\"\",\"set_data_done_flag\":\"1973\",\"set_data_http_method\":\"GET\",\"set_data_id_grafik\":\"\",\"set_data_id_grafik_template\":\"{bus_number}\",\"set_data_id_skld\":\"106\",\"set_data_make_group_command\":\"makeGroup\",\"set_data_timeout_seconds\":30,\"set_data_unserved_bukva_template\":\"HOF1-{stop_number}\",\"set_data_unserved_done_flag\":\"0\",\"set_data_unserved_id_grafik\":\"1004501000\",\"set_data_unserved_id_grafik_template\":\"{id_grafik}\",\"set_data_url\":\"http://sio.effect.bg:7080/lubiv_Bizant\",\"set_data_vratza_id_skld\":\"128\"}}"
     tsp_default_service_time_minutes: int = 8  # TSP service time по подразбиране, ако POST не подаде service_time_minutes.
     tsp_objective_metric: str = "time"  # TSP цел по подразбиране: time или distance.
     tsp_use_time_windows: bool = True  # Дали TSP подреждането да отчита работното време на клиентите.
@@ -1094,35 +1224,83 @@ class MainConfig:
         return [
             VehicleConfig(
                 vehicle_type=VehicleType.INTERNAL_BUS,
-                capacity=4200,
-                count=5,
-                name="Благоевград общо",
+                capacity=385,
+                count=7,
+                name="Маршрут",
+                config_id="Маршрут",
                 fixed_cost=0,
                 max_distance_km=None,
                 max_time_hours=8,
                 service_time_minutes=8,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.006031278165295, 23.085359288631953),
+                max_customers_per_day=None,
+                start_location=(42.695785029219415, 23.23165887245312),
                 end_location=None,
+                reload_location=(42.695785029219415, 23.23165887245312),
+                reload_time_minutes=30,
                 start_time_minutes=480,
                 tsp_depot_location=(42.695785029219415, 23.23165887245312)
             ),
             VehicleConfig(
-                vehicle_type=VehicleType.INTERNAL_BUS,
-                capacity=5000,
+                vehicle_type=VehicleType.CENTER_BUS,
+                capacity=320,
                 count=1,
-                name="БЛ Камион",
+                name="Център",
+                config_id="Център",
                 fixed_cost=0,
                 max_distance_km=None,
                 max_time_hours=8,
-                service_time_minutes=10,
+                service_time_minutes=8,
                 enabled=True,
                 max_customers_per_route=None,
-                start_location=(42.006031278165295, 23.085359288631953),
+                max_customers_per_day=None,
+                start_location=(42.695785029219415, 23.23165887245312),
                 end_location=None,
+                reload_location=(42.695785029219415, 23.23165887245312),
+                reload_time_minutes=30,
                 start_time_minutes=480,
                 tsp_depot_location=(42.695785029219415, 23.23165887245312)
+            ),
+            VehicleConfig(
+                vehicle_type=VehicleType.VRATZA_BUS,
+                capacity=385,
+                count=2,
+                name="Враца",
+                config_id="Враца",
+                fixed_cost=0,
+                max_distance_km=None,
+                max_time_hours=8,
+                service_time_minutes=7,
+                enabled=True,
+                max_customers_per_route=None,
+                max_customers_per_day=None,
+                start_location=(43.221042895146915, 23.5344026186417),
+                end_location=None,
+                reload_location=(43.221042895146915, 23.5344026186417),
+                reload_time_minutes=30,
+                start_time_minutes=480,
+                tsp_depot_location=(43.221042895146915, 23.5344026186417)
+            ),
+            VehicleConfig(
+                vehicle_type=VehicleType.VRATZA_BUS,
+                capacity=320,
+                count=1,
+                name="Враца*",
+                config_id="Враца1",
+                fixed_cost=0,
+                max_distance_km=None,
+                max_time_hours=8,
+                service_time_minutes=7,
+                enabled=True,
+                max_customers_per_route=None,
+                max_customers_per_day=None,
+                start_location=(43.221042895146915, 23.5344026186417),
+                end_location=None,
+                reload_location=(43.221042895146915, 23.5344026186417),
+                reload_time_minutes=30,
+                start_time_minutes=480,
+                tsp_depot_location=(43.221042895146915, 23.5344026186417)
             ),
         ]
 

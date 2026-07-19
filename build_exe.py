@@ -1,5 +1,5 @@
 """
-Build script for CVRP_Optimizer.exe.
+Build script for Bizant.exe.
 
 The important part is the generated PyInstaller spec. OR-Tools ships Python
 modules, protobuf modules and native binaries. A hand-written list of DLL names
@@ -10,6 +10,7 @@ helpers such as collect_all(), collect_submodules() and collect_dynamic_libs().
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import shutil
 import subprocess
@@ -18,10 +19,44 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DIST_DIR = PROJECT_DIR.parent / "dist"
-BUILD_DIR = PROJECT_DIR.parent / "build"
+DIST_DIR = Path(
+    os.environ.get("CVRP_DIST_DIR") or PROJECT_DIR.parent / "dist"
+).resolve()
+BUILD_DIR = Path(
+    os.environ.get("CVRP_BUILD_DIR") or PROJECT_DIR.parent / "build"
+).resolve()
 SPEC_FILE = PROJECT_DIR / "CVRP_Optimizer.spec"
 VERSION_FILE = PROJECT_DIR / "file_version_info.txt"
+MAIN_EXE_NAME = "Bizant"
+MAIN_EXE_FILENAME = f"{MAIN_EXE_NAME}.exe"
+LEGACY_MAIN_EXE_FILENAMES = ("CVRP_Optimizer.exe",)
+PYVRP_NEXT_PYTHON = PROJECT_DIR / ".venv-pyvrp-next" / "Scripts" / "python.exe"
+PYVRP_NEXT_BUILD_SCRIPT = PROJECT_DIR / "build_pyvrp_next_worker.py"
+PYVRP_NEXT_WORKER = (
+    DIST_DIR
+    / "pyvrp-next"
+    / "CVRP_PyVRP_Next_Worker"
+    / "CVRP_PyVRP_Next_Worker.exe"
+)
+PYVRP_NEXT_VERSION_PREFIX = "0.14"
+VROOM_PYTHON = PROJECT_DIR / ".venv-vroom" / "Scripts" / "python.exe"
+VROOM_BUILD_SCRIPT = PROJECT_DIR / "build_vroom_worker.py"
+VROOM_WORKER = (
+    DIST_DIR
+    / "vroom"
+    / "CVRP_VROOM_Worker"
+    / "CVRP_VROOM_Worker.exe"
+)
+VROOM_VERSION_PREFIX = "1.15"
+VRP_RUST_PYTHON = PROJECT_DIR / ".venv-vrp-rust" / "Scripts" / "python.exe"
+VRP_RUST_BUILD_SCRIPT = PROJECT_DIR / "build_vrp_rust_worker.py"
+VRP_RUST_WORKER = (
+    DIST_DIR
+    / "vrp-rust"
+    / "CVRP_VRP_Rust_Worker"
+    / "CVRP_VRP_Rust_Worker.exe"
+)
+VRP_RUST_VERSION_PREFIX = "1.24"
 
 
 IMPORT_CHECKS = {
@@ -197,6 +232,7 @@ explicit_hiddenimports = [
     "cvrp_api_server",
     "current_tsp",
     "tsp_worker",
+    "cvrp_run_worker",
     "tsp_daily_report",
     "input_handler",
     "warehouse_manager",
@@ -206,6 +242,13 @@ explicit_hiddenimports = [
     "osrm_client",
     "valhalla_client",
     "run_main",
+    "pyvrp_next_runtime",
+    "vroom_solver",
+    "vroom_runtime",
+    "vrp_solver",
+    "vrp_runtime",
+    "vrp_rust_prototype",
+    "web_gui_auth",
 
     # OR-Tools modules used by the solver.
     "ortools",
@@ -279,7 +322,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="CVRP_Optimizer",
+    name="{MAIN_EXE_NAME}",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -324,12 +367,12 @@ VSVersionInfo(
         u'040904B0',
         [
           StringStruct(u'CompanyName', u'OptioRoute'),
-          StringStruct(u'FileDescription', u'CVRP Optimizer'),
+          StringStruct(u'FileDescription', u'Bizant'),
           StringStruct(u'FileVersion', u'1.2.0'),
-          StringStruct(u'InternalName', u'CVRP_Optimizer'),
+          StringStruct(u'InternalName', u'Bizant'),
           StringStruct(u'LegalCopyright', u'(c) {current_year} OptioRoute'),
-          StringStruct(u'OriginalFilename', u'CVRP_Optimizer.exe'),
-          StringStruct(u'ProductName', u'CVRP Optimizer'),
+          StringStruct(u'OriginalFilename', u'Bizant.exe'),
+          StringStruct(u'ProductName', u'Bizant'),
           StringStruct(u'ProductVersion', u'1.2.0')
         ]
       )
@@ -346,6 +389,23 @@ def build_exe() -> bool:
     """Run PyInstaller using the generated spec file."""
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # PyInstaller --clean clears its work cache, but not obsolete executables
+    # already present in dist. Remove the previous product name so a successful
+    # build exposes one unambiguous main executable.
+    for legacy_filename in LEGACY_MAIN_EXE_FILENAMES:
+        legacy_path = DIST_DIR / legacy_filename
+        if not legacy_path.is_file():
+            continue
+        try:
+            legacy_path.unlink()
+        except OSError as exc:
+            print(
+                f"Cannot remove the old executable {legacy_path}: {exc}. "
+                "Stop the running application and build again."
+            )
+            return False
+        print(f"Removed old executable: {legacy_path}")
 
     os.environ.setdefault("SOURCE_DATE_EPOCH", "1700000000")
 
@@ -366,12 +426,176 @@ def build_exe() -> bool:
         print(f"Build failed: {exc}")
         return False
 
-    exe_path = DIST_DIR / "CVRP_Optimizer.exe"
+    exe_path = DIST_DIR / MAIN_EXE_FILENAME
     if not exe_path.exists():
         print(f"Build finished, but EXE was not created: {exe_path}")
         return False
 
     print(f"EXE created: {exe_path}")
+    return True
+
+
+def _parse_last_json_line(output: str) -> dict:
+    for raw_line in reversed((output or "").splitlines()):
+        try:
+            value = json.loads(raw_line.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("no JSON object was returned")
+
+
+def verify_pyvrp_next_worker() -> str:
+    """Run the frozen sidecar self-check and return its PyVRP version."""
+    if not PYVRP_NEXT_WORKER.is_file():
+        raise RuntimeError(f"Experimental worker was not created: {PYVRP_NEXT_WORKER}")
+
+    completed = subprocess.run(
+        [str(PYVRP_NEXT_WORKER), "--self-check"],
+        cwd=str(PROJECT_DIR),
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    metadata = _parse_last_json_line(completed.stdout)
+    version = str(metadata.get("solver_version") or "").strip()
+    if (
+        metadata.get("ok") is not True
+        or metadata.get("kind") != "self_check"
+        or metadata.get("protocol_version") != 1
+        or metadata.get("solver_backend") != "pyvrp_next"
+        or not version.startswith(PYVRP_NEXT_VERSION_PREFIX)
+    ):
+        raise RuntimeError(f"Invalid experimental worker self-check: {metadata!r}")
+    return version
+
+
+def build_pyvrp_next_worker() -> bool:
+    """Build and verify the required PyVRP 0.14 companion executable."""
+    if not PYVRP_NEXT_PYTHON.is_file():
+        print(
+            "PyVRP 0.14 build environment is missing: "
+            f"{PYVRP_NEXT_PYTHON}\nRun setup_pyvrp_next.py first."
+        )
+        return False
+    if not PYVRP_NEXT_BUILD_SCRIPT.is_file():
+        print(f"PyVRP 0.14 worker build script is missing: {PYVRP_NEXT_BUILD_SCRIPT}")
+        return False
+
+    try:
+        _run([str(PYVRP_NEXT_PYTHON), str(PYVRP_NEXT_BUILD_SCRIPT)])
+        version = verify_pyvrp_next_worker()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+        print(f"PyVRP 0.14 worker build/verification failed: {exc}")
+        return False
+
+    print(f"Experimental worker verified: {PYVRP_NEXT_WORKER} (PyVRP {version})")
+    return True
+
+
+def verify_vroom_worker() -> str:
+    """Run the frozen VROOM sidecar self-check and return its pyvroom version."""
+    if not VROOM_WORKER.is_file():
+        raise RuntimeError(f"VROOM worker was not created: {VROOM_WORKER}")
+
+    completed = subprocess.run(
+        [str(VROOM_WORKER), "--self-check"],
+        cwd=str(PROJECT_DIR),
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    metadata = _parse_last_json_line(completed.stdout)
+    version = str(metadata.get("solver_version") or "").strip()
+    if (
+        metadata.get("ok") is not True
+        or metadata.get("kind") != "self_check"
+        or metadata.get("protocol_version") != 1
+        or metadata.get("solver_backend") != "vroom"
+        or not version.startswith(VROOM_VERSION_PREFIX)
+    ):
+        raise RuntimeError(f"Invalid VROOM worker self-check: {metadata!r}")
+    return version
+
+
+def build_vroom_worker() -> bool:
+    """Build and verify the required official VROOM companion executable."""
+    if not VROOM_PYTHON.is_file():
+        print(
+            "VROOM build environment is missing: "
+            f"{VROOM_PYTHON}\nRun setup_vroom.py first."
+        )
+        return False
+    if not VROOM_BUILD_SCRIPT.is_file():
+        print(f"VROOM worker build script is missing: {VROOM_BUILD_SCRIPT}")
+        return False
+
+    try:
+        _run([str(VROOM_PYTHON), str(VROOM_BUILD_SCRIPT)])
+        version = verify_vroom_worker()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+        print(f"VROOM worker build/verification failed: {exc}")
+        return False
+
+    print(f"VROOM worker verified: {VROOM_WORKER} (pyvroom {version})")
+    return True
+
+
+def verify_vrp_rust_worker() -> str:
+    """Run the frozen VRP-Rust sidecar self-check and return its version."""
+    if not VRP_RUST_WORKER.is_file():
+        raise RuntimeError(f"VRP-Rust worker was not created: {VRP_RUST_WORKER}")
+
+    completed = subprocess.run(
+        [str(VRP_RUST_WORKER), "--self-check"],
+        cwd=str(PROJECT_DIR),
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    metadata = _parse_last_json_line(completed.stdout)
+    version = str(metadata.get("solver_version") or "").strip()
+    if (
+        metadata.get("ok") is not True
+        or metadata.get("kind") != "self_check"
+        or metadata.get("protocol_version") != 1
+        or metadata.get("solver_backend") != "vrp"
+        or not version.startswith(VRP_RUST_VERSION_PREFIX)
+    ):
+        raise RuntimeError(f"Invalid VRP-Rust worker self-check: {metadata!r}")
+    return version
+
+
+def build_vrp_rust_worker() -> bool:
+    """Build and verify the required VRP-Rust companion executable."""
+    if not VRP_RUST_PYTHON.is_file():
+        print(
+            "VRP-Rust build environment is missing: "
+            f"{VRP_RUST_PYTHON}\nCreate .venv-vrp-rust and install vrp-cli 1.24 plus PyInstaller."
+        )
+        return False
+    if not VRP_RUST_BUILD_SCRIPT.is_file():
+        print(f"VRP-Rust worker build script is missing: {VRP_RUST_BUILD_SCRIPT}")
+        return False
+
+    try:
+        _run([str(VRP_RUST_PYTHON), str(VRP_RUST_BUILD_SCRIPT)])
+        version = verify_vrp_rust_worker()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+        print(f"VRP-Rust worker build/verification failed: {exc}")
+        return False
+
+    print(f"VRP-Rust worker verified: {VRP_RUST_WORKER} (vrp-cli {version})")
     return True
 
 
@@ -382,12 +606,12 @@ set "APP_DIR=%~dp0"
 cd /d "%APP_DIR%"
 set "PYINSTALLER_RESET_ENVIRONMENT=1"
 set "_MEIPASS2="
-echo CVRP Optimizer - Starting...
+echo Bizant - Starting...
 echo.
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
+if exist "%APP_DIR%Bizant.exe" (
     set "APP_MODE=exe"
-    set "APP_CMD=%APP_DIR%CVRP_Optimizer.exe"
+    set "APP_CMD=%APP_DIR%Bizant.exe"
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     set "APP_MODE=python"
     set "APP_CMD=%APP_DIR%.venv\Scripts\python.exe"
@@ -426,8 +650,8 @@ cd /d "%APP_DIR%"
 set "PYINSTALLER_RESET_ENVIRONMENT=1"
 set "_MEIPASS2="
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
-    "%APP_DIR%CVRP_Optimizer.exe" --settings
+if exist "%APP_DIR%Bizant.exe" (
+    "%APP_DIR%Bizant.exe" --settings
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     "%APP_DIR%.venv\Scripts\python.exe" "%APP_DIR%config_gui.py"
 ) else (
@@ -447,14 +671,14 @@ set "_MEIPASS2="
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
-echo CVRP Optimizer - API Server
+echo Bizant - API Server
 echo.
 echo Default listen address is configured in config.py / Settings.
 echo Use 0.0.0.0 to accept requests from other computers.
 echo.
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
-    "%APP_DIR%CVRP_Optimizer.exe" --server
+if exist "%APP_DIR%Bizant.exe" (
+    "%APP_DIR%Bizant.exe" --server
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     "%APP_DIR%.venv\Scripts\python.exe" "%APP_DIR%cvrp_api_server.py"
 ) else (
@@ -471,7 +695,7 @@ if exist "%APP_DIR%CVRP_Optimizer.exe" (
     )
 
     echo Python not found.
-    echo Install Python or build/copy CVRP_Optimizer.exe first.
+    echo Install Python or build/copy Bizant.exe first.
     pause
     exit /b 1
 )
@@ -485,8 +709,8 @@ set "_MEIPASS2="
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%CVRP_Optimizer.exe' -ArgumentList '--server' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%APP_DIR%logs\api_server_stdout.log' -RedirectStandardError '%APP_DIR%logs\api_server_stderr.log'"
+if exist "%APP_DIR%Bizant.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%Bizant.exe' -ArgumentList '--server' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%APP_DIR%logs\api_server_stdout.log' -RedirectStandardError '%APP_DIR%logs\api_server_stderr.log'"
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '%APP_DIR%logs' | Out-Null; Start-Process -FilePath '%APP_DIR%.venv\Scripts\python.exe' -ArgumentList '\"%APP_DIR%cvrp_api_server.py\"' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%APP_DIR%logs\api_server_stdout.log' -RedirectStandardError '%APP_DIR%logs\api_server_stderr.log'"
 ) else if exist "%APP_DIR%.venv\Scripts\pythonw.exe" (
@@ -505,7 +729,7 @@ if exist "%APP_DIR%CVRP_Optimizer.exe" (
     )
 
     echo Python not found.
-    echo Install Python or build CVRP_Optimizer.exe first.
+    echo Install Python or build Bizant.exe first.
     pause
     exit /b 1
 )
@@ -526,15 +750,21 @@ def copy_runtime_files() -> None:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
 
     config_src = PROJECT_DIR / "config.py"
-    if config_src.exists():
-        shutil.copy2(config_src, DIST_DIR / "config.py")
+    config_dst = DIST_DIR / "config.py"
+    preserve_existing_config = os.environ.get(
+        "CVRP_PRESERVE_DIST_CONFIG", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if preserve_existing_config and config_dst.exists():
+        print(f"Preserved existing runtime config without changes: {config_dst}")
+    elif config_src.exists():
+        shutil.copy2(config_src, config_dst)
         print(f"Copied config.py to {DIST_DIR}")
 
     (DIST_DIR / "data").mkdir(exist_ok=True)
 
 
 def main() -> None:
-    print("CVRP Optimizer - EXE Builder")
+    print("Bizant - EXE Builder")
     print("=" * 40)
     print(f"Python: {sys.executable}")
 
@@ -554,11 +784,35 @@ def main() -> None:
         print("EXE build failed. No fallback EXE was created.")
         return
 
+    if not build_pyvrp_next_worker():
+        print(
+            f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
+            "PyVRP 0.14 companion worker was not built successfully."
+        )
+        return
+
+    if not build_vroom_worker():
+        print(
+            f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
+            "VROOM companion worker was not built successfully."
+        )
+        return
+
+    if not build_vrp_rust_worker():
+        print(
+            f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
+            "VRP-Rust companion worker was not built successfully."
+        )
+        return
+
     create_batch_files()
     copy_runtime_files()
 
     print("\nBuild completed successfully.")
-    print(f"EXE: {DIST_DIR / 'CVRP_Optimizer.exe'}")
+    print(f"EXE: {DIST_DIR / MAIN_EXE_FILENAME}")
+    print(f"PyVRP 0.14 worker: {PYVRP_NEXT_WORKER}")
+    print(f"VROOM worker: {VROOM_WORKER}")
+    print(f"VRP-Rust worker: {VRP_RUST_WORKER}")
     print("Place input data in dist\\data\\input.xlsx or edit dist\\config.py.")
 
 

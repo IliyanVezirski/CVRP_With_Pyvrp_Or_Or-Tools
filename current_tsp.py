@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import html
+from itertools import permutations
 import logging
 import math
 import os
@@ -977,38 +978,54 @@ def _solve_open_tsp_order(
     if not customers:
         return [], []
 
-    unvisited = set(range(1, len(customers) + 1))
-    current = 0
-    current_clock_seconds = start_time_minutes * 60
-    order: List[int] = []
-
-    while unvisited:
-        best_node = min(
-            unvisited,
-            key=lambda node: _greedy_step_score(
-                current,
-                node,
-                customers[node - 1],
-                matrix,
-                metric,
-                current_clock_seconds,
-                use_time_windows,
-                wait_weight,
-                late_weight,
-            ),
-        )
-        order.append(best_node)
-        current_clock_seconds = _arrival_after_service_seconds(
-            current,
-            best_node,
-            customers[best_node - 1],
+    if end_node is not None:
+        order = _fixed_end_insertion_order(
+            customers,
             matrix,
-            current_clock_seconds,
-            service_time_minutes,
-            use_time_windows,
+            metric,
+            end_node=end_node,
+            start_time_minutes=start_time_minutes,
+            service_time_minutes=service_time_minutes,
+            use_time_windows=use_time_windows,
+            wait_weight=wait_weight,
+            late_weight=late_weight,
         )
-        unvisited.remove(best_node)
-        current = best_node
+    else:
+        # Keep the historical nearest-neighbour behaviour for a genuinely open
+        # route.  A fixed destination uses a different construction heuristic
+        # below because the final leg is part of that route's objective.
+        unvisited = set(range(1, len(customers) + 1))
+        current = 0
+        current_clock_seconds = start_time_minutes * 60
+        order = []
+
+        while unvisited:
+            best_node = min(
+                unvisited,
+                key=lambda node: _greedy_step_score(
+                    current,
+                    node,
+                    customers[node - 1],
+                    matrix,
+                    metric,
+                    current_clock_seconds,
+                    use_time_windows,
+                    wait_weight,
+                    late_weight,
+                ),
+            )
+            order.append(best_node)
+            current_clock_seconds = _arrival_after_service_seconds(
+                current,
+                best_node,
+                customers[best_node - 1],
+                matrix,
+                current_clock_seconds,
+                service_time_minutes,
+                use_time_windows,
+            )
+            unvisited.remove(best_node)
+            current = best_node
 
     if two_opt_enabled:
         order = _two_opt_open_route(
@@ -1025,6 +1042,65 @@ def _solve_open_tsp_order(
             max_passes=two_opt_max_passes,
         )
     return [customers[node - 1] for node in order], order
+
+
+def _fixed_end_insertion_order(
+    customers: List[Customer],
+    matrix: DistanceMatrix,
+    metric: str,
+    end_node: int,
+    start_time_minutes: int,
+    service_time_minutes: float,
+    use_time_windows: bool,
+    wait_weight: float,
+    late_weight: float,
+) -> List[int]:
+    """Build a start-to-end route with deterministic cheapest insertion.
+
+    Unlike forward nearest-neighbour, every insertion is evaluated between the
+    fixed start and fixed end.  When time windows are enabled the complete
+    partial schedule is scored so waiting and lateness remain part of the same
+    objective used by local improvement.
+    """
+    order: List[int] = []
+    unvisited = set(range(1, len(customers) + 1))
+
+    while unvisited:
+        best_order: Optional[List[int]] = None
+        best_cost = math.inf
+
+        for node in sorted(unvisited):
+            for position in range(len(order) + 1):
+                candidate = order[:position] + [node] + order[position:]
+                candidate_cost = _open_route_cost(
+                    candidate,
+                    matrix,
+                    metric,
+                    end_node=end_node,
+                    customers=customers,
+                    start_time_minutes=start_time_minutes,
+                    service_time_minutes=service_time_minutes,
+                    use_time_windows=use_time_windows,
+                    wait_weight=wait_weight,
+                    late_weight=late_weight,
+                )
+                if (
+                    candidate_cost + 0.001 < best_cost
+                    or (
+                        abs(candidate_cost - best_cost) <= 0.001
+                        and (best_order is None or tuple(candidate) < tuple(best_order))
+                    )
+                ):
+                    best_order = candidate
+                    best_cost = candidate_cost
+
+        if best_order is None:
+            # Defensive only: ``unvisited`` guarantees at least one candidate.
+            break
+        order = best_order
+        unvisited.difference_update(order)
+
+    return order
 
 
 def _greedy_step_score(
@@ -1081,7 +1157,30 @@ def _two_opt_open_route(
     end_node: Optional[int] = None,
     max_passes: int = 30,
 ) -> List[int]:
-    if len(order) < 4 or max_passes <= 0:
+    if max_passes <= 0:
+        return order
+
+    # Preserve the previous local-search behaviour for routes that have no
+    # destination.  The fixed-end bug affected short routes because the old
+    # implementation returned before it ever evaluated the final leg.
+    if end_node is None and len(order) < 4:
+        return order
+
+    if end_node is not None and len(order) <= 8:
+        return _exact_fixed_end_order(
+            order,
+            customers,
+            matrix,
+            metric,
+            end_node=end_node,
+            start_time_minutes=start_time_minutes,
+            service_time_minutes=service_time_minutes,
+            use_time_windows=use_time_windows,
+            wait_weight=wait_weight,
+            late_weight=late_weight,
+        )
+
+    if len(order) < 2:
         return order
 
     best = list(order)
@@ -1102,28 +1201,95 @@ def _two_opt_open_route(
     while improved and passes < max_passes:
         improved = False
         passes += 1
-        for i in range(len(best) - 2):
-            for j in range(i + 2, len(best)):
-                candidate = best[:i] + list(reversed(best[i : j + 1])) + best[j + 1 :]
-                candidate_cost = _open_route_cost(
-                    candidate,
-                    matrix,
-                    metric,
-                    end_node=end_node,
-                    customers=customers,
-                    start_time_minutes=start_time_minutes,
-                    service_time_minutes=service_time_minutes,
-                    use_time_windows=use_time_windows,
-                    wait_weight=wait_weight,
-                    late_weight=late_weight,
-                )
-                if candidate_cost + 0.001 < best_cost:
-                    best = candidate
-                    best_cost = candidate_cost
-                    improved = True
-                    break
-            if improved:
+        if end_node is None:
+            reversal_ranges = (
+                (i, j)
+                for i in range(len(best) - 2)
+                for j in range(i + 2, len(best))
+            )
+        else:
+            # Adjacent reversals are required to improve the node immediately
+            # before a fixed end.  They also make the search useful for routes
+            # just above the exact-search threshold.
+            reversal_ranges = (
+                (i, j)
+                for i in range(len(best) - 1)
+                for j in range(i + 1, len(best))
+            )
+
+        for i, j in reversal_ranges:
+            candidate = best[:i] + list(reversed(best[i : j + 1])) + best[j + 1 :]
+            candidate_cost = _open_route_cost(
+                candidate,
+                matrix,
+                metric,
+                end_node=end_node,
+                customers=customers,
+                start_time_minutes=start_time_minutes,
+                service_time_minutes=service_time_minutes,
+                use_time_windows=use_time_windows,
+                wait_weight=wait_weight,
+                late_weight=late_weight,
+            )
+            if candidate_cost + 0.001 < best_cost:
+                best = candidate
+                best_cost = candidate_cost
+                improved = True
                 break
+    return best
+
+
+def _exact_fixed_end_order(
+    order: List[int],
+    customers: List[Customer],
+    matrix: DistanceMatrix,
+    metric: str,
+    end_node: int,
+    start_time_minutes: int,
+    service_time_minutes: float,
+    use_time_windows: bool,
+    wait_weight: float,
+    late_weight: float,
+) -> List[int]:
+    """Return the best fixed-end order for a small route.
+
+    Exhaustive evaluation is inexpensive for at most eight stops and avoids
+    the old blind spot for one, two, or three customers.  ``permutations``
+    starts with the supplied order, so equal-cost alternatives keep the stable
+    order produced by the construction heuristic.
+    """
+    best = list(order)
+    best_cost = _open_route_cost(
+        best,
+        matrix,
+        metric,
+        end_node=end_node,
+        customers=customers,
+        start_time_minutes=start_time_minutes,
+        service_time_minutes=service_time_minutes,
+        use_time_windows=use_time_windows,
+        wait_weight=wait_weight,
+        late_weight=late_weight,
+    )
+
+    for candidate_tuple in permutations(order):
+        candidate = list(candidate_tuple)
+        candidate_cost = _open_route_cost(
+            candidate,
+            matrix,
+            metric,
+            end_node=end_node,
+            customers=customers,
+            start_time_minutes=start_time_minutes,
+            service_time_minutes=service_time_minutes,
+            use_time_windows=use_time_windows,
+            wait_weight=wait_weight,
+            late_weight=late_weight,
+        )
+        if candidate_cost + 0.001 < best_cost:
+            best = candidate
+            best_cost = candidate_cost
+
     return best
 
 

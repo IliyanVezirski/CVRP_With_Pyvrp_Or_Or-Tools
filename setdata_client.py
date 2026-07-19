@@ -9,7 +9,13 @@ import urllib.request
 from typing import Any, Dict, List
 
 from cvrp_solver import CVRPSolution
-from vehicle_numbering import format_route_bus_number, order_routes_for_output
+from vehicle_numbering import (
+    format_route_bus_number,
+    order_routes_for_output,
+    route_identifier,
+    route_trip_number,
+    route_vehicle_key,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,14 @@ def _format_bukva(template: str, context: Dict[str, Any]) -> str:
     except Exception as exc:
         logger.warning("Грешка при форматиране на Bukva шаблон '%s': %s", template, exc)
         return str(context.get("bus_number", "")) + str(context.get("route_number", "")) + str(context.get("stop_number", ""))
+
+
+def _route_planned_value(route: Any, name: str) -> Any:
+    """Read the Route contract field, retaining the early alias for compatibility."""
+    value = getattr(route, f"{name}_minutes", None)
+    if value in (None, ""):
+        value = getattr(route, name, "")
+    return value
 
 
 def _resolve_unserved_done_flag(set_data: Any) -> str:
@@ -122,6 +136,11 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
     for route_index, route in enumerate(routes):
         route_number = route_index + 1
         bus_number = _format_bus_number(output, route_index, route, routes)
+        trip_number = route_trip_number(route)
+        route_id = route_identifier(route, route_number)
+        vehicle_key = route_vehicle_key(route, route_index)
+        planned_start = _route_planned_value(route, "planned_start")
+        planned_end = _route_planned_value(route, "planned_end")
         vehicle_type = getattr(route.vehicle_type, "value", str(route.vehicle_type))
         vehicle_name = str(getattr(route, "vehicle_name", "") or "").strip()
         id_skld = resolve_route_id_skld(route, config)
@@ -134,6 +153,11 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
                 context = {
                     "bus_number": bus_number,
                     "route_number": route_number,
+                    "trip_number": trip_number,
+                    "route_id": route_id,
+                    "vehicle_key": vehicle_key,
+                    "planned_start": "" if planned_start is None else str(planned_start),
+                    "planned_end": "" if planned_end is None else str(planned_end),
                     "stop_number": stop_number,
                     "vehicle_type": vehicle_type,
                     "vehicle_name": vehicle_name,
@@ -249,6 +273,11 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
             context = {
                 "bus_number": "",
                 "route_number": 0,
+                "trip_number": 0,
+                "route_id": "",
+                "vehicle_key": "",
+                "planned_start": "",
+                "planned_end": "",
                 "stop_number": stop_number,
                 "vehicle_type": "unserved",
                 "customer_id": getattr(customer, "id", ""),

@@ -11,8 +11,10 @@ import os
 import io
 import copy
 import re
+import math
 import threading
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Optional, List, Dict, Any, Tuple
 from multiprocessing import Pool, cpu_count, current_process
 from dataclasses import asdict
@@ -29,15 +31,57 @@ from config import (
     VehicleConfig,
     VehicleType,
     build_ordered_depots,
+    CVRP_SOLVER_TYPES,
+    PYVRP_SOLVER_TYPES,
 )
-from input_handler import InputHandler, InputData
+from input_handler import InputHandler, InputData, MandatoryCustomerError, is_mandatory_customer
 from warehouse_manager import WarehouseManager, WarehouseAllocation
 from cvrp_solver import CVRPSolver, CVRPSolution
 from pyvrp_solver import solve_cvrp_pyvrp
+from pyvrp_next_runtime import (
+    MandatoryVisitInvariantError,
+    solve_cvrp_pyvrp_next,
+    validate_mandatory_customer_solution,
+)
+from vroom_solver import solve_cvrp_vroom
+from vrp_solver import solve_cvrp_vrp
 from output_handler import OutputHandler
 from osrm_client import OSRMClient, DistanceMatrix, get_distance_matrix_from_central_cache
+from vehicle_numbering import format_route_bus_number, route_identifier
 
 _RUNTIME_CONFIG_LOCK = threading.RLock()
+
+
+def _is_usable_solution(solution: Optional[CVRPSolution]) -> bool:
+    """Only feasible, finite, non-empty solutions may reach output/export."""
+    if solution is None or not bool(getattr(solution, "is_feasible", False)):
+        return False
+    if not getattr(solution, "routes", None):
+        return False
+    try:
+        return math.isfinite(float(getattr(solution, "fitness_score", float("inf"))))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _assert_mandatory_customer_solution(
+    allocation: WarehouseAllocation,
+    solution: Optional[CVRPSolution],
+    *,
+    context: str,
+) -> None:
+    """Stop the run before an invalid mandatory visit can reach any output."""
+    try:
+        validate_mandatory_customer_solution(allocation, solution, context=context)
+    except MandatoryVisitInvariantError as exc:
+        logging.getLogger(__name__).critical(
+            "Отказвам решение, което нарушава задължителните клиентски посещения: %s",
+            exc,
+        )
+        raise MandatoryCustomerError(
+            "Решението е отхвърлено: задължителен клиент липсва, дублиран е, "
+            f"отбелязан е като пропуснат или е останал в склада. {exc}"
+        ) from exc
 
 
 @contextmanager
@@ -133,7 +177,7 @@ def vehicle_configs_from_worker_dicts(items: Optional[List[Dict[str, Any]]]) -> 
         if not isinstance(vehicle_type, VehicleType):
             data["vehicle_type"] = VehicleType(vehicle_type)
 
-        for key in ("start_location", "end_location", "tsp_depot_location"):
+        for key in ("start_location", "end_location", "reload_location", "tsp_depot_location"):
             if isinstance(data.get(key), list):
                 data[key] = tuple(data[key])
 
@@ -186,7 +230,8 @@ def prepare_data(
     logger.info("СТЪПКА 1: ПОДГОТОВКА НА ДАННИ")
     logger.info("="*60)
     
-    warehouse_manager = WarehouseManager()
+    effective_config = config_override or get_config()
+    warehouse_manager = WarehouseManager(main_config=effective_config)
 
     try:
         if input_data_override is not None:
@@ -210,6 +255,9 @@ def prepare_data(
         logger.info(f"Използване на капацитета: {warehouse_allocation.capacity_utilization*100:.1f}%")
 
         return input_data, warehouse_allocation
+    except MandatoryCustomerError as e:
+        logger.error("Невалиден задължителен клиент: %s", e, exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Фатална грешка при подготовка на данните: {e}", exc_info=True)
         return None, None
@@ -225,6 +273,17 @@ def move_customers_without_coordinates_to_unserved(
 
     if not missing_coordinates:
         return allocation
+
+    mandatory_missing = [customer for customer in missing_coordinates if is_mandatory_customer(customer)]
+    if mandatory_missing:
+        preview = ", ".join(
+            str(getattr(customer, "id", "") or getattr(customer, "name", ""))
+            for customer in mandatory_missing[:10]
+        )
+        raise MandatoryCustomerError(
+            "Задължителни клиенти нямат валидни GPS координати и не могат да бъдат "
+            f"пропуснати: {preview}"
+        )
 
     valid_customers = [customer for customer in vehicle_customers if customer.coordinates]
     existing_warehouse_ids = {id(customer) for customer in allocation.warehouse_customers or []}
@@ -286,7 +345,11 @@ def get_distance_matrix(
         return None
         
     enabled_vehicles = vehicle_configs if vehicle_configs is not None else (config.vehicles or [])
-    sorted_depots = build_ordered_depots(location_config.depot_location, enabled_vehicles)
+    sorted_depots = build_ordered_depots(
+        location_config.depot_location,
+        enabled_vehicles,
+        include_reload_locations=bool(getattr(config.cvrp, "enable_multiple_trips", False)),
+    )
 
     all_locations = sorted_depots + [c.coordinates for c in customers]
     logger.info(f"Ред на депата в матрицата: {sorted_depots}")
@@ -348,6 +411,50 @@ def get_distance_matrix(
     return distance_matrix
 
 
+def _installed_package_version(distribution_name: str) -> str:
+    """Return a package version for solver metadata without making it fatal."""
+    try:
+        return package_version(distribution_name)
+    except (PackageNotFoundError, ValueError, TypeError):
+        return ""
+
+
+def _set_solver_metadata(
+    solution: Optional[CVRPSolution],
+    *,
+    requested: str,
+    default_used: str,
+    default_version: str,
+) -> None:
+    """Attach uniform backend metadata while preserving sidecar-provided data."""
+    if solution is None:
+        return
+
+    requested_value = str(getattr(solution, "solver_requested", "") or requested)
+    used_value = str(
+        getattr(solution, "solver_used", "")
+        or getattr(solution, "solver_backend", "")
+        or default_used
+    )
+    backend_value = str(getattr(solution, "solver_backend", "") or used_value)
+    existing_version = str(getattr(solution, "solver_version", "") or "")
+    version_value = existing_version or (default_version if used_value == default_used else "")
+    fallback_used = bool(getattr(solution, "solver_fallback_used", False))
+    fallback_reason = str(getattr(solution, "solver_fallback_reason", "") or "")
+
+    if used_value != requested_value and not fallback_used:
+        fallback_used = True
+        if not fallback_reason:
+            fallback_reason = f"Requested {requested_value}, solved with {used_value}."
+
+    solution.solver_requested = requested_value
+    solution.solver_used = used_value
+    solution.solver_backend = backend_value
+    solution.solver_version = version_value
+    solution.solver_fallback_used = fallback_used
+    solution.solver_fallback_reason = fallback_reason
+
+
 def generate_solver_configs(base_cvrp_config: CVRPConfig, num_workers: int) -> List[CVRPConfig]:
     """
     Генерира списък с различни конфигурации за паралелно тестване.
@@ -386,7 +493,7 @@ def generate_solver_configs(base_cvrp_config: CVRPConfig, num_workers: int) -> L
     logger.info(f"Създадени {len(configs)} конфигурации за тестване.")
     logger.info(f"Използвани стратегии: {[c.first_solution_strategy for c in configs]}")
     logger.info(f"Използвани метаевристики: {[c.local_search_metaheuristic for c in configs]}")
-    if base_cvrp_config.solver_type == "pyvrp":
+    if str(base_cvrp_config.solver_type or "").strip().lower() in PYVRP_SOLVER_TYPES:
         logger.info(f"Използвани PyVRP seed-ове: {[getattr(c, 'pyvrp_seed', None) for c in configs]}")
     
     return configs
@@ -404,7 +511,15 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
     cvrp_config = CVRPConfig(**cvrp_config_dict)
     location_config = LocationConfig(**location_config_dict)
     vehicle_configs = vehicle_configs_from_worker_dicts(vehicle_config_dicts)
-    if cvrp_config.solver_type == "pyvrp" and getattr(cvrp_config, "pyvrp_seed", None) is None:
+    solver_type = str(cvrp_config.solver_type or "").strip().lower()
+    if solver_type not in CVRP_SOLVER_TYPES:
+        raise ValueError(
+            f"Неподдържан solver_type={cvrp_config.solver_type!r}. "
+            f"Разрешени стойности: {', '.join(CVRP_SOLVER_TYPES)}"
+        )
+    cvrp_config.solver_type = solver_type
+
+    if solver_type in PYVRP_SOLVER_TYPES and getattr(cvrp_config, "pyvrp_seed", None) is None:
         cvrp_config.pyvrp_seed = int(getattr(cvrp_config, "pyvrp_seed_base", 42) or 42)
 
     # Добавяме лог за дебъгване
@@ -413,14 +528,14 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
         f"objective_metric = {getattr(cvrp_config, 'objective_metric', 'distance')}, "
         f"use_simple_solver = {cvrp_config.use_simple_solver}"
     )
-    if cvrp_config.solver_type == "pyvrp":
+    if solver_type in PYVRP_SOLVER_TYPES:
         logger.info(f"[Работник {worker_id}]: PyVRP seed = {cvrp_config.pyvrp_seed}")
 
     logger.info(f"[Работник {worker_id}]: СТАРТ. Стратегия: {cvrp_config.first_solution_strategy}, "
                 f"Метаевристика: {cvrp_config.local_search_metaheuristic}")
 
     # Избираме подходящия солвър
-    if cvrp_config.solver_type == "pyvrp":
+    if solver_type == "pyvrp":
         solution = solve_cvrp_pyvrp(
             allocation=warehouse_allocation,
             depot_location=location_config.depot_location,
@@ -429,18 +544,92 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
             location_config=location_config,
             vehicle_configs=vehicle_configs,
         )
-    else:  # or_tools
+        _set_solver_metadata(
+            solution,
+            requested=solver_type,
+            default_used="pyvrp",
+            default_version=_installed_package_version("pyvrp"),
+        )
+    elif solver_type == "pyvrp_experimental":
+        solution = solve_cvrp_pyvrp_next(
+            allocation=warehouse_allocation,
+            depot_location=location_config.depot_location,
+            distance_matrix=distance_matrix,
+            config=cvrp_config,
+            location_config=location_config,
+            vehicle_configs=vehicle_configs,
+        )
+        _set_solver_metadata(
+            solution,
+            requested=solver_type,
+            default_used="pyvrp_experimental",
+            default_version="",
+        )
+    elif solver_type == "or_tools":
         solver = CVRPSolver(cvrp_config, location_config, vehicle_configs)
         solution = solver.solve(warehouse_allocation, location_config.depot_location, distance_matrix)
+        _set_solver_metadata(
+            solution,
+            requested=solver_type,
+            default_used="or_tools",
+            default_version=_installed_package_version("ortools"),
+        )
+    elif solver_type == "vroom":
+        solution = solve_cvrp_vroom(
+            allocation=warehouse_allocation,
+            depot_location=location_config.depot_location,
+            distance_matrix=distance_matrix,
+            config=cvrp_config,
+            location_config=location_config,
+            vehicle_configs=vehicle_configs,
+        )
+        _set_solver_metadata(
+            solution,
+            requested=solver_type,
+            default_used="vroom",
+            default_version=str(getattr(solution, "solver_version", "") or ""),
+        )
+    elif solver_type == "vrp":
+        solution = solve_cvrp_vrp(
+            allocation=warehouse_allocation,
+            depot_location=location_config.depot_location,
+            distance_matrix=distance_matrix,
+            config=cvrp_config,
+            location_config=location_config,
+            vehicle_configs=vehicle_configs,
+        )
+        _set_solver_metadata(
+            solution,
+            requested=solver_type,
+            default_used="vrp",
+            default_version=str(getattr(solution, "solver_version", "") or ""),
+        )
+    else:  # Defensive guard if the supported-values check above changes independently.
+        raise ValueError(f"Неподдържан solver_type={solver_type!r}")
 
-    if solution and solution.routes:
+    if _is_usable_solution(solution):
+        _assert_mandatory_customer_solution(
+            warehouse_allocation,
+            solution,
+            context=f"solver worker {worker_id} acceptance",
+        )
         # Изчисляваме общия обем за това решение
         total_volume = sum(r.total_volume for r in solution.routes)
         logger.info(f"[Работник {worker_id}]: ЗАВЪРШЕН. Обслужен обем: {total_volume:.2f}, "
                     f"Маршрути: {len(solution.routes)}, Пропуснати: {len(solution.dropped_customers)}")
         return solution
 
-    logger.info(f"[Работник {worker_id}]: ЗАВЪРШЕН. Не е намерено валидно решение.")
+    if solution is not None:
+        logger.error(
+            "[Работник %s]: ОТХВЪРЛЕНО невалидно решение "
+            "(feasible=%s, fitness=%s, routes=%s).",
+            worker_id,
+            bool(getattr(solution, "is_feasible", False)),
+            getattr(solution, "fitness_score", None),
+            len(getattr(solution, "routes", []) or []),
+        )
+    else:
+        logger.info(f"[Работник {worker_id}]: ЗАВЪРШЕН. Не е намерено валидно решение.")
     return None
 
 
@@ -454,6 +643,11 @@ def process_results(
     """
     Стъпка 3: Обработва финалното (най-доброто) решение.
     """
+    _assert_mandatory_customer_solution(
+        warehouse_allocation,
+        solution,
+        context="immediately before output generation",
+    )
     logger = logging.getLogger(__name__)
     logger.info("="*60)
     logger.info("СТЪПКА 3: ОБРАБОТКА НА РЕЗУЛТАТИТЕ")
@@ -540,6 +734,7 @@ def _solution_to_api_response(
             "index": entry.get("index"),
             "customer_id": getattr(customer, "id", entry.get("customer_id", "")),
             "customer_name": getattr(customer, "name", entry.get("customer_name", "")),
+            "mandatory": bool(getattr(customer, "mandatory", False)),
             "delivery_comment": getattr(customer, "delivery_comment", ""),
             "previous_stop_name": entry.get("previous_stop_name", ""),
             "distance_from_previous_km": round(float(entry.get("distance_from_previous", 0) or 0), 2),
@@ -557,12 +752,26 @@ def _solution_to_api_response(
 
     response = {
         "status": "ok",
+        "solver_requested": str(getattr(solution, "solver_requested", "") or ""),
+        "solver_used": str(getattr(solution, "solver_used", "") or getattr(solution, "solver_backend", "") or ""),
+        "solver_backend": str(getattr(solution, "solver_backend", "") or getattr(solution, "solver_used", "") or ""),
+        "solver_version": str(getattr(solution, "solver_version", "") or ""),
+        "solver_fallback_used": bool(getattr(solution, "solver_fallback_used", False)),
+        "solver_fallback_reason": str(getattr(solution, "solver_fallback_reason", "") or ""),
         "execution_time_seconds": round(execution_time, 2),
         "customers_total": len(input_data.customers),
+        "mandatory_customers_total": sum(
+            1 for customer in input_data.customers if bool(getattr(customer, "mandatory", False))
+        ),
         "customers_for_routes": len(warehouse_allocation.vehicle_customers),
         "customers_for_warehouse": len(warehouse_allocation.warehouse_customers),
         "routes_count": len(solution.routes),
+        "total_trips": int(getattr(solution, "total_trips", 0) or len(solution.routes)),
+        "second_trips_count": int(getattr(solution, "second_trips_count", 0) or 0),
         "dropped_customers_count": len(solution.dropped_customers),
+        "mandatory_dropped_customers_count": sum(
+            1 for customer in solution.dropped_customers if bool(getattr(customer, "mandatory", False))
+        ),
         "total_vehicles_used": solution.total_vehicles_used,
         "total_distance_km": round(solution.total_distance_km, 2),
         "total_time_minutes": round(solution.total_time_minutes, 1),
@@ -570,8 +779,23 @@ def _solution_to_api_response(
         "output_files": output_files,
         "routes": [
             {
+                "bus_number": format_route_bus_number(
+                    get_config().output,
+                    route_index,
+                    route=route,
+                    routes=solution.routes,
+                ),
                 "vehicle_type": route.vehicle_type.value,
+                "vehicle_id": getattr(route, "vehicle_id", None),
+                "vehicle_key": str(getattr(route, "vehicle_key", "") or ""),
                 "vehicle_name": str(getattr(route, "vehicle_name", "") or "").strip(),
+                "trip_number": int(getattr(route, "trip_number", 1) or 1),
+                "trip_count": int(getattr(route, "trip_count", 1) or 1),
+                "route_id": route_identifier(route, route_index + 1),
+                "planned_start_minutes": getattr(route, "planned_start_minutes", None),
+                "planned_end_minutes": getattr(route, "planned_end_minutes", None),
+                "planned_start": _format_schedule_minutes(getattr(route, "planned_start_minutes", None)),
+                "planned_end": _format_schedule_minutes(getattr(route, "planned_end_minutes", None)),
                 "start_location": list(route.depot_location) if getattr(route, "depot_location", None) else None,
                 "end_location": list(getattr(route, "end_location", None) or route.depot_location) if getattr(route, "depot_location", None) else None,
                 "customers_count": len(route.customers),
@@ -591,6 +815,7 @@ def _solution_to_api_response(
                         "plas_doc": getattr(customer, "plas_doc", ""),
                         "source_id_skld": getattr(customer, "source_id_skld", ""),
                         "delivery_comment": getattr(customer, "delivery_comment", ""),
+                        "mandatory": bool(getattr(customer, "mandatory", False)),
                         "time_window_start_minutes": getattr(customer, "time_window_start_minutes", None),
                         "time_window_end_minutes": getattr(customer, "time_window_end_minutes", None),
                         "grouped_documents": getattr(customer, "grouped_documents", []),
@@ -598,7 +823,7 @@ def _solution_to_api_response(
                     for customer in route.customers
                 ],
             }
-            for route in solution.routes
+            for route_index, route in enumerate(solution.routes)
         ],
         "dropped_customers": [
             {
@@ -609,6 +834,7 @@ def _solution_to_api_response(
                 "plas_doc": getattr(customer, "plas_doc", ""),
                 "source_id_skld": getattr(customer, "source_id_skld", ""),
                 "delivery_comment": getattr(customer, "delivery_comment", ""),
+                "mandatory": bool(getattr(customer, "mandatory", False)),
                 "time_window_start_minutes": getattr(customer, "time_window_start_minutes", None),
                 "time_window_end_minutes": getattr(customer, "time_window_end_minutes", None),
                 "grouped_documents": getattr(customer, "grouped_documents", []),
@@ -665,7 +891,19 @@ def run_optimization(
     best_solution = None
 
     cpu_cores = os.cpu_count() or 1
-    if config.cvrp.enable_parallel_solving and cpu_cores > 1:
+    solver_type = str(getattr(config.cvrp, "solver_type", "") or "").strip().lower()
+    use_outer_parallelism = config.cvrp.enable_parallel_solving and cpu_cores > 1
+    if solver_type in {"vroom", "vrp"} and use_outer_parallelism:
+        # Sidecar solvers have no outer seed variants and already use their own threads.
+        # Starting identical outer workers only oversubscribes the CPU and RAM.
+        logger.info(
+            "%s uses one application worker and its own internal threads; "
+            "outer parallel solving is disabled for this run.",
+            "VRP-Rust" if solver_type == "vrp" else "VROOM",
+        )
+        use_outer_parallelism = False
+
+    if use_outer_parallelism:
         if config.cvrp.num_workers == -1:
             num_workers = max(1, cpu_cores - 1)
         else:
@@ -693,15 +931,32 @@ def run_optimization(
         with Pool(processes=num_workers) as pool:
             results = pool.map(solve_cvrp_worker, worker_args)
         
-        valid_solutions = [sol for sol in results if sol is not None]
+        valid_solutions = [sol for sol in results if _is_usable_solution(sol)]
+        rejected_count = len(results) - len(valid_solutions)
+        if rejected_count:
+            logger.warning(
+                "Отхвърлени са %s невалидни/безкрайни решения от работниците; "
+                "те няма да бъдат експортирани.",
+                rejected_count,
+            )
         
         if valid_solutions:
-            # ИЗБИРАМЕ ПОБЕДИТЕЛЯ ПО НАЙ-ДОБЪР ФИТНЕС СКОР (distance или time според objective_metric)
+            # In time mode the public fitness is pure workday duration. Prefer
+            # solutions that serve more customers before comparing their time,
+            # otherwise an optional-customer solution could win by dropping work.
             for sol in valid_solutions:
                  sol.total_served_volume = sum(r.total_volume for r in sol.routes)
 
-            best_solution = min(valid_solutions, key=lambda s: s.fitness_score)
             objective_metric = getattr(config.cvrp, "objective_metric", "distance")
+            if str(objective_metric).strip().lower() in {
+                "time", "duration", "fastest", "shortest_time"
+            }:
+                best_solution = min(
+                    valid_solutions,
+                    key=lambda s: (len(s.dropped_customers), s.fitness_score),
+                )
+            else:
+                best_solution = min(valid_solutions, key=lambda s: s.fitness_score)
             
             logger.info(f"🏆 Избрано е най-доброто решение по ФИТНЕС СКОР от {len(valid_solutions)} намерени, "
                         f"objective={objective_metric}, fitness score: {best_solution.fitness_score:.2f} "
@@ -721,14 +976,23 @@ def run_optimization(
             1
         ))
 
-    if best_solution:
+    if _is_usable_solution(best_solution):
         execution_time = time.time() - start_time
         # Получаваме депата за предаване към process_results в същия ред като матрицата.
         enabled_vehicles = active_vehicle_configs
-        sorted_depots = build_ordered_depots(config.locations.depot_location, enabled_vehicles)
+        sorted_depots = build_ordered_depots(
+            config.locations.depot_location,
+            enabled_vehicles,
+            include_reload_locations=bool(getattr(config.cvrp, "enable_multiple_trips", False)),
+        )
         
         output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots)
         set_data_result = None
+        _assert_mandatory_customer_solution(
+            warehouse_allocation,
+            best_solution,
+            context="immediately before setData upload",
+        )
         try:
             from setdata_client import upload_solution_set_data
             set_data_result = upload_solution_set_data(best_solution, config, warehouse_allocation)
