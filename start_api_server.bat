@@ -6,7 +6,7 @@ set "_MEIPASS2="
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
-echo CVRP Optimizer - API Server
+echo Bizant - API Server
 echo.
 echo Default listen address is configured in config.py / Settings.
 echo Use 0.0.0.0 to accept requests from other computers.

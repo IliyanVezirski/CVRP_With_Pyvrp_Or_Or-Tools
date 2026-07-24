@@ -12,6 +12,119 @@ from config import get_config
 
 
 class WebRunSettingsTests(unittest.TestCase):
+    @staticmethod
+    def _config_with_legacy_output():
+        base = deepcopy(get_config())
+        legacy_values = {
+            name: value
+            for name, value in vars(base.output).items()
+            if name not in {
+                "saturday_excel_bus_number_prefix",
+                "saturday_excel_bus_number_digits",
+            }
+        }
+        base.output = types.SimpleNamespace(**legacy_values)
+        return base
+
+    def test_legacy_config_gets_saturday_defaults_for_web_and_endpoint(self):
+        base = self._config_with_legacy_output()
+
+        web_settings = api._web_run_settings_from_config(base)
+        self.assertEqual(
+            "100450121",
+            web_settings["output"]["saturday_excel_bus_number_prefix"],
+        )
+        self.assertEqual(
+            1,
+            web_settings["output"]["saturday_excel_bus_number_digits"],
+        )
+
+        with (
+            patch.object(api, "get_config", return_value=base),
+            patch.object(api, "_resolve_dynamic_api_date", return_value="25/07/2026"),
+        ):
+            saturday_config, _, _ = api._build_saturday_run_config_override()
+
+        self.assertEqual("100450121", saturday_config.output.excel_bus_number_prefix)
+        self.assertEqual(1, saturday_config.output.excel_bus_number_digits)
+
+    def test_global_save_can_insert_missing_saturday_config_fields(self):
+        source = '''@dataclass
+class OutputConfig:
+    excel_bus_number_prefix: str = "10045010"
+    excel_bus_number_digits: int = 2
+'''
+        updated = api._replace_class_field_literal(
+            source,
+            "OutputConfig",
+            "saturday_excel_bus_number_digits",
+            1,
+        )
+        updated = api._replace_class_field_literal(
+            updated,
+            "OutputConfig",
+            "saturday_excel_bus_number_prefix",
+            "100450121",
+        )
+
+        self.assertIn(
+            'saturday_excel_bus_number_prefix: str = "100450121"',
+            updated,
+        )
+        self.assertIn("saturday_excel_bus_number_digits: int = 1", updated)
+        compile(updated, "legacy_config.py", "exec")
+
+    def test_legacy_strategy_strings_are_normalised_before_web_rendering(self):
+        base = deepcopy(get_config())
+        base.cvrp.parallel_first_solution_strategies = "['SAVINGS', 'PATH_CHEAPEST_ARC']"
+        base.cvrp.parallel_local_search_metaheuristics = (
+            '["GUIDED_LOCAL_SEARCH", "TABU_SEARCH"]'
+        )
+
+        settings = api._web_run_settings_from_config(base)
+
+        self.assertEqual(
+            ["SAVINGS", "PATH_CHEAPEST_ARC"],
+            settings["cvrp"]["parallel_first_solution_strategies"],
+        )
+        self.assertEqual(
+            ["GUIDED_LOCAL_SEARCH", "TABU_SEARCH"],
+            settings["cvrp"]["parallel_local_search_metaheuristics"],
+        )
+
+    def test_repeated_web_saves_keep_strategy_fields_as_real_lists(self):
+        source = '''from dataclasses import dataclass, field
+from typing import List
+
+@dataclass
+class CVRPConfig:
+    parallel_first_solution_strategies: List[str] = field(default_factory=lambda: ["OLD"])
+    parallel_local_search_metaheuristics: List[str] = "['OLD']"
+'''
+        expected_first = ["SAVINGS", "PATH_CHEAPEST_ARC"]
+        expected_meta = ["GUIDED_LOCAL_SEARCH", "TABU_SEARCH"]
+        updated = source
+        for _ in range(3):
+            updated = api._replace_class_field_literal(
+                updated,
+                "CVRPConfig",
+                "parallel_first_solution_strategies",
+                expected_first,
+            )
+            updated = api._replace_class_field_literal(
+                updated,
+                "CVRPConfig",
+                "parallel_local_search_metaheuristics",
+                expected_meta,
+            )
+
+        namespace = {}
+        exec(compile(updated, "saved_config.py", "exec"), namespace)
+        saved_config = namespace["CVRPConfig"]()
+        self.assertEqual(expected_first, saved_config.parallel_first_solution_strategies)
+        self.assertEqual(expected_meta, saved_config.parallel_local_search_metaheuristics)
+        self.assertNotIn('List[str] = "[', updated)
+
     def test_builder_is_isolated_and_accepts_cvrp_output_and_set_data(self):
         base = get_config()
         original_solver = base.cvrp.solver_type
@@ -141,6 +254,10 @@ class WebRunSettingsTests(unittest.TestCase):
         self.assertIn("cvrp:collectCvrpSettings()", page)
         self.assertIn("const runSettings = collectRunSettings()", page)
         self.assertIn("run_settings:runSettings", page)
+        self.assertIn(
+            "stringList(cvrp.parallel_first_solution_strategies).join",
+            page,
+        )
         self.assertNotIn("482253", page)
 
     def test_web_run_rejects_wrong_json_types(self):

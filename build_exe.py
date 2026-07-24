@@ -35,7 +35,6 @@ PYVRP_NEXT_BUILD_SCRIPT = PROJECT_DIR / "build_pyvrp_next_worker.py"
 PYVRP_NEXT_WORKER = (
     DIST_DIR
     / "pyvrp-next"
-    / "CVRP_PyVRP_Next_Worker"
     / "CVRP_PyVRP_Next_Worker.exe"
 )
 PYVRP_NEXT_VERSION_PREFIX = "0.14"
@@ -44,7 +43,6 @@ VROOM_BUILD_SCRIPT = PROJECT_DIR / "build_vroom_worker.py"
 VROOM_WORKER = (
     DIST_DIR
     / "vroom"
-    / "CVRP_VROOM_Worker"
     / "CVRP_VROOM_Worker.exe"
 )
 VROOM_VERSION_PREFIX = "1.15"
@@ -53,7 +51,6 @@ VRP_RUST_BUILD_SCRIPT = PROJECT_DIR / "build_vrp_rust_worker.py"
 VRP_RUST_WORKER = (
     DIST_DIR
     / "vrp-rust"
-    / "CVRP_VRP_Rust_Worker"
     / "CVRP_VRP_Rust_Worker.exe"
 )
 VRP_RUST_VERSION_PREFIX = "1.24"
@@ -459,7 +456,7 @@ def verify_pyvrp_next_worker() -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=180,
     )
     metadata = _parse_last_json_line(completed.stdout)
     version = str(metadata.get("solver_version") or "").strip()
@@ -510,7 +507,7 @@ def verify_vroom_worker() -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=180,
     )
     metadata = _parse_last_json_line(completed.stdout)
     version = str(metadata.get("solver_version") or "").strip()
@@ -561,7 +558,7 @@ def verify_vrp_rust_worker() -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=180,
     )
     metadata = _parse_last_json_line(completed.stdout)
     version = str(metadata.get("solver_version") or "").strip()
@@ -763,7 +760,7 @@ def copy_runtime_files() -> None:
     (DIST_DIR / "data").mkdir(exist_ok=True)
 
 
-def main() -> None:
+def main() -> int:
     print("Bizant - EXE Builder")
     print("=" * 40)
     print(f"Python: {sys.executable}")
@@ -772,38 +769,38 @@ def main() -> None:
         answer = input("Install/update dependencies in this Python environment? (y/n): ").strip().lower()
         if answer != "y":
             print("Build cancelled.")
-            return
+            return 1
         if not install_dependencies() or not check_dependencies():
             print("Dependencies are still missing. Build cancelled.")
-            return
+            return 1
 
     create_version_info()
     create_spec_file()
 
     if not build_exe():
         print("EXE build failed. No fallback EXE was created.")
-        return
+        return 1
 
     if not build_pyvrp_next_worker():
         print(
             f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
             "PyVRP 0.14 companion worker was not built successfully."
         )
-        return
+        return 1
 
     if not build_vroom_worker():
         print(
             f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
             "VROOM companion worker was not built successfully."
         )
-        return
+        return 1
 
     if not build_vrp_rust_worker():
         print(
             f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
             "VRP-Rust companion worker was not built successfully."
         )
-        return
+        return 1
 
     create_batch_files()
     copy_runtime_files()
@@ -814,7 +811,8 @@ def main() -> None:
     print(f"VROOM worker: {VROOM_WORKER}")
     print(f"VRP-Rust worker: {VRP_RUST_WORKER}")
     print("Place input data in dist\\data\\input.xlsx or edit dist\\config.py.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

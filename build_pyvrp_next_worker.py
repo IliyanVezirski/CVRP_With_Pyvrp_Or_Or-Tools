@@ -61,9 +61,7 @@ def _build_command() -> list[str]:
         "PyInstaller",
         "--clean",
         "--noconfirm",
-        "--onedir",
-        "--contents-directory",
-        "_internal",
+        "--onefile",
         "--console",
         "--name",
         WORKER_NAME,
@@ -112,7 +110,7 @@ def _verify_executable(executable: Path, expected_version: str) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,
+            timeout=180,
         )
         metadata = None
         for line in reversed(completed.stdout.splitlines()):
@@ -123,7 +121,7 @@ def _verify_executable(executable: Path, expected_version: str) -> None:
             if isinstance(value, dict):
                 metadata = value
                 break
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         executable.unlink(missing_ok=True)
         raise SystemExit(f"Frozen worker self-check failed: {exc}") from exc
 
@@ -147,19 +145,14 @@ def main() -> int:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     SPEC_DIR.mkdir(parents=True, exist_ok=True)
 
-    executable = WORKER_PACKAGE_DIR / f"{WORKER_NAME}.exe"
-    if os.name != "nt":
-        executable = WORKER_PACKAGE_DIR / WORKER_NAME
+    executable = DIST_DIR / (f"{WORKER_NAME}.exe" if os.name == "nt" else WORKER_NAME)
 
-    # Remove both the previous onedir package and the legacy one-file worker.
-    # The latter must not remain available as a slower fallback after a
-    # successful build.
+    # Remove the previous onedir package and one-file worker.  The one-file
+    # format is required on Windows installations where Smart App Control
+    # blocks newly generated unsigned onedir launchers.
     if WORKER_PACKAGE_DIR.exists():
         shutil.rmtree(WORKER_PACKAGE_DIR)
-    legacy_executable = DIST_DIR / (
-        f"{WORKER_NAME}.exe" if os.name == "nt" else WORKER_NAME
-    )
-    legacy_executable.unlink(missing_ok=True)
+    executable.unlink(missing_ok=True)
 
     env = os.environ.copy()
     env.setdefault("SOURCE_DATE_EPOCH", "1700000000")

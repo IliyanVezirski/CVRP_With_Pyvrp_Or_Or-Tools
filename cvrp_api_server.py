@@ -23,6 +23,7 @@ and uses the same endpoint in visible and hidden API server modes.
 from __future__ import annotations
 
 import argparse
+import ast
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta
@@ -80,6 +81,25 @@ from tsp_daily_report import (
 
 logger = logging.getLogger(__name__)
 _CURRENT_WEEK_SATURDAY_TOKEN = "current_week_saturday"
+_OUTPUT_COMPAT_DEFAULTS = {
+    # Older preserved config.py files predate the dedicated Saturday fields.
+    # Keep Web/API usable until the next global save writes the fields into the
+    # external config file.
+    "saturday_excel_bus_number_prefix": "100450121",
+    "saturday_excel_bus_number_digits": 1,
+}
+_OUTPUT_COMPAT_FIELD_SPECS = {
+    "saturday_excel_bus_number_prefix": (
+        "str",
+        "excel_bus_number_digits",
+        "Префикс за бусове при HTTP /run_saturday.",
+    ),
+    "saturday_excel_bus_number_digits": (
+        "int",
+        "excel_bus_number_digits",
+        "Брой цифри след съботния префикс.",
+    ),
+}
 _API_RUN_DATE_OUTPUT_FIELDS = {
     "map_output_file",
     "routes_output_dir",
@@ -90,6 +110,15 @@ _API_RUN_DATE_OUTPUT_FIELDS = {
     "csv_output_file",
     "charts_output_dir",
 }
+
+
+def _output_config_value(output: Any, field_name: str) -> Any:
+    """Read an output field with defaults for preserved legacy configs."""
+    if hasattr(output, field_name):
+        return getattr(output, field_name)
+    if field_name in _OUTPUT_COMPAT_DEFAULTS:
+        return deepcopy(_OUTPUT_COMPAT_DEFAULTS[field_name])
+    raise AttributeError(field_name)
 _TRIGGER_COMMANDS = {"run", "start", "trigger", "solve_config", "start_program"}
 _SHUTDOWN_COMMANDS = {"shutdown", "stop", "stop_program", "exit", "quit"}
 _REQUEST_BODY_LOG_LIMIT = 100_000
@@ -902,12 +931,24 @@ def _parse_coords(value: Any) -> Optional[tuple[float, float]]:
 def _parse_string_list(value: Any) -> list[str]:
     if value is None:
         return []
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text[:1] in {"[", "("} and text[-1:] in {"]", ")"}:
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    parsed = parser(text)
+                except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, (list, tuple)):
+                    return _parse_string_list(parsed)
     return [
-        part.strip()
-        for part in str(value).replace(",", "\n").splitlines()
-        if part.strip()
+        part.strip().strip("'\"")
+        for part in str(value).strip().strip("[]()").replace(",", "\n").splitlines()
+        if part.strip().strip("'\"")
     ]
 
 
@@ -1674,7 +1715,7 @@ def _build_saturday_run_config_override(
     saturday_date = _resolve_dynamic_api_date(_CURRENT_WEEK_SATURDAY_TOKEN)
     saturday_stamp = datetime.strptime(saturday_date, "%d/%m/%Y").strftime("%Y-%m-%d")
     saturday_prefix = str(
-        getattr(request_config.output, "saturday_excel_bus_number_prefix", "")
+        _output_config_value(request_config.output, "saturday_excel_bus_number_prefix")
         or getattr(request_config.output, "excel_bus_number_prefix", "")
     ).strip()
     if not saturday_prefix:
@@ -1682,7 +1723,7 @@ def _build_saturday_run_config_override(
 
     try:
         saturday_digits = int(
-            getattr(request_config.output, "saturday_excel_bus_number_digits", 1)
+            _output_config_value(request_config.output, "saturday_excel_bus_number_digits")
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("Цифрите за съботния префикс трябва да са цяло число.") from exc
@@ -2152,6 +2193,12 @@ def _validate_web_run_config(config_obj: MainConfig) -> None:
     output = config_obj.output
     set_data = config_obj.set_data
 
+    for field_name in (
+        "parallel_first_solution_strategies",
+        "parallel_local_search_metaheuristics",
+    ):
+        setattr(cvrp, field_name, _parse_string_list(getattr(cvrp, field_name, [])))
+
     cvrp.solver_type = _parse_solver_type(getattr(cvrp, "solver_type", "pyvrp"))
     objective_metric = str(getattr(cvrp, "objective_metric", "distance") or "distance").strip().lower()
     if objective_metric not in {"time", "distance"}:
@@ -2278,6 +2325,22 @@ def _validate_web_run_config(config_obj: MainConfig) -> None:
         raise ValueError("map_provider must be osm or google")
     output.map_provider = map_provider
 
+    saturday_prefix = str(
+        _output_config_value(output, "saturday_excel_bus_number_prefix") or ""
+    ).strip()
+    if not saturday_prefix:
+        raise ValueError("saturday_excel_bus_number_prefix cannot be empty")
+    try:
+        saturday_digits = int(
+            _output_config_value(output, "saturday_excel_bus_number_digits")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("saturday_excel_bus_number_digits must be an integer") from exc
+    if not 1 <= saturday_digits <= 9:
+        raise ValueError("saturday_excel_bus_number_digits must be between 1 and 9")
+    output.saturday_excel_bus_number_prefix = saturday_prefix
+    output.saturday_excel_bus_number_digits = saturday_digits
+
     method = str(getattr(set_data, "set_data_http_method", "GET") or "GET").strip().upper()
     if method not in {"GET", "POST"}:
         raise ValueError("set_data_http_method must be GET or POST")
@@ -2321,7 +2384,16 @@ def _apply_web_run_settings(config_obj: MainConfig, settings: Dict[str, Dict[str
     for section_name, section_payload in (settings or {}).items():
         section_obj = getattr(config_obj, section_name)
         for field_name, raw_value in section_payload.items():
-            current_value = getattr(section_obj, field_name)
+            current_value = (
+                _output_config_value(section_obj, field_name)
+                if section_name == "output"
+                else getattr(section_obj, field_name)
+            )
+            if field_name in {
+                "parallel_first_solution_strategies",
+                "parallel_local_search_metaheuristics",
+            }:
+                current_value = _parse_string_list(current_value)
             setting_name = f"{section_name}.{field_name}"
             if isinstance(current_value, bool):
                 if not isinstance(raw_value, bool):
@@ -2365,9 +2437,26 @@ def _build_web_run_config_override(payload: Any = None) -> tuple[MainConfig, lis
 def _web_run_settings_from_config(config_obj: MainConfig) -> Dict[str, Dict[str, Any]]:
     return {
         section_name: {
-            field_name: deepcopy(getattr(getattr(config_obj, section_name), field_name))
+            field_name: deepcopy(
+                _parse_string_list(getattr(config_obj.cvrp, field_name))
+                if (
+                    section_name == "cvrp"
+                    and field_name in {
+                        "parallel_first_solution_strategies",
+                        "parallel_local_search_metaheuristics",
+                    }
+                )
+                else (
+                    _output_config_value(getattr(config_obj, section_name), field_name)
+                    if section_name == "output"
+                    else getattr(getattr(config_obj, section_name), field_name)
+                )
+            )
             for field_name in sorted(allowed_fields)
-            if hasattr(getattr(config_obj, section_name), field_name)
+            if (
+                hasattr(getattr(config_obj, section_name), field_name)
+                or (section_name == "output" and field_name in _OUTPUT_COMPAT_DEFAULTS)
+            )
         }
         for section_name, allowed_fields in _WEB_RUN_SECTION_FIELDS.items()
     }
@@ -2552,10 +2641,10 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
             "parallel_first_solution_strategies",
             "parallel_local_search_metaheuristics",
         }:
-            list_value = [str(item) for item in (value or [])]
+            list_value = _parse_string_list(value)
             list_factory_pattern = (
                 rf'(?ms)^(\s*{re.escape(field_name)}\s*:\s*[^=\n]+=\s*)'
-                rf'field\(default_factory=lambda:\s*\[.*?^\s*\]\)'
+                rf'(?:field\(default_factory=lambda:\s*\[.*?\]\)|[^\r\n#]*)'
                 rf'(\s*(?:#.*)?$)'
             )
             replaced, count = re.subn(
@@ -2571,12 +2660,34 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
             if count:
                 return replaced
         field_pattern = rf'(?m)^(\s*{re.escape(field_name)}\s*:\s*[^=\n]+=\s*)(.*?)(\s*(?:#.*)?$)'
-        return re.sub(
+        replaced, count = re.subn(
             field_pattern,
             lambda field_match: f"{field_match.group(1)}{_python_literal(value)}{field_match.group(3)}",
             class_block,
             count=1,
         )
+        if count:
+            return replaced
+
+        # A preserved config.py can be older than the executable. Insert the
+        # known additive fields during the first global Web save instead of
+        # silently leaving the external config structurally incompatible.
+        if class_name == "OutputConfig" and field_name in _OUTPUT_COMPAT_FIELD_SPECS:
+            annotation, anchor_name, comment = _OUTPUT_COMPAT_FIELD_SPECS[field_name]
+            anchor_pattern = rf'(?m)^(\s*){re.escape(anchor_name)}\s*:.*$'
+            inserted, inserted_count = re.subn(
+                anchor_pattern,
+                lambda anchor_match: (
+                    f"{anchor_match.group(0)}\n"
+                    f"{anchor_match.group(1)}{field_name}: {annotation} = "
+                    f"{_python_literal(value)} # {comment}"
+                ),
+                class_block,
+                count=1,
+            )
+            if inserted_count:
+                return inserted
+        return class_block
 
     return re.sub(class_pattern, replace_in_class, content, count=1, flags=re.S)
 
@@ -2742,7 +2853,11 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
                 f"Unsupported global Web fields in {section_name}: " + ", ".join(unknown_fields)
             )
         for field_name, raw_value in section_payload.items():
-            current_value = getattr(section_obj, field_name)
+            current_value = (
+                _output_config_value(section_obj, field_name)
+                if section_name == "output"
+                else getattr(section_obj, field_name)
+            )
             setattr(
                 section_obj,
                 field_name,
@@ -3118,6 +3233,16 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     .solver-fine-panel h4 {{ margin:0 0 4px; font-size:13px; color:#1e3a8a; }}
     .solver-fine-panel[hidden] {{ display:none; }}
     .settings-card h3 {{ margin:0 0 5px; font-size:14px; }}
+    .settings-accordion {{ grid-column:1 / -1; margin:0; padding:0; overflow:hidden; }}
+    .settings-accordion > summary {{ display:flex; align-items:center; justify-content:space-between; gap:14px; padding:15px 16px; border:0; cursor:pointer; list-style:none; color:var(--text); user-select:none; }}
+    .settings-accordion > summary::-webkit-details-marker {{ display:none; }}
+    .settings-accordion > summary::after {{ content:"Разпъни"; flex:0 0 auto; padding:5px 9px; border:1px solid #bfdbfe; border-radius:999px; background:#fff; color:#1d4ed8; font-size:11px; font-weight:800; }}
+    .settings-accordion[open] > summary::after {{ content:"Свий"; }}
+    .settings-accordion[open] > summary {{ border-bottom:1px solid #dbe3ef; }}
+    .settings-accordion > summary:hover {{ background:rgba(219,234,254,.45); }}
+    .settings-accordion-title {{ display:block; margin-bottom:4px; font-size:14px; font-weight:800; }}
+    .settings-accordion-description {{ display:block; color:var(--muted); font-size:12px; font-weight:400; line-height:1.4; }}
+    .settings-accordion-body {{ padding:14px; }}
     .field-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:0 12px; }}
     .field-grid .wide {{ grid-column:1 / -1; }}
     .check-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px 12px; margin:12px 0; }}
@@ -3187,8 +3312,11 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         <strong>„Запази глобално“</strong> записва същите стойности в <code>config.py</code> и те важат за Desktop GUI, Web и API <code>/run</code>.
       </div>
       <div class="settings-grid">
-        <div class="settings-card solver-settings-card">
-          <h3>Решаване</h3>
+        <details class="settings-card settings-accordion solver-settings-card" data-settings-panel="solver">
+          <summary>
+            <span><span class="settings-accordion-title">Решаване</span><span class="settings-accordion-description">Solver, цел, времеви лимит и фини настройки за качество.</span></span>
+          </summary>
+          <div class="settings-accordion-body">
           <div class="muted">Тези стойности също участват в временния старт; не е необходимо първо да ги записваш.</div>
           <div class="solver-settings-grid">
             <div><label for="solverType">Solver</label><select id="solverType" title="VRP-Rust е отделен експериментален sidecar; зоните влияят в distance режим, а pure time минимизира само продължителността. VROOM 1.15 не поддържа свързани повторни курсове."><option value="pyvrp">PyVRP 0.13</option><option value="pyvrp_experimental">PyVRP 0.14</option><option value="or_tools">OR-Tools</option><option value="vroom">VROOM 1.15</option><option value="vrp">VRP-Rust</option></select></div>
@@ -3274,9 +3402,13 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div class="check-line"><input id="solverParallelEnabled" type="checkbox"><label for="solverParallelEnabled">Външни паралелни workers</label></div>
             </div>
           </div>
-        </div>
-        <div class="settings-card">
-          <h3>Изходни файлове</h3>
+          </div>
+        </details>
+        <details class="settings-card settings-accordion" data-settings-panel="output">
+          <summary>
+            <span><span class="settings-accordion-title">Изходни файлове</span><span class="settings-accordion-description">Карти, Excel, CSV, графики, качване и съботно номериране.</span></span>
+          </summary>
+          <div class="settings-accordion-body">
           <div class="muted">Избери какво да се генерира и къде да се запише.</div>
           <div class="check-grid">
             <div class="check-line"><input id="outMapEnabled" type="checkbox"><label for="outMapEnabled">HTML карти</label></div>
@@ -3317,9 +3449,13 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div><label for="outSaturdayBusDigits">Цифри за събота</label><input id="outSaturdayBusDigits" type="number" min="1" max="9"></div>
             </div>
           </details>
-        </div>
-        <div class="settings-card">
-          <h3>setData</h3>
+          </div>
+        </details>
+        <details class="settings-card settings-accordion" data-settings-panel="set-data">
+          <summary>
+            <span><span class="settings-accordion-title">setData</span><span class="settings-accordion-description">Обслужени, необслужени, IdSkld, шаблони и makeGroup.</span></span>
+          </summary>
+          <div class="settings-accordion-body">
           <div class="muted">Изпращането променя данни във външната система и винаги се потвърждава преди старт.</div>
           <div class="check-grid">
             <div class="check-line wide"><input id="setDataEnabled" type="checkbox"><label for="setDataEnabled">Изпращай обслужените клиенти</label></div>
@@ -3355,7 +3491,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             </div>
           </details>
           <div class="notice warning" style="margin-top:12px">При включено setData ще видиш потвърждение непосредствено преди старта.</div>
-        </div>
+          </div>
+        </details>
       </div>
       <div class="actions run-actions">
         <button class="primary" onclick="startRun()">Стартирай без запис</button>
@@ -3390,6 +3527,22 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
 
     function $(id) {{ return document.getElementById(id); }}
     function value(id) {{ return $(id).value; }}
+    function stringList(raw) {{
+      if (Array.isArray(raw)) return raw.map(item => String(item).trim()).filter(Boolean);
+      if (typeof raw !== "string") return [];
+      const text = raw.trim();
+      if (!text) return [];
+      try {{
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) return parsed.map(item => String(item).trim()).filter(Boolean);
+      }} catch (_) {{}}
+      return text
+        .replace(/^\\s*[\\[(]/, "")
+        .replace(/[\\])]\\s*$/, "")
+        .split(/[,;\\r\\n]+/)
+        .map(item => item.trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean);
+    }}
     function intOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; }}
     function numberOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }}
     function requiredInt(id, label, minimum=1, maximum=3600) {{
@@ -3508,8 +3661,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("orLogSearch", !!cvrp.log_search);
       put("orStartTracking", cvrp.enable_start_time_tracking !== false);
       put("orGlobalStart", cvrp.global_start_time_minutes ?? 480);
-      put("orParallelFirstStrategies", (cvrp.parallel_first_solution_strategies || []).join("\\n"));
-      put("orParallelMetaheuristics", (cvrp.parallel_local_search_metaheuristics || []).join("\\n"));
+      put("orParallelFirstStrategies", stringList(cvrp.parallel_first_solution_strategies).join("\\n"));
+      put("orParallelMetaheuristics", stringList(cvrp.parallel_local_search_metaheuristics).join("\\n"));
       put("vroomWorkerTimeout", cvrp.vroom_worker_timeout_seconds ?? 0);
       put("vroomThreads", cvrp.vroom_threads ?? 0);
       put("vroomExploration", cvrp.vroom_exploration_level ?? 5);
@@ -4153,8 +4306,12 @@ def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
                 "methods": ["GET", "POST"],
                 "description": "Съботен run с автоматична дата и отделен префикс за бусове.",
                 "single_active_run": True,
-                "bus_number_prefix": getattr(get_config().output, "saturday_excel_bus_number_prefix", ""),
-                "bus_number_digits": getattr(get_config().output, "saturday_excel_bus_number_digits", 1),
+                "bus_number_prefix": _output_config_value(
+                    get_config().output, "saturday_excel_bus_number_prefix"
+                ),
+                "bus_number_digits": _output_config_value(
+                    get_config().output, "saturday_excel_bus_number_digits"
+                ),
             },
             "tsp": {
                 "method": "POST",

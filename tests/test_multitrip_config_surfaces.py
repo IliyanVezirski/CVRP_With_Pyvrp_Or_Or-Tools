@@ -217,6 +217,16 @@ class MultiTripConfigSurfaceTests(unittest.TestCase):
                     include_output=True,
                     include_set_data=True,
                 )
+                # A second save used to turn the inline list factory produced
+                # by the first save into a quoted string and break Web load.
+                api._persist_web_gui_config(
+                    cfg,
+                    include_api=False,
+                    include_cvrp=True,
+                    include_vehicles=False,
+                    include_output=True,
+                    include_set_data=True,
+                )
             saved = config_path.read_text(encoding="utf-8")
 
         saved_vehicle_start = saved.index("    def _create_default_vehicles")
@@ -266,6 +276,19 @@ class MultiTripConfigSurfaceTests(unittest.TestCase):
         desktop_source = Path(config_gui.__file__).read_text(encoding="utf-8")
         self.assertIn('"output.saturday_excel_bus_number_prefix"', desktop_source)
         self.assertIn('"api.saturday_trigger_endpoint"', desktop_source)
+
+    def test_web_settings_are_collapsed_panels_while_vehicles_stay_visible(self):
+        cfg = config.get_config()
+        page = api._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
+
+        self.assertIn('<section class="vehicles-section">', page)
+        self.assertNotIn('<details class="vehicles-section"', page)
+        self.assertEqual(3, page.count('class="settings-card settings-accordion'))
+        for panel_name in ("solver", "output", "set-data"):
+            self.assertIn(f'data-settings-panel="{panel_name}">', page)
+            self.assertNotIn(f'data-settings-panel="{panel_name}" open', page)
+        self.assertIn('content:"Разпъни"', page)
+        self.assertIn('content:"Свий"', page)
 
     def test_desktop_incremental_vehicle_save_persists_daily_distance(self):
         gui = config_gui.ConfigGUI.__new__(config_gui.ConfigGUI)

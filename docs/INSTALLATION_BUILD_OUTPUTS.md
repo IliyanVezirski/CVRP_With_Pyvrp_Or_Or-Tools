@@ -128,13 +128,14 @@ Worker path настройките (`pyvrp_next_worker_path`, `vroom_worker_path
 
 ```powershell
 .\.venv-pyvrp-next\Scripts\python.exe build_pyvrp_next_worker.py
-& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker\CVRP_PyVRP_Next_Worker.exe" --self-check
+& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker.exe" --self-check
 ```
 
 `cvrp.pyvrp_next_worker_timeout_seconds = 0` означава автоматичен timeout:
 поне 60 секунди и обичайно solver лимитът плюс 60 секунди. При положителна
-стойност тя е общият worker timeout. Startup self-check е ограничен до максимум
-60 секунди.
+стойност тя е общият worker timeout. Ръчният/build self-check допуска до 180
+секунди за студен старт на onefile пакета. При нормален solve няма отделен
+pre-flight self-check; валидира се отговорът от реалната задача.
 
 По подразбиране повреден или липсващ 0.14 worker прекратява run-а с ясна
 грешка. Само `pyvrp_next_fallback_to_stable = True` разрешава преминаване към
@@ -154,7 +155,7 @@ Worker path настройките (`pyvrp_next_worker_path`, `vroom_worker_path
 .\.venv\Scripts\python.exe setup_vroom.py
 .\.venv-vroom\Scripts\python.exe vroom_worker.py --self-check
 .\.venv-vroom\Scripts\python.exe build_vroom_worker.py
-& "D:\Iliyan\dist\vroom\CVRP_VROOM_Worker\CVRP_VROOM_Worker.exe" --self-check
+& "D:\Iliyan\dist\vroom\CVRP_VROOM_Worker.exe" --self-check
 ```
 
 `vroom_worker_timeout_seconds = 0` използва поне 60 секунди и обичайно solver
@@ -177,7 +178,7 @@ py -3.12 -m venv .venv-vrp-rust
 .\.venv-vrp-rust\Scripts\python.exe -m pip install "vrp-cli==1.24.0" "pyinstaller==6.20.0"
 .\.venv-vrp-rust\Scripts\python.exe vrp_rust_worker.py --self-check
 .\.venv-vrp-rust\Scripts\python.exe build_vrp_rust_worker.py
-& "D:\Iliyan\dist\vrp-rust\CVRP_VRP_Rust_Worker\CVRP_VRP_Rust_Worker.exe" --self-check
+& "D:\Iliyan\dist\vrp-rust\CVRP_VRP_Rust_Worker.exe" --self-check
 ```
 
 `vrp_worker_timeout_seconds = 0` използва поне 60 секунди и обичайно solver
@@ -251,22 +252,17 @@ dist\
   start_api_server_hidden.bat
   data\
   pyvrp-next\
-    CVRP_PyVRP_Next_Worker\
-      CVRP_PyVRP_Next_Worker.exe
-      _internal\...
+    CVRP_PyVRP_Next_Worker.exe
   vroom\
-    CVRP_VROOM_Worker\
-      CVRP_VROOM_Worker.exe
-      _internal\...
+    CVRP_VROOM_Worker.exe
   vrp-rust\
-    CVRP_VRP_Rust_Worker\
-      CVRP_VRP_Rust_Worker.exe
-      _internal\...
+    CVRP_VRP_Rust_Worker.exe
 ```
 
-Worker-ите са `onedir` packages. Не копирайте само техния `.exe`; необходима е
-и съответната `_internal` директория. За разпространение копирайте цялата
-release папка.
+Worker-ите са `onefile` EXE packages. Runtime-ът продължава да разпознава стария
+`onedir` layout, но новите build-ове използват показаните flat paths. За
+разпространение копирайте цялата release папка, защото тя съдържа config,
+launcher-и и всички companion worker-и.
 
 ### 5.4. Проверка на release-а
 
@@ -641,9 +637,10 @@ config рестартирайте API server-а или използвайте We
 
 ### Worker „is not installed“
 
-Проверете цялата onedir структура и изпълнете `--self-check`. При source режим
+Проверете съответния flat worker EXE и изпълнете `--self-check`. При source режим
 проверете съответната `.venv-*\Scripts\python.exe`; при build режим — worker-а
-до EXE. Не местете само worker `.exe` без `_internal`.
+в неговата release подпапка. Legacy `onedir` layout също се разпознава, ако е
+копирана цялата му директория.
 
 ### Worker protocol/version mismatch
 
@@ -659,8 +656,8 @@ Rebuild-нете companion worker-а със съответния source код �
 
 Положителната `*_worker_timeout_seconds` стойност ограничава целия процес,
 включително startup и solve. Ако тя е по-малка или почти равна на solver
-лимита, увеличете я или задайте `0` за автоматичния margin. PyVRP startup
-self-check има отделен максимум 60 секунди.
+лимита, увеличете я или задайте `0` за автоматичния margin. Ръчната/build
+проверка на worker допуска до 180 секунди за студен onefile старт.
 
 ### Недостатъчно RAM/pagefile
 

@@ -51,9 +51,7 @@ def _build_command() -> list[str]:
         "PyInstaller",
         "--clean",
         "--noconfirm",
-        "--onedir",
-        "--contents-directory",
-        "_internal",
+        "--onefile",
         "--console",
         "--name",
         WORKER_NAME,
@@ -94,7 +92,7 @@ def _verify(executable: Path, expected_version: str) -> None:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=180,
     )
     metadata = _last_json_object(completed.stdout)
     if (
@@ -113,13 +111,10 @@ def main() -> int:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     SPEC_DIR.mkdir(parents=True, exist_ok=True)
 
-    executable = WORKER_PACKAGE_DIR / (
-        f"{WORKER_NAME}.exe" if os.name == "nt" else WORKER_NAME
-    )
+    executable = DIST_DIR / (f"{WORKER_NAME}.exe" if os.name == "nt" else WORKER_NAME)
     if WORKER_PACKAGE_DIR.exists():
         shutil.rmtree(WORKER_PACKAGE_DIR)
-    legacy = DIST_DIR / (f"{WORKER_NAME}.exe" if os.name == "nt" else WORKER_NAME)
-    legacy.unlink(missing_ok=True)
+    executable.unlink(missing_ok=True)
 
     env = os.environ.copy()
     env.setdefault("SOURCE_DATE_EPOCH", "1700000000")
@@ -132,7 +127,7 @@ def main() -> int:
         raise SystemExit(f"PyInstaller did not create the VROOM worker: {executable}")
     try:
         _verify(executable, version)
-    except (subprocess.SubprocessError, RuntimeError) as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         raise SystemExit(f"Frozen VROOM worker self-check failed: {exc}") from exc
 
     print(f"VROOM worker created and verified: {executable}")

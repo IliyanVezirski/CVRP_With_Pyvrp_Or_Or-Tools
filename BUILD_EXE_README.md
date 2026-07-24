@@ -16,9 +16,9 @@ cd "D:\Iliyan\bizant_source"
 По подразбиране release-ът се създава в `D:\Iliyan\dist`. `build_exe.py` изгражда и проверява:
 
 - `Bizant.exe`;
-- `pyvrp-next\CVRP_PyVRP_Next_Worker\CVRP_PyVRP_Next_Worker.exe`;
-- `vroom\CVRP_VROOM_Worker\CVRP_VROOM_Worker.exe`;
-- `vrp-rust\CVRP_VRP_Rust_Worker\CVRP_VRP_Rust_Worker.exe`.
+- `pyvrp-next\CVRP_PyVRP_Next_Worker.exe`;
+- `vroom\CVRP_VROOM_Worker.exe`;
+- `vrp-rust\CVRP_VRP_Rust_Worker.exe`.
 
 Ако някоя задължителна изолирана среда/worker липсва, build-ът трябва да спре с ясна грешка. Не разпространявай само главния EXE — нужна е цялата `dist` директория.
 
@@ -46,7 +46,7 @@ $env:CVRP_PRESERVE_DIST_CONFIG = "1"
 
 След build:
 
-1. Провери, че всички worker директории съществуват.
+1. Провери, че всички worker EXE файлове съществуват.
 2. Изпълни worker self-check командите от пълното ръководство.
 3. Стартирай `Settings.bat` и виж правилния `config.py`.
 4. Стартирай `start_api_server.bat` и извикай `GET /health`.

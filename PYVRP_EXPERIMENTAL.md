@@ -91,20 +91,23 @@ $env:CVRP_DIST_DIR = "D:\Iliyan\dist_candidate"
 
 Главният `build_exe.py` извиква worker build-а автоматично и отказва release, ако self-check/version проверката не мине.
 
-Предпочитаният worker е PyInstaller `onedir`, защото parallel solve не разархивира голям onefile пакет за всеки процес. Runtime-ът пази съвместимост и със стария flat path.
+Актуалният worker е PyInstaller `onefile` на flat path. Това позволява новият
+неподписан build да се стартира и на Windows системи, на които Smart App Control
+блокира генерираната `onedir` структура. Runtime-ът пази съвместимост и със
+стария `onedir` layout.
 
 ## 5. Self-check
 
 За готов build използвай точния път от [build ръководството](docs/INSTALLATION_BUILD_OUTPUTS.md), например:
 
 ```powershell
-& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker\CVRP_PyVRP_Next_Worker.exe" --self-check
+& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker.exe" --self-check
 ```
 
-При стар flat layout:
+При legacy `onedir` layout runtime-ът разпознава и:
 
 ```powershell
-& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker.exe" --self-check
+& "D:\Iliyan\dist\pyvrp-next\CVRP_PyVRP_Next_Worker\CVRP_PyVRP_Next_Worker.exe" --self-check
 ```
 
 Успехът връща JSON metadata с `ok=true`, protocol/backend, PyVRP version и `capabilities.hard_mandatory_customers=true`. Нормалният solve не пуска отделен self-check subprocess преди всяка задача; response envelope-ът се валидира при самото изпълнение.
@@ -187,7 +190,10 @@ Worker-ът е от друг build, библиотеката не е 0.14.x ил
 
 ### Бавно начало
 
-Onedir worker-ът избягва onefile unpack overhead. Antivirus scan, студен disk cache и много parallel worker-и могат да забавят първото зареждане.
+Onefile worker-ът може да има еднократно unpack забавяне при стартиране.
+Antivirus scan, студен disk cache и много parallel worker-и могат допълнително
+да забавят първото зареждане. Нормалният solve не пуска отделен pre-flight
+self-check, затова това забавяне не се плаща втори път преди същата задача.
 
 ### RAM/pagefile/OpenBLAS failure
 
