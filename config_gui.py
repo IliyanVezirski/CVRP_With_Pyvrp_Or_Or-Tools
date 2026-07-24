@@ -9,11 +9,17 @@ import copy
 import sys
 import os
 import importlib
+import ipaddress
 import json
+import re
+import shutil
 import socket
+import tempfile
 import threading
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 # Добавяме текущата директория в path
 if getattr(sys, 'frozen', False):
@@ -22,25 +28,65 @@ else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _base_dir)
 import config
+from web_gui_auth import CredentialStore, CredentialStoreError, CredentialValidationError
+
+
+_WEB_GUI_PASSWORD_MIN_LENGTH = 8
+
+
+def _validate_web_gui_credential_form(username, password, confirmation):
+    """Validate credential form data without changing password characters."""
+    normalized_username = str(username or "").strip()
+    if not normalized_username:
+        raise ValueError("Попълни потребителско име.")
+    if password == "":
+        raise ValueError("Попълни парола.")
+    if password != confirmation:
+        raise ValueError("Паролата и потвърждението не съвпадат.")
+    if len(password) < _WEB_GUI_PASSWORD_MIN_LENGTH:
+        raise ValueError(
+            f"Паролата трябва да е поне {_WEB_GUI_PASSWORD_MIN_LENGTH} знака."
+        )
+    return normalized_username, password
 
 
 class ConfigGUI:
     """Графичен интерфейс за config.py"""
 
-    # Български етикети за секциите и полетата
-    SECTION_LABELS = {
-        "input": "📥 Входни данни",
-        "vehicles": "🚐 Превозни средства",
-        "warehouse": "🏭 Предварителна оптимизация",
-        "cvrp": "⚙️ Солвър (CVRP)",
-        "locations": "📍 Локации",
+    SOLVER_LABELS = {
+        "pyvrp": "PyVRP 0.13",
+        "pyvrp_experimental": "PyVRP 0.14",
+        "or_tools": "OR-Tools",
+        "vroom": "VROOM 1.15",
+        "vrp": "VRP-Rust (experimental)",
     }
+    SOLVER_VALUES_BY_LABEL = {label: value for value, label in SOLVER_LABELS.items()}
+
+    SECTION_LABELS = {
+        "input": "Входни данни",
+        "vehicles": "Превозни средства",
+        "warehouse": "Предварителна оптимизация",
+        "cvrp": "Решител (CVRP)",
+        "locations": "Локации и зони",
+        "output": "Резултати",
+        "advanced": "Разширени",
+    }
+
+    SECTION_NAVIGATION = (
+        ("01", "Входни данни", "Източник, JSON и Excel"),
+        ("02", "Превозни средства", "Капацитети, депа и смени"),
+        ("03", "Предварителна оптимизация", "Склад и филтриране"),
+        ("04", "Решител", "Цел, ограничения и PyVRP"),
+        ("05", "Локации и зони", "Депа, трафик и център"),
+        ("06", "Резултати", "Карти, Excel и upload"),
+        ("07", "Разширени", "API, setData и автоматизация"),
+    )
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CVRP Настройки")
-        self.root.geometry("1180x820")
-        self.root.minsize(1000, 700)
+        self.root.geometry("1320x860")
+        self.root.minsize(1120, 720)
         self.root.resizable(True, True)
         self._configure_style()
 
@@ -48,21 +94,59 @@ class ConfigGUI:
         importlib.reload(config)
         self.cfg = config.get_config()
         self.widgets = {}  # field_key → widget
-        self.status_var = tk.StringVar(value="Готово")
+        self.controls = {}  # field_key → visible input control
+        self.control_default_states = {}
+        self.status_var = tk.StringVar(value="Настройките са заредени")
+        self.dirty_var = tk.StringVar(value="Всички промени са запазени")
+        self.validation_var = tk.StringVar(value="Не е проверено")
+        self.is_dirty = False
+        self._tracking_ready = False
+        self._saved_snapshot = {}
+        self.main_notebook = None
+        self.nav_buttons = []
+        self.setting_search_var = tk.StringVar(value="")
+        self.save_button = None
+        self.reset_button = None
         self.vehicle_container = None
+        self.vehicle_tree = None
         self.vehicle_next_index = 0
         self.depot_choice_widgets = []
+        self.depot_listbox = None
+        self.depot_tree = None
         self.traffic_zone_listbox = None
+        self.traffic_zone_tree = None
         self.center_zone_listbox = None
+        self.center_zone_tree = None
         self.center_zone_priority_vars = {}
         self.center_zone_restricted_vars = {}
+        self.solver_fine_panels = {}
+        self.solver_fine_anchor = None
+        self.pyvrp_parallel_specific = None
+        self.ortools_parallel_specific = None
+        self._web_gui_credential_store = None
+        self.web_gui_users_tree = None
+        self.web_gui_users_status_var = None
 
         self._build_ui()
+        self._saved_snapshot = copy.deepcopy(self._collect_values())
+        self._setup_dirty_tracking()
+        self._setup_conditional_controls()
+        self._set_dirty(False)
+        self.root.protocol("WM_DELETE_WINDOW", self._request_close)
+        self.root.bind("<Control-s>", lambda event: self._save())
+        self.root.bind("<Control-Return>", lambda event: self._validate_from_ui())
+        self.root.bind("<F5>", lambda event: self._validate_from_ui())
+        self.root.bind_all("<MouseWheel>", self._dispatch_mousewheel, add="+")
+        for index in range(len(self.SECTION_NAVIGATION)):
+            self.root.bind(
+                f"<Alt-Key-{index + 1}>",
+                lambda event, section_index=index: self._select_section(section_index),
+            )
 
     # ── UI ────────────────────────────────────────────────────
 
     def _configure_style(self):
-        self.root.configure(bg="#eef2f6")
+        self.root.configure(bg="#f3f6fb")
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -70,50 +154,91 @@ class ConfigGUI:
             pass
 
         self.root.option_add("*Font", ("Segoe UI", 9))
-        style.configure("TFrame", background="#eef2f6")
+        style.configure("TFrame", background="#f3f6fb")
         style.configure("Toolbar.TFrame", background="#ffffff")
         style.configure("Surface.TFrame", background="#ffffff")
-        style.configure("TLabel", background="#eef2f6", foreground="#1f2933")
-        style.configure("Surface.TLabel", background="#ffffff", foreground="#1f2933")
-        style.configure("Hint.TLabel", background="#ffffff", foreground="#667085", font=("Segoe UI", 8))
-        style.configure("Status.TLabel", background="#ffffff", foreground="#475467", font=("Segoe UI", 8))
-        style.configure("AppTitle.TLabel", background="#ffffff", foreground="#111827", font=("Segoe UI", 15, "bold"))
-        style.configure("AppSubtitle.TLabel", background="#ffffff", foreground="#667085", font=("Segoe UI", 8))
-        style.configure("TLabelframe", background="#ffffff", bordercolor="#d0d5dd", relief="solid")
-        style.configure("TLabelframe.Label", background="#ffffff", foreground="#111827", font=("Segoe UI", 10, "bold"))
-        style.configure("TButton", padding=(10, 6))
-        style.configure("Primary.TButton", padding=(12, 7), foreground="#ffffff", background="#2563eb")
-        style.map("Primary.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
-        style.configure("TEntry", padding=(6, 4))
-        style.configure("TCombobox", padding=(6, 4))
-        style.configure("TNotebook", background="#eef2f6", borderwidth=0)
+        style.configure("Sidebar.TFrame", background="#172033")
+        style.configure("TLabel", background="#f3f6fb", foreground="#243044")
+        style.configure("Surface.TLabel", background="#ffffff", foreground="#243044")
+        style.configure("Hint.TLabel", background="#ffffff", foreground="#68758a", font=("Segoe UI", 8))
+        style.configure("Status.TLabel", background="#ffffff", foreground="#526077", font=("Segoe UI", 9))
+        style.configure("Dirty.TLabel", background="#ffffff", foreground="#b45309", font=("Segoe UI", 9, "bold"))
+        style.configure("Clean.TLabel", background="#ffffff", foreground="#15803d", font=("Segoe UI", 9, "bold"))
+        style.configure("SidebarTitle.TLabel", background="#172033", foreground="#ffffff", font=("Segoe UI", 10, "bold"))
+        style.configure("SidebarHint.TLabel", background="#172033", foreground="#9eabc0", font=("Segoe UI", 8))
+        style.configure("AppTitle.TLabel", background="#ffffff", foreground="#101828", font=("Segoe UI", 17, "bold"))
+        style.configure("AppSubtitle.TLabel", background="#ffffff", foreground="#68758a", font=("Segoe UI", 9))
+        style.configure("TLabelframe", background="#ffffff", bordercolor="#d7deea", relief="solid")
+        style.configure("TLabelframe.Label", background="#ffffff", foreground="#172033", font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=(11, 7), font=("Segoe UI", 9))
+        style.configure("Primary.TButton", padding=(14, 8), foreground="#ffffff", background="#2563eb", bordercolor="#2563eb")
+        style.map(
+            "Primary.TButton",
+            background=[("disabled", "#9db8f2"), ("active", "#1d4ed8"), ("pressed", "#1e40af")],
+            foreground=[("disabled", "#eef4ff"), ("!disabled", "#ffffff")],
+        )
+        style.configure("Secondary.TButton", foreground="#243044", background="#ffffff", bordercolor="#cbd5e1")
+        style.map("Secondary.TButton", background=[("active", "#f1f5f9"), ("pressed", "#e2e8f0")])
+        style.configure("Danger.TButton", foreground="#b42318", background="#fff5f4", bordercolor="#f5b7b1")
+        style.map("Danger.TButton", background=[("active", "#fee4e2"), ("pressed", "#fecdca")])
+        style.configure("Nav.TButton", anchor="w", padding=(14, 9), foreground="#cbd5e1", background="#172033", borderwidth=0)
+        style.configure("NavSelected.TButton", anchor="w", padding=(14, 9), foreground="#ffffff", background="#2563eb", borderwidth=0)
+        style.map("Nav.TButton", background=[("active", "#263249")], foreground=[("active", "#ffffff")])
+        style.map("NavSelected.TButton", background=[("active", "#1d4ed8")])
+        style.configure("TEntry", padding=(7, 5), fieldbackground="#ffffff", bordercolor="#cbd5e1")
+        style.configure("TCombobox", padding=(7, 5), fieldbackground="#ffffff", bordercolor="#cbd5e1")
+        style.configure("Invalid.TEntry", padding=(7, 5), fieldbackground="#fff7f6", bordercolor="#d92d20")
+        style.configure("Invalid.TCombobox", padding=(7, 5), fieldbackground="#fff7f6", bordercolor="#d92d20")
+        style.configure("TCheckbutton", background="#ffffff", foreground="#243044")
+        style.map("TCheckbutton", background=[("active", "#ffffff")])
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#243044", rowheight=28, bordercolor="#d7deea")
+        style.configure("Treeview.Heading", background="#eef2f7", foreground="#344054", font=("Segoe UI", 9, "bold"), padding=(6, 7))
+        style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", "#1e3a8a")])
+        style.configure("TNotebook", background="#f3f6fb", borderwidth=0)
         style.configure("TNotebook.Tab", padding=(14, 8))
         style.map("TNotebook.Tab", background=[("selected", "#ffffff")], foreground=[("selected", "#111827")])
+        style.configure("Sidebar.TNotebook", background="#f3f6fb", borderwidth=0, tabmargins=0)
+        style.layout("Sidebar.TNotebook.Tab", [])
 
     def _build_ui(self):
-        # Toolbar
-        toolbar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(14, 10))
+        toolbar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(18, 12))
         toolbar.pack(fill="x")
 
         title_box = ttk.Frame(toolbar, style="Toolbar.TFrame")
         title_box.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_box, text="CVRP настройки", style="AppTitle.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text="CVRP Control Center", style="AppTitle.TLabel").pack(anchor="w")
         ttk.Label(
             title_box,
-            text="Редакция на основните параметри за входни данни, бусове, решители и output.",
+            text="Единно място за входни данни, автопарк, оптимизация, зони, API и резултати.",
             style="AppSubtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
         actions = ttk.Frame(toolbar, style="Toolbar.TFrame")
         actions.pack(side="right")
-        ttk.Button(actions, text="Запази", command=self._save).pack(side="left", padx=3)
-        ttk.Button(actions, text="Запази и затвори", command=self._save_and_close, style="Primary.TButton").pack(side="left", padx=3)
-        ttk.Button(actions, text="Запази и стартирай", command=self._save_and_run).pack(side="left", padx=3)
-        ttk.Button(actions, text="Отказ", command=self.root.destroy).pack(side="left", padx=(10, 0))
+        ttk.Button(actions, text="Провери", command=self._validate_from_ui, style="Secondary.TButton").pack(side="left", padx=3)
+        self.reset_button = ttk.Button(actions, text="Отмени промените", command=self._reset_changes, style="Secondary.TButton")
+        self.reset_button.pack(side="left", padx=3)
+        self.save_button = ttk.Button(actions, text="Запази", command=self._save, style="Primary.TButton")
+        self.save_button.pack(side="left", padx=(10, 3))
+        ttk.Button(actions, text="Запази и затвори", command=self._save_and_close, style="Secondary.TButton").pack(side="left", padx=3)
+        ttk.Button(actions, text="Запази и стартирай", command=self._save_and_run, style="Secondary.TButton").pack(side="left", padx=3)
+        ttk.Button(actions, text="Затвори", command=self._request_close, style="Danger.TButton").pack(side="left", padx=(10, 0))
 
-        # Notebook (tabs)
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=12, pady=(12, 8))
+        workspace = ttk.Frame(self.root)
+        workspace.pack(fill="both", expand=True)
+
+        sidebar = ttk.Frame(workspace, style="Sidebar.TFrame", width=230, padding=(12, 16))
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        ttk.Label(sidebar, text="НАСТРОЙКИ", style="SidebarTitle.TLabel").pack(anchor="w", padx=8, pady=(0, 2))
+        ttk.Label(sidebar, text="Alt+1 … Alt+7 за бърза навигация", style="SidebarHint.TLabel").pack(anchor="w", padx=8, pady=(0, 14))
+
+        content = ttk.Frame(workspace)
+        content.pack(side="left", fill="both", expand=True, padx=(12, 12), pady=(12, 8))
+
+        nb = ttk.Notebook(content, style="Sidebar.TNotebook")
+        nb.pack(fill="both", expand=True)
+        self.main_notebook = nb
 
         # ─── Tab 1: Входни данни ───
         self._add_input_tab(nb)
@@ -136,11 +261,695 @@ class ConfigGUI:
         # ─── Last: Advanced/reference tools ───
         self._add_advanced_tab(nb)
 
-        status_bar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(14, 7))
+        for index, (number, title, subtitle) in enumerate(self.SECTION_NAVIGATION):
+            button = ttk.Button(
+                sidebar,
+                text=f"{number}   {title}\n       {subtitle}",
+                style="Nav.TButton",
+                command=lambda section_index=index: self._select_section(section_index),
+            )
+            button.pack(fill="x", pady=2)
+            self.nav_buttons.append(button)
+        ttk.Separator(sidebar, orient="horizontal").pack(fill="x", padx=8, pady=(18, 12))
+        ttk.Label(sidebar, text="НАМЕРИ НАСТРОЙКА", style="SidebarTitle.TLabel").pack(anchor="w", padx=8, pady=(0, 6))
+        search_combo = ttk.Combobox(
+            sidebar,
+            textvariable=self.setting_search_var,
+            values=sorted(self.controls),
+            state="normal",
+            width=26,
+        )
+        search_combo.pack(fill="x", padx=8)
+        search_combo.bind("<<ComboboxSelected>>", self._jump_to_setting)
+        search_combo.bind("<Return>", self._jump_to_setting)
+        ttk.Label(
+            sidebar,
+            text="Въведи част от името и натисни Enter.",
+            style="SidebarHint.TLabel",
+        ).pack(anchor="w", padx=8, pady=(5, 0))
+        self._select_section(0)
+
+        status_bar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(18, 8))
         status_bar.pack(fill="x", side="bottom")
         ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel").pack(side="left")
+        ttk.Label(
+            status_bar,
+            text=os.path.join(_base_dir, "config.py"),
+            style="Status.TLabel",
+        ).pack(side="right")
+        self.dirty_label = ttk.Label(status_bar, textvariable=self.dirty_var, style="Clean.TLabel")
+        self.dirty_label.pack(side="right", padx=(16, 20))
+        ttk.Label(status_bar, textvariable=self.validation_var, style="Status.TLabel").pack(side="right")
+
+    def _select_section(self, index):
+        if self.main_notebook is None:
+            return
+        tabs = self.main_notebook.tabs()
+        if not 0 <= int(index) < len(tabs):
+            return
+        self.main_notebook.select(int(index))
+        for button_index, button in enumerate(self.nav_buttons):
+            button.configure(style="NavSelected.TButton" if button_index == int(index) else "Nav.TButton")
+        if 0 <= int(index) < len(self.SECTION_NAVIGATION):
+            self.status_var.set(f"Отворена секция: {self.SECTION_NAVIGATION[int(index)][1]}")
+
+    def _section_index_for_control(self, control):
+        if self.main_notebook is None or control is None:
+            return None
+        control_path = str(control)
+        for index, tab_id in enumerate(self.main_notebook.tabs()):
+            if control_path == tab_id or control_path.startswith(f"{tab_id}."):
+                return index
+        return None
+
+    def _jump_to_setting(self, event=None):
+        query = self.setting_search_var.get().strip().lower()
+        if not query:
+            return
+        exact = next((key for key in self.controls if key.lower() == query), None)
+        key = exact or next((key for key in sorted(self.controls) if query in key.lower()), None)
+        if key is None:
+            self.status_var.set(f"Не е намерена настройка: {query}")
+            return
+        self.setting_search_var.set(key)
+        control = self.controls[key]
+        section_index = self._section_index_for_control(control)
+        if section_index is not None:
+            self._select_section(section_index)
+        try:
+            control.focus_set()
+        except tk.TclError:
+            pass
+        self.status_var.set(f"Намерена настройка: {key}")
+
+    def _set_dirty(self, dirty):
+        self.is_dirty = bool(dirty)
+        if self.is_dirty:
+            self.dirty_var.set("Незаписани промени")
+            self.dirty_label.configure(style="Dirty.TLabel")
+            self.root.title("CVRP Настройки •")
+            if self.save_button is not None:
+                self.save_button.configure(state="normal")
+            if self.reset_button is not None:
+                self.reset_button.configure(state="normal")
+        else:
+            self.dirty_var.set("Всички промени са запазени")
+            self.dirty_label.configure(style="Clean.TLabel")
+            self.root.title("CVRP Настройки")
+            if self.save_button is not None:
+                self.save_button.configure(state="disabled")
+            if self.reset_button is not None:
+                self.reset_button.configure(state="disabled")
+
+    def _mark_dirty(self, *_args):
+        if not self._tracking_ready:
+            return
+        self.validation_var.set("Има непроверени промени")
+        self._set_dirty(True)
+
+    def _on_tracked_text_modified(self, widget):
+        if not widget.edit_modified():
+            return
+        widget.edit_modified(False)
+        self._mark_dirty()
+
+    def _setup_dirty_tracking(self):
+        seen = set()
+        for value_holder in self.widgets.values():
+            holder_id = id(value_holder)
+            if holder_id in seen:
+                continue
+            seen.add(holder_id)
+            if isinstance(value_holder, tk.Variable):
+                value_holder.trace_add("write", self._mark_dirty)
+            elif isinstance(value_holder, tk.Text):
+                value_holder.edit_modified(False)
+                value_holder.bind(
+                    "<<Modified>>",
+                    lambda event, widget=value_holder: self._on_tracked_text_modified(widget),
+                    add="+",
+                )
+        self._tracking_ready = True
+
+    def _resume_dirty_tracking_after_restore(self):
+        """Resume change tracking after Tk has delivered pending Text events.
+
+        Programmatic delete/insert operations queue ``<<Modified>>`` events.
+        Keeping tracking suspended until the idle queue is drained prevents a
+        successful reset from immediately marking the form dirty again.
+        """
+        for value_holder in self.widgets.values():
+            if isinstance(value_holder, tk.Text):
+                try:
+                    value_holder.edit_modified(False)
+                except tk.TclError:
+                    pass
+        self._tracking_ready = True
+
+    def _set_control_enabled(self, key, enabled):
+        control = self.controls.get(key)
+        if control is None:
+            return
+        target_state = self.control_default_states.get(key, "normal") if enabled else "disabled"
+        try:
+            control.configure(state=target_state)
+        except tk.TclError:
+            pass
+
+    def _setup_conditional_controls(self):
+        dependency_keys = (
+            "input.input_source",
+            "cvrp.solver_type",
+            "routing.engine",
+            "output.route_maps_upload_mode",
+            "output.map_provider",
+            "set_data.enable_set_data_upload",
+            "api.web_gui_enabled",
+            "api.tsp_use_time_windows",
+        )
+        for key in dependency_keys:
+            value_holder = self.widgets.get(key)
+            if isinstance(value_holder, tk.Variable):
+                value_holder.trace_add("write", lambda *_args: self._update_conditional_controls())
+        self._update_conditional_controls()
+
+    def _update_conditional_controls(self):
+        def current(key, default=""):
+            holder = self.widgets.get(key)
+            if holder is None:
+                return default
+            try:
+                return holder.get()
+            except (tk.TclError, AttributeError):
+                return default
+
+        input_source = str(current("input.input_source", "http_json")).strip().lower()
+        for key in self.controls:
+            if key.startswith("input.json_"):
+                self._set_control_enabled(key, input_source == "http_json")
+            elif key.startswith("input.") and key in {
+                "input.excel_file_path", "input.gps_column", "input.client_id_column",
+                "input.client_name_column", "input.volume_column", "input.document_column",
+                "input.time_window_column", "input.delivery_comment_column", "input.mandatory_column",
+            }:
+                self._set_control_enabled(key, input_source == "excel")
+
+        engine = str(current("routing.engine", "osrm")).strip().lower()
+        for key in self.controls:
+            if key.startswith("osrm."):
+                self._set_control_enabled(key, engine == "osrm")
+            elif key.startswith("valhalla."):
+                self._set_control_enabled(key, engine == "valhalla")
+
+        upload_enabled = str(current("output.route_maps_upload_mode", "disabled")).strip().lower() in {
+            "effect", "effect_upload", "upload", "new",
+        }
+        for key in (
+            "output.route_maps_upload_url",
+            "output.route_maps_upload_token",
+            "output.route_maps_upload_token_field",
+            "output.route_maps_upload_file_field",
+            "output.route_maps_upload_bus_id_field",
+            "output.route_maps_upload_timeout_seconds",
+        ):
+            self._set_control_enabled(key, upload_enabled)
+
+        google_enabled = str(current("output.map_provider", "osm")).strip().lower() == "google"
+        self._set_control_enabled("output.google_maps_api_key", google_enabled)
+        self._set_control_enabled("output.folium_tiles", not google_enabled)
+
+        set_data_enabled = bool(current("set_data.enable_set_data_upload", False))
+        for key in self.controls:
+            if key.startswith("set_data.") and key != "set_data.enable_set_data_upload":
+                self._set_control_enabled(key, set_data_enabled)
+
+        web_gui_enabled = bool(current("api.web_gui_enabled", False))
+        for key in self.controls:
+            if key.startswith("api.web_gui_") and key != "api.web_gui_enabled":
+                self._set_control_enabled(key, web_gui_enabled)
+
+        tsp_windows_enabled = bool(current("api.tsp_use_time_windows", True))
+        for key in ("api.tsp_time_window_wait_weight", "api.tsp_time_window_late_weight"):
+            self._set_control_enabled(key, tsp_windows_enabled)
+
+        self._show_solver_fine_settings(current("cvrp.solver_type", "pyvrp"))
+
+    def _show_solver_fine_settings(self, solver_value=None):
+        """Shows only the fine-tuning groups used by the selected solver."""
+        panels = getattr(self, "solver_fine_panels", None) or {}
+        anchor = getattr(self, "solver_fine_anchor", None)
+        if not panels or anchor is None:
+            return
+
+        solver_type = str(solver_value or "pyvrp").strip()
+        solver_type = self.SOLVER_VALUES_BY_LABEL.get(solver_type, solver_type).lower()
+        selected_panels = panels.get(solver_type, panels.get("pyvrp", ()))
+
+        for panel in {panel for solver_panels in panels.values() for panel in solver_panels}:
+            panel.pack_forget()
+
+        pyvrp_parallel = getattr(self, "pyvrp_parallel_specific", None)
+        ortools_parallel = getattr(self, "ortools_parallel_specific", None)
+        if pyvrp_parallel is not None:
+            if solver_type in {"pyvrp", "pyvrp_experimental"}:
+                pyvrp_parallel.grid()
+            else:
+                pyvrp_parallel.grid_remove()
+        if ortools_parallel is not None:
+            if solver_type == "or_tools":
+                ortools_parallel.grid()
+            else:
+                ortools_parallel.grid_remove()
+
+        for panel in selected_panels:
+            panel.pack(
+                fill="x",
+                expand=True,
+                padx=2,
+                pady=(0, 14),
+                before=anchor,
+            )
+
+    def _restore_values(self, snapshot):
+        self._tracking_ready = False
+        try:
+            for key, value in snapshot.items():
+                holder = self.widgets.get(key)
+                if key == "cvrp.solver_type":
+                    value = self.SOLVER_LABELS.get(value, value)
+                if isinstance(holder, tk.Variable):
+                    holder.set(value)
+                elif isinstance(holder, tk.Text):
+                    previous_state = str(holder.cget("state"))
+                    if previous_state == "disabled":
+                        holder.configure(state="normal")
+                    holder.delete("1.0", "end")
+                    holder.insert("1.0", "" if value is None else str(value))
+                    holder.edit_modified(False)
+                    if previous_state == "disabled":
+                        holder.configure(state="disabled")
+
+            if "locations.depot_locations" in snapshot:
+                self._sync_depot_widgets(self._parse_depots_text(snapshot["locations.depot_locations"]))
+            if "locations.traffic_zones" in snapshot:
+                self._sync_traffic_zone_widgets(self._parse_traffic_zones_text(snapshot["locations.traffic_zones"]))
+            if "locations.center_zones" in snapshot:
+                self._sync_center_zone_widgets(self._parse_center_zones_text(snapshot["locations.center_zones"]))
+            if "api.tsp_valhalla_truck_profiles" in snapshot:
+                self._sync_tsp_truck_profiles_widgets(
+                    self._parse_tsp_truck_profiles_text(snapshot["api.tsp_valhalla_truck_profiles"])
+                )
+            self._sync_vehicle_tree_from_widgets()
+        finally:
+            self.root.after_idle(self._resume_dirty_tracking_after_restore)
+        self._update_conditional_controls()
+
+    def _reset_changes(self):
+        if not self.is_dirty:
+            return
+        if not messagebox.askyesno("Отмяна на промените", "Да върна ли всички полета до последно запазеното състояние?"):
+            return
+        self._restore_values(copy.deepcopy(self._saved_snapshot))
+        self.validation_var.set("Не е проверено")
+        self.status_var.set("Промените са отменени")
+        self._set_dirty(False)
+
+    def _request_close(self):
+        if not self.is_dirty:
+            self.root.destroy()
+            return
+        choice = messagebox.askyesnocancel(
+            "Незаписани промени",
+            "Има незапазени промени. Да ги запазя ли преди затваряне?",
+        )
+        if choice is None:
+            return
+        if choice and not self._save_config(show_success=False):
+            return
+        self.root.destroy()
+
+    def _reset_validation_styles(self):
+        for control in self.controls.values():
+            try:
+                if isinstance(control, ttk.Entry):
+                    control.configure(style="TEntry")
+                elif isinstance(control, ttk.Combobox):
+                    control.configure(style="TCombobox")
+            except tk.TclError:
+                pass
+
+    def _mark_invalid_control(self, key):
+        control = self.controls.get(key)
+        if control is None:
+            return
+        try:
+            if isinstance(control, ttk.Entry):
+                control.configure(style="Invalid.TEntry")
+            elif isinstance(control, ttk.Combobox):
+                control.configure(style="Invalid.TCombobox")
+        except tk.TclError:
+            pass
+
+    def _validate_values(self, values):
+        errors = []
+        warnings = []
+
+        def text_value(key, default=""):
+            value = values.get(key, default)
+            return str(value or "").strip()
+
+        def require_number(key, label, minimum=None, maximum=None, integer=False, optional=False):
+            if key not in values:
+                return None
+            raw = text_value(key)
+            if optional and not raw:
+                return None
+            try:
+                number = int(raw) if integer else float(raw)
+            except (TypeError, ValueError):
+                errors.append((key, f"{label}: въведи валидно {'цяло число' if integer else 'число'}."))
+                return None
+            if minimum is not None and number < minimum:
+                errors.append((key, f"{label}: минималната стойност е {minimum}."))
+            if maximum is not None and number > maximum:
+                errors.append((key, f"{label}: максималната стойност е {maximum}."))
+            return number
+
+        require_number("api.api_port", "API порт", 1, 65535, integer=True)
+        require_number("input.json_timeout_seconds", "HTTP JSON timeout", 1, 3600, integer=True)
+        require_number("cvrp.time_limit_seconds", "Времеви лимит на решителя", 1, 86400, integer=True)
+        require_number(
+            "cvrp.pyvrp_next_worker_timeout_seconds",
+            "PyVRP experimental worker timeout",
+            0,
+            86400,
+            integer=True,
+        )
+        require_number(
+            "cvrp.vroom_worker_timeout_seconds",
+            "VROOM worker timeout",
+            0,
+            86400,
+            integer=True,
+        )
+        require_number("cvrp.vroom_threads", "VROOM threads", 0, 256, integer=True)
+        require_number(
+            "cvrp.vrp_worker_timeout_seconds",
+            "VRP-Rust worker timeout",
+            0,
+            86400,
+            integer=True,
+        )
+        require_number("cvrp.vrp_threads", "VRP-Rust threads", 0, 256, integer=True)
+        require_number(
+            "cvrp.vrp_max_generations",
+            "VRP-Rust maximum generations",
+            1,
+            1000000000000,
+            integer=True,
+        )
+        require_number(
+            "cvrp.vroom_exploration_level",
+            "VROOM exploration level",
+            0,
+            5,
+            integer=True,
+        )
+        require_number("cvrp.pyvrp_num_neighbours", "PyVRP съседи", 1, 10000, integer=True)
+        require_number("cvrp.pyvrp_weight_wait_time", "PyVRP тежест на чакането", 0, 1000)
+        require_number("cvrp.pyvrp_ils_no_improvement", "PyVRP ILS без подобрение", 0, 1000000000, integer=True)
+        require_number("cvrp.pyvrp_ils_history_length", "PyVRP ILS история", 1, 10000000, integer=True)
+        min_perturbations = require_number(
+            "cvrp.pyvrp_min_perturbations", "PyVRP минимални perturbations", 1, 1000000, integer=True
+        )
+        max_perturbations = require_number(
+            "cvrp.pyvrp_max_perturbations", "PyVRP максимални perturbations", 1, 1000000, integer=True
+        )
+        if (
+            min_perturbations is not None
+            and max_perturbations is not None
+            and min_perturbations > max_perturbations
+        ):
+            errors.append((
+                "cvrp.pyvrp_max_perturbations",
+                "PyVRP максималните perturbations трябва да са поне колкото минималните.",
+            ))
+        require_number("cvrp.pyvrp_display_interval_seconds", "PyVRP progress интервал", 0.1, 3600)
+        require_number(
+            "cvrp.pyvrp_penalty_solutions_between_updates",
+            "PyVRP penalty update интервал",
+            1,
+            1000000000,
+            integer=True,
+        )
+        require_number("cvrp.pyvrp_penalty_increase", "PyVRP penalty увеличение", 1, 1000)
+        require_number("cvrp.pyvrp_penalty_decrease", "PyVRP penalty намаление", 0, 1)
+        require_number("cvrp.pyvrp_penalty_target_feasible", "PyVRP target feasible", 0, 1)
+        require_number("cvrp.pyvrp_penalty_feas_tolerance", "PyVRP feasible tolerance", 0, 1)
+        penalty_min = require_number("cvrp.pyvrp_penalty_min", "PyVRP минимална penalty", 0, 1000000000)
+        penalty_max = require_number("cvrp.pyvrp_penalty_max", "PyVRP максимална penalty", 0, 1000000000)
+        if penalty_min is not None and penalty_max is not None and penalty_min > penalty_max:
+            errors.append((
+                "cvrp.pyvrp_penalty_max",
+                "PyVRP максималната penalty трябва да е поне колкото минималната.",
+            ))
+        workers = require_number("cvrp.num_workers", "Брой workers", -1, 128, integer=True)
+        if workers == 0 or (workers is not None and workers < -1):
+            errors.append(("cvrp.num_workers", "Брой workers трябва да бъде -1 или положително число."))
+        require_number("api.tsp_two_opt_max_passes", "TSP 2-opt обходи", 0, 10000, integer=True)
+        require_number("api.tsp_worker_timeout_seconds", "TSP worker timeout", 1, 86400, integer=True)
+        require_number("output.route_maps_upload_timeout_seconds", "Upload timeout", 1, 3600, integer=True)
+
+        start_minutes = require_number(
+            "cvrp.customer_time_window_default_start_minutes",
+            "Начало на стандартния работен прозорец",
+            0,
+            2879,
+            integer=True,
+        )
+        end_minutes = require_number(
+            "cvrp.customer_time_window_default_end_minutes",
+            "Край на стандартния работен прозорец",
+            0,
+            2879,
+            integer=True,
+        )
+        if start_minutes is not None and end_minutes is not None and start_minutes >= end_minutes:
+            errors.append((
+                "cvrp.customer_time_window_default_end_minutes",
+                "Краят на стандартния работен прозорец трябва да е след началото.",
+            ))
+
+        coordinate_keys = (
+            "locations.depot_location",
+            "locations.center_location",
+            "locations.vratza_depot_location",
+        )
+        for key in coordinate_keys:
+            raw = text_value(key)
+            coords = self._parse_coords_text(raw)
+            if not coords or not (-90 <= coords[0] <= 90 and -180 <= coords[1] <= 180):
+                errors.append((key, f"{key}: очакват се валидни координати lat, lon."))
+
+        for key, raw_value in values.items():
+            if not key.startswith("vehicle."):
+                continue
+            if key.endswith(".capacity"):
+                try:
+                    if float(raw_value) <= 0:
+                        errors.append((key, "Капацитетът на буса трябва да е положителен."))
+                except (TypeError, ValueError):
+                    errors.append((key, "Капацитетът на буса трябва да е число."))
+            elif key.endswith(".count"):
+                try:
+                    if int(float(raw_value)) < 0:
+                        errors.append((key, "Броят на бусовете не може да е отрицателен."))
+                except (TypeError, ValueError):
+                    errors.append((key, "Броят на бусовете трябва да е цяло число."))
+            elif key.endswith(".reload_time_minutes"):
+                try:
+                    if int(float(raw_value)) < 0:
+                        errors.append((key, "Времето за презареждане не може да е отрицателно."))
+                except (TypeError, ValueError):
+                    errors.append((key, "Времето за презареждане трябва да е цяло число."))
+            elif key.endswith(".max_customers_per_day") and str(raw_value or "").strip():
+                try:
+                    if int(float(raw_value)) < 1:
+                        errors.append((key, "Дневният лимит за клиенти трябва да е положителен."))
+                except (TypeError, ValueError):
+                    errors.append((key, "Дневният лимит за клиенти трябва да е цяло число."))
+
+        seen_vehicle_config_ids = set()
+        for key, raw_value in values.items():
+            if not key.startswith("vehicle.") or not key.endswith(".config_id"):
+                continue
+            prefix = key.rsplit(".", 1)[0]
+            if self._parse_bool_value(values.get(f"{prefix}.remove", False)):
+                continue
+            config_id = str(raw_value or "").strip()
+            if not config_id:
+                errors.append((key, "Стабилното ID на превозното средство е задължително."))
+            elif config_id in seen_vehicle_config_ids:
+                errors.append((key, f"Стабилното ID '{config_id}' се използва повече от веднъж."))
+            seen_vehicle_config_ids.add(config_id)
+
+        url_keys = (
+            "input.json_url",
+            "osrm.base_url",
+            "osrm.public_osrm_url",
+            "valhalla.base_url",
+            "output.route_maps_upload_url",
+            "set_data.set_data_url",
+            "api.api_public_url",
+            "api.web_gui_public_url",
+        )
+        for key in url_keys:
+            raw = text_value(key)
+            if not raw:
+                continue
+            parsed = urlparse(raw)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                errors.append((key, f"{key}: очаква се пълен http:// или https:// URL."))
+
+        for key in (
+            "api.api_endpoint",
+            "api.trigger_endpoint",
+            "api.saturday_trigger_endpoint",
+            "api.tsp_endpoint",
+            "api.tsp_report_endpoint",
+            "api.shutdown_endpoint",
+            "api.health_endpoint",
+            "api.web_gui_endpoint",
+        ):
+            raw = text_value(key)
+            if raw and not raw.startswith("/"):
+                errors.append((key, f"{key}: endpoint-ът трябва да започва с /."))
+
+        web_endpoint_raw = text_value("api.web_gui_endpoint")
+        web_endpoint = web_endpoint_raw.rstrip("/") or "/"
+        if web_endpoint_raw:
+            if web_endpoint == "/":
+                errors.append(("api.web_gui_endpoint", "Web GUI endpoint-ът не може да бъде коренът /."))
+            elif not re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]+", web_endpoint):
+                errors.append((
+                    "api.web_gui_endpoint",
+                    "Web GUI endpoint-ът съдържа невалидни знаци, интервал, query или fragment.",
+                ))
+            for key in (
+                "api.api_endpoint",
+                "api.trigger_endpoint",
+                "api.saturday_trigger_endpoint",
+                "api.tsp_endpoint",
+                "api.tsp_report_endpoint",
+                "api.shutdown_endpoint",
+                "api.health_endpoint",
+            ):
+                reserved = text_value(key).rstrip("/") or "/"
+                if reserved == web_endpoint or reserved.startswith(f"{web_endpoint}/"):
+                    errors.append((
+                        "api.web_gui_endpoint",
+                        f"Web GUI endpoint-ът се припокрива със запазения API endpoint {reserved}.",
+                    ))
+                    break
+
+        for proxy_item in re.split(r"[,;\s]+", text_value("api.web_gui_trusted_proxy_ips")):
+            if not proxy_item:
+                continue
+            try:
+                ipaddress.ip_network(proxy_item, strict=False)
+            except ValueError:
+                errors.append((
+                    "api.web_gui_trusted_proxy_ips",
+                    f"Невалиден доверен proxy IP/CIDR: {proxy_item}",
+                ))
+                break
+
+        routing_engine = text_value("routing.engine", "osrm").lower()
+        if routing_engine not in {"osrm", "valhalla"}:
+            errors.append(("routing.engine", "Routing engine трябва да бъде osrm или valhalla."))
+        solver_type = text_value("cvrp.solver_type", "pyvrp").lower()
+        if solver_type not in set(config.CVRP_SOLVER_TYPES):
+            errors.append((
+                "cvrp.solver_type",
+                "Решителят трябва да бъде pyvrp, pyvrp_experimental, or_tools, vroom или vrp.",
+            ))
+        if solver_type == "vroom" and self._parse_bool_value(
+            values.get("cvrp.enable_multiple_trips", False)
+        ):
+            errors.append((
+                "cvrp.enable_multiple_trips",
+                "VROOM 1.15 не поддържа свързани повторни курсове. Изключи повторните курсове или избери PyVRP/OR-Tools/VRP-Rust.",
+            ))
+
+        if text_value("locations.center_zone_mode", "circle").lower() == "circle":
+            require_number("locations.center_zone_radius_km", "Радиус на главната център зона", 0.001, 500)
+        else:
+            polygon = self._parse_polygon_text(text_value("locations.center_zone_polygon"))
+            if len(polygon) < 3:
+                errors.append(("locations.center_zone_polygon", "Полигонът на главната център зона изисква поне 3 точки."))
+
+        host = text_value("api.api_host", "127.0.0.1")
+        api_key = text_value("api.api_key")
+        if host not in {"127.0.0.1", "localhost", "::1"} and not api_key:
+            warnings.append("API слуша в мрежата без зададен API ключ.")
+        for key in ("input.json_url", "set_data.set_data_url"):
+            if text_value(key).lower().startswith("http://"):
+                warnings.append(f"{key} използва некриптиран HTTP.")
+        if text_value("output.map_provider", "osm").lower() == "google" and not text_value("output.google_maps_api_key"):
+            warnings.append("Избран е Google Maps, но липсва API key.")
+
+        self._reset_validation_styles()
+        for key, _message in errors:
+            self._mark_invalid_control(key)
+        return errors, warnings
+
+    def _focus_validation_error(self, key):
+        control = self.controls.get(key)
+        if control is None:
+            return
+        section_index = self._section_index_for_control(control)
+        if section_index is not None:
+            self._select_section(section_index)
+        try:
+            control.focus_set()
+        except tk.TclError:
+            pass
+
+    def _validate_from_ui(self):
+        values = self._collect_values()
+        errors, warnings = self._validate_values(values)
+        if errors:
+            self.validation_var.set(f"{len(errors)} грешки")
+            self.status_var.set("Настройките съдържат грешки")
+            self._focus_validation_error(errors[0][0])
+            details = "\n".join(f"• {message}" for _key, message in errors[:12])
+            if len(errors) > 12:
+                details += f"\n• … и още {len(errors) - 12}"
+            messagebox.showerror("Невалидни настройки", details)
+            return False
+        if warnings:
+            self.validation_var.set(f"Проверено: {len(warnings)} предупреждения")
+            self.status_var.set("Настройките са валидни с предупреждения")
+            messagebox.showwarning("Настройките са валидни", "\n".join(f"• {item}" for item in warnings))
+        else:
+            self.validation_var.set("Проверено успешно")
+            self.status_var.set("Всички настройки са валидни")
+            messagebox.showinfo("Проверката е успешна", "Не са открити проблеми в настройките.")
+        return True
 
     # ── Helpers ──────────────────────────────────────────────
+
+    def _dispatch_mousewheel(self, event):
+        widget = event.widget
+        while widget is not None:
+            if isinstance(widget, tk.Canvas) and getattr(widget, "_scroll_needed", False):
+                units = int(-1 * (event.delta / 120)) if event.delta else 0
+                if units:
+                    widget.yview_scroll(units, "units")
+                    return "break"
+                return None
+            widget = getattr(widget, "master", None)
+        return None
 
     def _make_scrollable_frame(self, parent):
         shell = ttk.Frame(parent)
@@ -174,24 +983,10 @@ class ConfigGUI:
         canvas.bind("<Configure>", _update_scroll_visibility)
         canvas._scroll_needed = False
 
-        def _on_mousewheel(event):
-            if canvas._scroll_needed:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_wheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        def _unbind_wheel(event):
-            canvas.unbind_all("<MouseWheel>")
-
         def _resize_inner(event):
             canvas.itemconfigure(window_id, width=event.width)
 
         canvas.bind("<Configure>", _resize_inner, add="+")
-        canvas.bind("<Enter>", _bind_wheel)
-        canvas.bind("<Leave>", _unbind_wheel)
-        frame.bind("<Enter>", _bind_wheel)
-        frame.bind("<Leave>", _unbind_wheel)
         return frame
 
     def _bind_text_editing(self, widget):
@@ -229,6 +1024,31 @@ class ConfigGUI:
             handler = _event_handler(virtual_event)
             for sequence in sequences:
                 widget.bind(sequence, handler)
+
+    def _scroll_parent_canvas_from_child(self, widget, event):
+        parent = widget
+        while parent is not None:
+            parent = getattr(parent, "master", None)
+            if isinstance(parent, tk.Canvas):
+                if getattr(parent, "_scroll_needed", False):
+                    if getattr(event, "num", None) == 4:
+                        units = -3
+                    elif getattr(event, "num", None) == 5:
+                        units = 3
+                    else:
+                        units = int(-1 * (getattr(event, "delta", 0) / 120))
+                    if units:
+                        parent.yview_scroll(units, "units")
+                return "break"
+        return "break"
+
+    def _bind_combobox_scrolling(self, combo):
+        def _on_wheel(event):
+            return self._scroll_parent_canvas_from_child(combo, event)
+
+        combo.bind("<MouseWheel>", _on_wheel)
+        combo.bind("<Button-4>", _on_wheel)
+        combo.bind("<Button-5>", _on_wheel)
 
     def _bind_text_scrolling(self, text_widget):
         def _scroll_units(units):
@@ -284,23 +1104,337 @@ class ConfigGUI:
             cb = ttk.Checkbutton(parent, variable=var)
             cb.grid(row=row, column=1, sticky="w", padx=6, pady=6)
             self.widgets[key] = var
+            self.controls[key] = cb
+            self.control_default_states[key] = "normal"
         elif field_type == "combo" and options:
             var = tk.StringVar(value=display_value)
             combo = ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=34)
             combo.grid(row=row, column=1, sticky="w", padx=6, pady=6)
             self._bind_text_editing(combo)
+            self._bind_combobox_scrolling(combo)
             self.widgets[key] = var
+            self.controls[key] = combo
+            self.control_default_states[key] = "readonly"
         else:
             var = tk.StringVar(value=display_value)
-            entry = ttk.Entry(parent, textvariable=var, width=40)
-            entry.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+            entry_options = {"show": "•"} if field_type == "secret" else {}
+            if field_type == "secret":
+                secret_box = ttk.Frame(parent, style="Surface.TFrame")
+                secret_box.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+                secret_box.columnconfigure(0, weight=1)
+                entry = ttk.Entry(secret_box, textvariable=var, width=40, **entry_options)
+                entry.grid(row=0, column=0, sticky="we")
+
+                def toggle_secret(target=entry):
+                    target.configure(show="" if str(target.cget("show")) else "•")
+
+                ttk.Button(
+                    secret_box,
+                    text="Покажи",
+                    command=toggle_secret,
+                    style="Secondary.TButton",
+                ).grid(row=0, column=1, padx=(6, 0))
+            else:
+                entry = ttk.Entry(parent, textvariable=var, width=40, **entry_options)
+                entry.grid(row=row, column=1, sticky="we", padx=6, pady=6)
             self._bind_text_editing(entry)
             self.widgets[key] = var
+            self.controls[key] = entry
+            self.control_default_states[key] = "normal"
 
         if tooltip:
             ttk.Label(parent, text=tooltip, style="Hint.TLabel", wraplength=330).grid(
                 row=row, column=2, sticky="nw", padx=(10, 4), pady=6
             )
+
+    def _add_text_field(self, parent, row, key, label, value, height=4, tooltip=""):
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text=label, anchor="w", width=28, wraplength=230, style="Surface.TLabel").grid(
+            row=row, column=0, sticky="nw", padx=(8, 12), pady=6
+        )
+        text_frame = ttk.Frame(parent, style="Surface.TFrame")
+        text_frame.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        text_frame.columnconfigure(0, weight=1)
+        widget = tk.Text(text_frame, width=40, height=height, wrap="none", relief="solid", borderwidth=1)
+        widget.insert("1.0", "" if value is None else str(value))
+        widget.grid(row=0, column=0, sticky="we")
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        widget.configure(yscrollcommand=scrollbar.set)
+        self._bind_text_editing(widget)
+        self.widgets[key] = widget
+        self.controls[key] = widget
+        self.control_default_states[key] = "normal"
+
+        if tooltip:
+            ttk.Label(parent, text=tooltip, style="Hint.TLabel", wraplength=330).grid(
+                row=row, column=2, sticky="nw", padx=(10, 4), pady=6
+            )
+
+    def _add_note_row(self, parent, row, text):
+        ttk.Label(parent, text=text, style="Hint.TLabel", wraplength=900, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="we", padx=8, pady=(2, 8)
+        )
+
+    def _get_web_gui_credential_store(self):
+        """Return the shared credential store, migrating legacy config once."""
+        if self._web_gui_credential_store is None:
+            api_config = getattr(self.cfg, "api", None)
+            legacy_users = getattr(api_config, "web_gui_users", "") if api_config else ""
+            self._web_gui_credential_store = CredentialStore(
+                _base_dir,
+                legacy_users=str(legacy_users or ""),
+            )
+        return self._web_gui_credential_store
+
+    def _selected_web_gui_username(self):
+        tree = self.web_gui_users_tree
+        if tree is not None:
+            selected = tree.selection()
+            if selected:
+                values = tree.item(selected[0], "values")
+                if values:
+                    return str(values[0])
+        username_var = getattr(self, "web_gui_username_var", None)
+        return str(username_var.get() if username_var is not None else "").strip()
+
+    def _refresh_web_gui_users(self, select_username=None, show_errors=True):
+        tree = self.web_gui_users_tree
+        if tree is None:
+            return []
+        try:
+            usernames = self._get_web_gui_credential_store().list_usernames()
+        except (CredentialStoreError, CredentialValidationError, OSError) as exc:
+            if self.web_gui_users_status_var is not None:
+                self.web_gui_users_status_var.set("Грешка при зареждане на защитеното хранилище")
+            if show_errors:
+                messagebox.showerror("Потребители за web GUI", str(exc))
+            return []
+
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        selected_item = None
+        for username in usernames:
+            item_id = tree.insert("", "end", values=(username,))
+            if username == select_username:
+                selected_item = item_id
+        if selected_item:
+            tree.selection_set(selected_item)
+            tree.focus(selected_item)
+            tree.see(selected_item)
+
+        if self.web_gui_users_status_var is not None:
+            count_text = "1 потребител" if len(usernames) == 1 else f"{len(usernames)} потребители"
+            if usernames:
+                self.web_gui_users_status_var.set(
+                    f"{count_text} • записват се веднага в data/web_gui_auth.json"
+                )
+            else:
+                self.web_gui_users_status_var.set(
+                    "Няма потребители • добави поне един, за да има достъп до web GUI"
+                )
+        return usernames
+
+    def _on_web_gui_user_selected(self, _event=None):
+        username = self._selected_web_gui_username()
+        if not username:
+            return
+        self.web_gui_username_var.set(username)
+        self.web_gui_password_var.set("")
+        self.web_gui_password_confirm_var.set("")
+
+    def _web_gui_credential_form_values(self):
+        return _validate_web_gui_credential_form(
+            self.web_gui_username_var.get(),
+            self.web_gui_password_var.get(),
+            self.web_gui_password_confirm_var.get(),
+        )
+
+    def _clear_web_gui_password_fields(self):
+        self.web_gui_password_var.set("")
+        self.web_gui_password_confirm_var.set("")
+
+    def _add_web_gui_user(self):
+        try:
+            username, password = self._web_gui_credential_form_values()
+            store = self._get_web_gui_credential_store()
+            if username in store.list_usernames():
+                messagebox.showwarning(
+                    "Потребителят съществува",
+                    f"'{username}' вече съществува. Използвай 'Смени паролата'.",
+                )
+                return
+            store.upsert_user(username, password)
+        except ValueError as exc:
+            messagebox.showwarning("Невалидни данни", str(exc))
+            return
+        except (CredentialStoreError, CredentialValidationError, OSError) as exc:
+            messagebox.showerror("Потребители за web GUI", str(exc))
+            return
+
+        self._clear_web_gui_password_fields()
+        self._refresh_web_gui_users(select_username=username)
+        self.status_var.set(
+            f"Потребителят '{username}' е добавен веднага. Не е нужно общото 'Запази'."
+        )
+
+    def _reset_web_gui_user_password(self):
+        try:
+            username, password = self._web_gui_credential_form_values()
+            store = self._get_web_gui_credential_store()
+            if username not in store.list_usernames():
+                messagebox.showwarning(
+                    "Няма такъв потребител",
+                    f"'{username}' не е намерен. Използвай 'Добави'.",
+                )
+                return
+            store.reset_password(username, password)
+        except ValueError as exc:
+            messagebox.showwarning("Невалидни данни", str(exc))
+            return
+        except (CredentialStoreError, CredentialValidationError, OSError) as exc:
+            messagebox.showerror("Потребители за web GUI", str(exc))
+            return
+
+        self._clear_web_gui_password_fields()
+        self._refresh_web_gui_users(select_username=username)
+        self.status_var.set(
+            f"Паролата на '{username}' е сменена веднага. Активните му сесии са прекратени."
+        )
+
+    def _delete_web_gui_user(self):
+        username = self._selected_web_gui_username()
+        if not username:
+            messagebox.showwarning("Липсва потребител", "Избери потребител от списъка.")
+            return
+        try:
+            store = self._get_web_gui_credential_store()
+            if username not in store.list_usernames():
+                messagebox.showinfo("Няма такъв потребител", f"'{username}' вече не съществува.")
+                self._refresh_web_gui_users()
+                return
+        except (CredentialStoreError, CredentialValidationError, OSError) as exc:
+            messagebox.showerror("Потребители за web GUI", str(exc))
+            return
+
+        if not messagebox.askyesno(
+            "Изтриване на потребител",
+            f"Да изтрия ли '{username}'? Достъпът и активните му сесии ще бъдат прекратени веднага.",
+            icon="warning",
+        ):
+            return
+        try:
+            store.delete_user(username)
+        except (CredentialStoreError, CredentialValidationError, OSError) as exc:
+            messagebox.showerror("Потребители за web GUI", str(exc))
+            return
+
+        self.web_gui_username_var.set("")
+        self._clear_web_gui_password_fields()
+        self._refresh_web_gui_users()
+        self.status_var.set(
+            f"Потребителят '{username}' е изтрит веднага. Не е нужно общото 'Запази'."
+        )
+
+    def _add_web_gui_user_controls(self, parent, row):
+        ttk.Label(
+            parent,
+            text="Потребители за вход:",
+            anchor="w",
+            width=28,
+            wraplength=230,
+            style="Surface.TLabel",
+        ).grid(row=row, column=0, sticky="nw", padx=(8, 12), pady=6)
+
+        box = ttk.Frame(parent, style="Surface.TFrame")
+        box.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        box.columnconfigure(0, weight=1)
+
+        list_box = ttk.Frame(box, style="Surface.TFrame")
+        list_box.grid(row=0, column=0, sticky="nsew")
+        list_box.columnconfigure(0, weight=1)
+        self.web_gui_users_tree = ttk.Treeview(
+            list_box,
+            columns=("username",),
+            show="headings",
+            selectmode="browse",
+            height=5,
+        )
+        self.web_gui_users_tree.heading("username", text="Потребителско име")
+        self.web_gui_users_tree.column("username", anchor="w", stretch=True, width=260)
+        self.web_gui_users_tree.grid(row=0, column=0, sticky="nsew")
+        user_scroll = ttk.Scrollbar(
+            list_box,
+            orient="vertical",
+            command=self.web_gui_users_tree.yview,
+        )
+        user_scroll.grid(row=0, column=1, sticky="ns")
+        self.web_gui_users_tree.configure(yscrollcommand=user_scroll.set)
+        self.web_gui_users_tree.bind("<<TreeviewSelect>>", self._on_web_gui_user_selected)
+
+        form = ttk.Frame(box, style="Surface.TFrame")
+        form.grid(row=1, column=0, sticky="we", pady=(10, 0))
+        form.columnconfigure(1, weight=1)
+        self.web_gui_username_var = tk.StringVar()
+        self.web_gui_password_var = tk.StringVar()
+        self.web_gui_password_confirm_var = tk.StringVar()
+
+        ttk.Label(form, text="Потребител", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        username_entry = ttk.Entry(form, textvariable=self.web_gui_username_var)
+        username_entry.grid(row=0, column=1, sticky="we", pady=3)
+        ttk.Label(form, text="Нова парола", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        password_entry = ttk.Entry(form, textvariable=self.web_gui_password_var, show="•")
+        password_entry.grid(row=1, column=1, sticky="we", pady=3)
+        ttk.Label(form, text="Потвърди", style="Surface.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        confirm_entry = ttk.Entry(form, textvariable=self.web_gui_password_confirm_var, show="•")
+        confirm_entry.grid(row=2, column=1, sticky="we", pady=3)
+
+        actions = ttk.Frame(box, style="Surface.TFrame")
+        actions.grid(row=2, column=0, sticky="we", pady=(9, 0))
+        ttk.Button(actions, text="Добави", command=self._add_web_gui_user).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(
+            actions,
+            text="Смени паролата",
+            command=self._reset_web_gui_user_password,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            actions,
+            text="Изтрий",
+            command=self._delete_web_gui_user,
+            style="Danger.TButton",
+        ).pack(side="left")
+
+        self.web_gui_users_status_var = tk.StringVar(value="Зареждам потребителите...")
+        ttk.Label(
+            box,
+            textvariable=self.web_gui_users_status_var,
+            style="Hint.TLabel",
+            wraplength=520,
+        ).grid(row=3, column=0, sticky="w", pady=(7, 0))
+
+        for entry in (username_entry, password_entry, confirm_entry):
+            self._bind_text_editing(entry)
+        confirm_entry.bind("<Return>", lambda _event: self._add_web_gui_user())
+        ttk.Label(
+            parent,
+            text=(
+                "Паролите са скрити и се пазят само като защитени hash-ове. "
+                f"Минимум {_WEB_GUI_PASSWORD_MIN_LENGTH} знака. Интервали, Unicode, ':' и ';' са позволени "
+                "и не се премахват. Промените влизат в сила веднага."
+            ),
+            style="Hint.TLabel",
+            wraplength=330,
+        ).grid(row=row, column=2, sticky="nw", padx=(10, 4), pady=6)
+
+        self._refresh_web_gui_users()
 
     def _add_group(self, parent, title, hint=""):
         group = ttk.LabelFrame(parent, text=title, padding=(14, 12))
@@ -332,6 +1466,220 @@ class ConfigGUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(str(text))
         self.status_var.set(status_message)
+
+    def _widget_value(self, widget, default=""):
+        if widget is None:
+            return default
+        if isinstance(widget, tk.Text):
+            return widget.get("1.0", "end-1c")
+        try:
+            return widget.get()
+        except Exception:
+            return default
+
+    def _selected_tree_index(self, tree):
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            return None
+        try:
+            return int(selection[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _selected_listbox_index(self, listbox):
+        if listbox is None:
+            return None
+        selection = listbox.curselection()
+        if not selection:
+            return None
+        return selection[0]
+
+    def _clear_tree_selection(self, tree):
+        if tree is not None:
+            for item in tree.selection():
+                tree.selection_remove(item)
+
+    def _api_json_example(self, payload):
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _api_json_compact(self, payload):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _add_api_doc_row(self, parent, row, title, body):
+        ttk.Label(parent, text=title, style="Surface.TLabel", width=18).grid(
+            row=row, column=0, sticky="nw", padx=(8, 10), pady=6
+        )
+        ttk.Label(parent, text=body, style="Hint.TLabel", wraplength=820, justify="left").grid(
+            row=row, column=1, columnspan=2, sticky="we", padx=6, pady=6
+        )
+        return row + 1
+
+    def _add_copyable_doc_block(self, parent, row, title, body, height=5):
+        ttk.Label(parent, text=title, style="Surface.TLabel", width=18).grid(
+            row=row, column=0, sticky="nw", padx=(8, 10), pady=6
+        )
+        box = ttk.Frame(parent, style="Surface.TFrame")
+        box.grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        box.columnconfigure(0, weight=1)
+        text = tk.Text(
+            box,
+            height=height,
+            wrap="word",
+            relief="solid",
+            borderwidth=1,
+            font=("Consolas", 9),
+            background="#f8fafc",
+        )
+        text.insert("1.0", str(body).strip())
+        text.configure(state="disabled", cursor="arrow")
+        text.grid(row=0, column=0, sticky="nsew")
+        self._bind_text_editing(text)
+        self._bind_text_scrolling(text)
+        ttk.Button(
+            parent,
+            text="Копирай пример",
+            command=lambda value=body: self._copy_to_clipboard(value, "Примерът е копиран."),
+        ).grid(row=row, column=2, sticky="nw", padx=(8, 4), pady=6)
+        return row + 1
+
+    def _api_endpoint_docs(self, base_url, solve_path, trigger_path, saturday_trigger_path, tsp_path, health_path, auth_header, shutdown_path):
+        run_body = {
+            "return_result": True,
+            "callback_url": "https://example.com/cvrp-finished",
+            "settings": {
+                "solver_type": "pyvrp",
+                "objective_metric": "time",
+                "time_limit_seconds": 180,
+                "vehicles": [
+                    {"vehicle_type": "internal_bus", "count": 7, "capacity": 385},
+                    {"vehicle_type": "vratza_bus", "count": 3, "capacity": 385},
+                ],
+                "depots": [
+                    {"name": "main", "role": "main", "location": [42.6957, 23.2316]},
+                    {"name": "vratza", "role": "vratza", "location": [43.2210, 23.5344]},
+                ],
+                "output": {"enable_excel_output": True, "excel_output_dir": "C:\\CVRP\\output"},
+                "set_data": {"enable_set_data_upload": False},
+            },
+        }
+        solve_body = {
+            "settings": {
+                "solver_type": "or_tools",
+                "objective_metric": "time",
+                "time_limit_seconds": 180,
+                "set_data.enable_set_data_upload": False,
+            },
+            "customers": [
+                {
+                    "IdCust": "1000001",
+                    "CustName": "Клиент 1",
+                    "GPS": "42.6977,23.3219",
+                    "Volume": 10.5,
+                    "IdDoc": "DOC001",
+                    "WorkTime": "08:00-13:00\n16:00-18:00",
+                    "ServiceTimeMinutes": 6,
+                    "Mandatory": True,
+                    "DeliveryComment": "Обади се 10 минути преди доставка.",
+                }
+            ],
+        }
+        tsp_body = {
+            "driver_id": "1004501001",
+            "driver_location": "42.695785029219415,23.23165887245312",
+            "end_location": "42.695785029219415,23.23165887245312",
+            "service_time_minutes": 8,
+            "customers": [
+                {
+                    "id": "1005487516",
+                    "name": "Клиент 1",
+                    "document": "0004384359",
+                    "gps": "42.67973749002523,23.324913047254086",
+                    "quantity": 8,
+                    "turnover": 245.50,
+                    "work_time": "08:00-13:00",
+                    "comment": "Вход откъм булеварда.",
+                },
+                {
+                    "id": "1007010901",
+                    "name": "Клиент 2",
+                    "document": "0004385134",
+                    "gps": "42.66299,23.31376",
+                    "quantity": 2,
+                    "turnover": 98.20,
+                    "work_time": "",
+                    "comment": "",
+                },
+            ],
+        }
+        return [
+            {
+                "tab": trigger_path,
+                "what": "Стартира цялата CVRP програма с текущите настройки или с временни settings от body/query. GET връща веднага, POST може да чака резултат при return_result=true.",
+                "method": "GET или POST",
+                "command": f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{self._api_json_compact(run_body).replace(chr(34), chr(92) + chr(34))}"',
+                "body": self._api_json_example(run_body),
+                "returns": "202 started за background run, 200 с пълен JSON резултат при return_result=true, 409 ако вече върви основен run.",
+            },
+            {
+                "tab": saturday_trigger_path,
+                "what": "Стартира съботен run. Датата е съботата от текущата седмица, а normal prefix-ът и броят цифри идват от полетата за събота в GUI. При включено center ID правило CENTER_BUS запазва отделната си серия.",
+                "method": "GET или POST",
+                "command": f'curl{auth_header} "{base_url}{saturday_trigger_path}"',
+                "body": "Няма задължителен body.",
+                "returns": "202 started за background run или 409, ако вече има активен CVRP run.",
+            },
+            {
+                "tab": solve_path,
+                "what": "Приема клиенти директно в заявката и връща JSON решение. Използва се, когато външната система подава списък клиенти, а не иска програмата сама да дърпа входа.",
+                "method": "POST",
+                "command": f'curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json"{auth_header} -d "{self._api_json_compact(solve_body).replace(chr(34), chr(92) + chr(34))}"',
+                "body": self._api_json_example(solve_body),
+                "returns": "200 с маршрути, необслужени клиенти, файлове и summary. При грешен вход връща JSON error.",
+            },
+            {
+                "tab": tsp_path,
+                "what": "Подрежда текущ маршрут за един шофьор от текущата му GPS позиция до крайна точка. Не пуска основния CVRP solver.",
+                "method": "POST",
+                "command": f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{self._api_json_compact(tsp_body).replace(chr(34), chr(92) + chr(34))}"',
+                "body": self._api_json_example(tsp_body),
+                "returns": "Ако TSP HTML и upload -> Отговор от /tsp = json: 200 JSON с ред на доставка, ETA, км/минути, map_file и upload статус. Ако е html: 200 text/html със самата карта като body. Локалният HTML файл се управлява отделно.",
+            },
+            {
+                "tab": health_path,
+                "what": "Проверява дали API сървърът работи и показва текущ run, последен run, endpoint-и и TSP готовност.",
+                "method": "GET",
+                "command": f'curl "{base_url}{health_path}"',
+                "body": "Няма body.",
+                "returns": "200 със status, listen/public URL, endpoints, run status, TSP статус и налични команди.",
+            },
+            {
+                "tab": shutdown_path,
+                "what": "Спира API сървъра/програмата. Използвай го само за контролирано спиране от доверена система.",
+                "method": "GET или POST",
+                "command": f'curl -X POST "{base_url}{shutdown_path}"{auth_header}',
+                "body": "Няма body.",
+                "returns": "200/202 със съобщение за спиране. Ако има API key, заявката трябва да го подаде.",
+            },
+        ]
+
+    def _add_api_docs_notebook(self, parent, row, docs):
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=8, pady=6)
+        parent.rowconfigure(row, weight=1)
+        parent.columnconfigure(0, weight=1)
+        for doc in docs:
+            page = ttk.Frame(notebook, padding=(12, 10), style="Surface.TFrame")
+            page.columnconfigure(1, weight=1)
+            notebook.add(page, text=f" {doc['tab']} ")
+            r = 0
+            r = self._add_api_doc_row(page, r, "Какво прави", doc["what"])
+            r = self._add_api_doc_row(page, r, "Метод", doc["method"])
+            r = self._add_copyable_doc_block(page, r, "Примерна команда", doc["command"], height=5)
+            r = self._add_copyable_doc_block(page, r, "JSON body", doc["body"], height=10)
+            self._add_api_doc_row(page, r, "Какво връща", doc["returns"])
+        return row + 1
 
     def _api_base_url_preview(self, api):
         public_url = str(getattr(api, "api_public_url", "") or "").strip().rstrip("/")
@@ -379,13 +1727,13 @@ class ConfigGUI:
                 """
 1. Вложени секции:
    "settings": {
-     "output": { "excel_output_dir": "H:\\Out" },
+     "output": { "excel_output_dir": "H:/Out" },
      "set_data": { "enable_set_data_upload": false }
    }
 
 2. Точкова нотация:
    "settings": {
-     "output.excel_output_dir": "H:\\Out",
+     "output.excel_output_dir": "H:/Out",
      "set_data.enable_set_data_upload": false
    }
 
@@ -429,6 +1777,8 @@ parallel                              -> cvrp.enable_parallel_solving
 workers / num_workers                 -> cvrp.num_workers
 pyvrp_seed                            -> cvrp.pyvrp_seed
 pyvrp_seed_base                       -> cvrp.pyvrp_seed_base
+pyvrp_next_worker_timeout_seconds     -> cvrp.pyvrp_next_worker_timeout_seconds
+pyvrp_next_fallback_to_stable         -> cvrp.pyvrp_next_fallback_to_stable
 routing_engine / engine               -> routing.engine
 osrm_url / osrm_base_url              -> osrm.base_url
 osrm_profile                          -> osrm.profile
@@ -438,19 +1788,49 @@ date / json_override_date             -> input.json_override_date
 sklad / json_sklad                    -> input.json_sklad
 done_flag / json_done_flag            -> input.json_done_flag
 group_customer_documents              -> input.enable_customer_document_grouping
+tsp_service_time_minutes              -> api.tsp_default_service_time_minutes
+tsp_metric / tsp_optimize_by          -> api.tsp_objective_metric
+tsp_time_windows                      -> api.tsp_use_time_windows
+tsp_wait_weight                       -> api.tsp_time_window_wait_weight
+tsp_late_weight                       -> api.tsp_time_window_late_weight
+tsp_two_opt                           -> api.tsp_enable_two_opt
+tsp_two_opt_max_passes                -> api.tsp_two_opt_max_passes
+tsp_response_format                   -> api.tsp_response_format
+tsp_generate_map                      -> api.tsp_generate_html_map
+tsp_generate_local_html               -> api.tsp_generate_html_map
+tsp_local_html                        -> api.tsp_generate_html_map
+tsp_upload_map                        -> api.tsp_upload_html_map
+tsp_worker_timeout                    -> api.tsp_worker_timeout_seconds
+tsp_truck_profiles                    -> api.tsp_valhalla_truck_profiles
+tsp_truck_driver_ids                  -> api.tsp_valhalla_truck_driver_ids
+tsp_truck_height                      -> api.tsp_valhalla_truck_height
+tsp_truck_width                       -> api.tsp_valhalla_truck_width
+tsp_truck_length                      -> api.tsp_valhalla_truck_length
+tsp_truck_weight                      -> api.tsp_valhalla_truck_weight
+tsp_truck_axle_load                   -> api.tsp_valhalla_truck_axle_load
+tsp_truck_axle_count                  -> api.tsp_valhalla_truck_axle_count
+tsp_truck_hazmat                      -> api.tsp_valhalla_truck_hazmat
+tsp_truck_hgv_no_access_penalty       -> api.tsp_valhalla_truck_hgv_no_access_penalty
+tsp_daily_report                      -> api.tsp_daily_report_enabled
+tsp_daily_report_time                 -> api.tsp_daily_report_time
                 """,
-                17,
+                31,
             ),
             (
                 "Solver настройки:",
                 """
-cvrp.solver_type                       pyvrp или or_tools
+cvrp.solver_type                       pyvrp, pyvrp_experimental, or_tools, vroom или vrp
+cvrp.enable_multiple_trips             разрешава динамични допълнителни курсове
 cvrp.objective_metric                  distance = най-къси км, time = най-кратко време
+cvrp.time_objective_include_waiting    при time включва чакането в целия работен ден
 cvrp.time_limit_seconds                време за решаване
 cvrp.enable_parallel_solving           паралелно решаване
 cvrp.num_workers                       брой процеси (-1 = автоматично)
 cvrp.allow_customer_skipping           позволява пропускане на клиенти
 cvrp.distance_penalty_disjunction      глоба за пропуснат клиент
+cvrp.enable_priority_dropping          индивидуални penalties според обем/близост
+cvrp.min_customer_drop_penalty         минимална индивидуална глоба
+cvrp.max_customer_drop_penalty         максимална индивидуална глоба
 cvrp.enable_customer_time_windows      спазва работното време на клиентите
 cvrp.first_solution_strategy           OR-Tools начална стратегия
 cvrp.local_search_metaheuristic        OR-Tools локално търсене
@@ -460,12 +1840,25 @@ cvrp.pyvrp_seed_base                   база за seed-ове при пара
 cvrp.pyvrp_num_neighbours              PyVRP neighbourhood размер
 cvrp.pyvrp_ils_no_improvement          PyVRP търпимост без подобрение
 cvrp.pyvrp_ils_history_length          PyVRP ILS история
+cvrp.pyvrp_exhaustive_on_best          по-задълбочено търсене при нов best
 cvrp.pyvrp_use_extended_operators      разширени PyVRP оператори
 cvrp.pyvrp_min_perturbations           минимална perturbation сила
 cvrp.pyvrp_max_perturbations           максимална perturbation сила
 cvrp.pyvrp_display_progress            PyVRP progress log
+cvrp.pyvrp_next_worker_path             optional път до PyVRP 0.14 sidecar
+cvrp.pyvrp_next_worker_timeout_seconds  timeout за experimental worker (0 = auto)
+cvrp.pyvrp_next_fallback_to_stable      fallback към стабилния PyVRP 0.13
+cvrp.vroom_worker_path                  optional път до VROOM sidecar
+cvrp.vroom_worker_timeout_seconds       timeout за VROOM worker (0 = auto)
+cvrp.vroom_threads                      вътрешни VROOM нишки (0 = auto)
+cvrp.vroom_exploration_level            качество 0..5; 5 е най-задълбочено
+cvrp.vrp_worker_path                    optional път до VRP-Rust sidecar
+cvrp.vrp_worker_timeout_seconds         timeout за VRP-Rust worker (0 = auto)
+cvrp.vrp_threads                        вътрешни нишки на VRP-Rust (0 = auto)
+cvrp.vrp_max_generations                максимален брой поколения
+cvrp.vrp_log_progress                   VRP-Rust progress log
                 """,
-                22,
+                27,
             ),
             (
                 "Routing и OSRM:",
@@ -509,7 +1902,12 @@ JSON mapping:
 input.json_gps_field, input.json_client_id_field, input.json_client_name_field
 input.json_volume_field, input.json_document_field, input.json_plas_doc_field
 input.json_id_skld_field, input.json_time_window_field
-input.json_delivery_comment_field
+input.json_delivery_comment_field, input.json_service_time_field, input.json_mandatory_field
+
+WorkTime може да съдържа няколко прозореца. В JSON използвай escape \\n,
+например "08:00-13:00\\n16:00-18:00". Валидните прозорци се подават към solver-а.
+ServiceTimeMinutes е индивидуално време за обслужване; при липса се използва времето от буса.
+Mandatory=true прави клиента абсолютно задължителен. Допустими са true/false, 1/0 и да/не.
                 """,
                 21,
             ),
@@ -524,6 +1922,7 @@ output.route_maps_upload_url            URL за качване на индив�
 output.route_maps_upload_token_field    име на token POST поле, обикновено pData
 output.route_maps_upload_token          token стойност за upload endpoint-а
 output.route_maps_upload_file_field     multipart поле, обикновено files[]
+output.route_maps_upload_bus_id_field   multipart POST поле за ID-та на бусовете, обикновено pData2[]
 output.route_maps_upload_timeout_seconds timeout за качване
 output.map_provider                     osm или google
 output.folium_tiles                     слой за OSM/Folium
@@ -533,13 +1932,17 @@ output.show_route_colors                цветове на маршрутите
 output.show_vehicle_info                информация за бус на картата
 
 Excel:
-output.enable_excel_output              генерира Excel отчети
+output.enable_excel_output              генерира общ cvrp_report_<date>.xlsx
 output.excel_output_dir                 папка за Excel
-output.routes_excel_file                файл с маршрути
-output.warehouse_excel_file             файл за склад/необслужени
-output.efficiency_excel_file            файл ефективност
+output.routes_excel_file                legacy име; текущият workflow е общ workbook
+output.warehouse_excel_file             legacy име; текущият workflow е общ workbook
+output.efficiency_excel_file            legacy име; текущият workflow е общ workbook
 output.excel_bus_number_prefix          префикс ID бус
 output.excel_bus_number_digits          брой цифри
+output.saturday_excel_bus_number_prefix normal префикс само за /run_saturday
+output.saturday_excel_bus_number_digits normal цифри само за /run_saturday
+output.center_bus_numbering_enabled     включва специално ID правило за CENTER_BUS
+output.center_bus_numbering_start_id    първи ID за CENTER_BUS, напр. 1004501015
 
 CSV и графики:
 output.enable_csv_output                генерира CSV
@@ -603,7 +2006,8 @@ depots:
   }
 
 vehicles:
-  Patch по vehicle_type. Пази останалите бусове непроменени.
+  Patch по config_id; ако липсва config_id, patch-ва редовете по vehicle_type.
+  Пази останалите бусове непроменени.
   start_depot_name може да сочи име от depots.
   end_location е optional GPS крайна точка. Ако липсва, маршрутът завършва в стартовото депо.
   end_depot_name може да сочи име от depots.
@@ -615,10 +2019,14 @@ vehicles:
 replace_vehicles:
   Пълна подмяна на всички бусове. Използвай внимателно.
 
+vehicle_counts_by_id:
+  Сменя броя само на конкретен конфигурационен ред по неговия config_id.
+
 Полета за един бус:
-  vehicle_type, capacity, count, name, fixed_cost, max_distance_km,
+  config_id, vehicle_type, capacity, count, name, fixed_cost, max_distance_km,
   max_time_hours, service_time_minutes, enabled, start_location, end_location,
-  max_customers_per_route, start_time_minutes, tsp_depot_location
+  reload_location/reload_depot_name, reload_time_minutes, max_customers_per_day,
+  legacy max_customers_per_route, start_time_minutes, tsp_depot_location
 
 center_zone:
   Управлява старата основна център зона и глобите за нея.
@@ -649,15 +2057,20 @@ center_zones:
         "external_bus": 40000,
         "vratza_bus": 40000
       },
-      "enabled": true
+      "enabled": true,
+      "show_on_map": true
     }
   ]
 
 traffic_zones:
   Допълнителни зони с multiplier за време.
   "traffic_zones": [
-    { "name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true }
+    { "name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true, "show_on_map": false }
   ]
+
+enabled управлява solver правилото на допълнителните зони. Legacy основната
+center зона се изключва чрез enable_priority=false и enable_restrictions=false.
+show_on_map управлява само визуализацията.
 
 city_traffic:
   Старият общ градски трафик.
@@ -755,10 +2168,320 @@ locations.*:
         text_w.grid(row=row, column=1, sticky="we", padx=6, pady=6)
         self._bind_text_editing(text_w)
         self.widgets[key] = text_w
+        self.controls[key] = text_w
+        self.control_default_states[key] = "normal"
         hint = tooltip or "По един елемент на ред"
         ttk.Label(parent, text=hint, style="Hint.TLabel", wraplength=330).grid(
             row=row, column=2, sticky="nw", padx=(10, 4), pady=6
         )
+
+    def _parse_tsp_truck_profiles_text(self, raw):
+        profiles = []
+        for line in str(raw or "").splitlines():
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            parts = [part.strip() for part in text.split("|")]
+            profile = {
+                "name": parts[0] if parts else "Truck profile",
+                "ids": "",
+                "height": "3.5",
+                "width": "2.5",
+                "length": "7.0",
+                "weight": "10.0",
+                "axle_load": "9.0",
+                "axle_count": "2",
+                "hazmat": "false",
+                "hgv_no_access_penalty": "43200",
+            }
+            for part in parts[1:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                aliases = {
+                    "driver_ids": "ids",
+                    "drivers": "ids",
+                    "bus_ids": "ids",
+                    "h": "height",
+                    "w": "width",
+                    "l": "length",
+                    "axles": "axle_count",
+                    "hgv_penalty": "hgv_no_access_penalty",
+                }
+                profile[aliases.get(key, key)] = value
+            if profile.get("ids"):
+                profiles.append(profile)
+        return profiles
+
+    def _format_tsp_truck_profiles_text(self, profiles):
+        lines = []
+        for profile in profiles or []:
+            name = str(profile.get("name") or "Truck profile").strip()
+            ids = str(profile.get("ids") or "").strip()
+            if not ids:
+                continue
+            parts = [
+                name,
+                f"ids={ids}",
+                f"height={profile.get('height', '3.5')}",
+                f"width={profile.get('width', '2.5')}",
+                f"length={profile.get('length', '7.0')}",
+                f"weight={profile.get('weight', '10.0')}",
+                f"axle_load={profile.get('axle_load', '9.0')}",
+                f"axle_count={profile.get('axle_count', '2')}",
+                f"hazmat={str(profile.get('hazmat', 'false')).lower()}",
+                f"hgv_no_access_penalty={profile.get('hgv_no_access_penalty', '43200')}",
+            ]
+            lines.append(" | ".join(parts))
+        return "\n".join(lines)
+
+    def _sync_tsp_truck_profiles_widgets(self, profiles):
+        hidden = self.widgets.get("api.tsp_valhalla_truck_profiles")
+        if isinstance(hidden, tk.Text):
+            hidden.delete("1.0", "end")
+            hidden.insert("1.0", self._format_tsp_truck_profiles_text(profiles))
+
+        tree = getattr(self, "tsp_truck_profiles_tree", None)
+        if tree is not None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for index, profile in enumerate(profiles or []):
+                tree.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=(
+                        profile.get("name", ""),
+                        profile.get("ids", ""),
+                        profile.get("height", ""),
+                        profile.get("width", ""),
+                        profile.get("length", ""),
+                        profile.get("weight", ""),
+                        profile.get("axle_count", ""),
+                        profile.get("hazmat", "false"),
+                    ),
+                )
+
+    def _current_tsp_truck_profiles(self):
+        hidden = self.widgets.get("api.tsp_valhalla_truck_profiles")
+        if isinstance(hidden, tk.Text):
+            return self._parse_tsp_truck_profiles_text(hidden.get("1.0", "end-1c"))
+        return []
+
+    def _clear_tsp_truck_profile_form(self):
+        defaults = {
+            "api.new_tsp_truck_profile_name": "",
+            "api.new_tsp_truck_profile_ids": "",
+            "api.new_tsp_truck_profile_height": "3.5",
+            "api.new_tsp_truck_profile_width": "2.5",
+            "api.new_tsp_truck_profile_length": "7.0",
+            "api.new_tsp_truck_profile_weight": "10.0",
+            "api.new_tsp_truck_profile_axle_load": "9.0",
+            "api.new_tsp_truck_profile_axle_count": "2",
+            "api.new_tsp_truck_profile_hazmat": False,
+            "api.new_tsp_truck_profile_hgv_no_access_penalty": "43200",
+        }
+        for key, value in defaults.items():
+            widget = self.widgets.get(key)
+            if widget is None:
+                continue
+            widget.set(value)
+
+    def _tsp_truck_profile_from_form(self):
+        def get(key, default=""):
+            widget = self.widgets.get(key)
+            return widget.get() if widget is not None else default
+
+        name = str(get("api.new_tsp_truck_profile_name", "") or "").strip()
+        ids = str(get("api.new_tsp_truck_profile_ids", "") or "").strip()
+        if not ids:
+            messagebox.showwarning("Липсват ID-та", "Въведете поне едно ID на шофьор/бус за truck профила.")
+            return None
+        return {
+            "name": name or "Truck profile",
+            "ids": ids,
+            "height": str(get("api.new_tsp_truck_profile_height", "3.5") or "3.5").strip(),
+            "width": str(get("api.new_tsp_truck_profile_width", "2.5") or "2.5").strip(),
+            "length": str(get("api.new_tsp_truck_profile_length", "7.0") or "7.0").strip(),
+            "weight": str(get("api.new_tsp_truck_profile_weight", "10.0") or "10.0").strip(),
+            "axle_load": str(get("api.new_tsp_truck_profile_axle_load", "9.0") or "9.0").strip(),
+            "axle_count": str(get("api.new_tsp_truck_profile_axle_count", "2") or "2").strip(),
+            "hazmat": "true" if bool(get("api.new_tsp_truck_profile_hazmat", False)) else "false",
+            "hgv_no_access_penalty": str(get("api.new_tsp_truck_profile_hgv_no_access_penalty", "43200") or "43200").strip(),
+        }
+
+    def _upsert_tsp_truck_profile_from_form(self):
+        profile = self._tsp_truck_profile_from_form()
+        if profile is None:
+            return
+        profiles = self._current_tsp_truck_profiles()
+        tree = getattr(self, "tsp_truck_profiles_tree", None)
+        selected = tree.selection()[0] if tree is not None and tree.selection() else None
+        if selected is not None:
+            try:
+                profiles[int(selected)] = profile
+            except (ValueError, IndexError):
+                profiles.append(profile)
+        else:
+            profiles.append(profile)
+        self._sync_tsp_truck_profiles_widgets(profiles)
+
+    def _remove_selected_tsp_truck_profile(self):
+        tree = getattr(self, "tsp_truck_profiles_tree", None)
+        if tree is None or not tree.selection():
+            messagebox.showinfo("Няма избор", "Изберете truck профил от таблицата.")
+            return
+        selected = tree.selection()[0]
+        profiles = self._current_tsp_truck_profiles()
+        try:
+            del profiles[int(selected)]
+        except (ValueError, IndexError):
+            return
+        self._sync_tsp_truck_profiles_widgets(profiles)
+        self._clear_tsp_truck_profile_form()
+
+    def _load_selected_tsp_truck_profile(self, event=None):
+        tree = getattr(self, "tsp_truck_profiles_tree", None)
+        if tree is None or not tree.selection():
+            return
+        try:
+            profile = self._current_tsp_truck_profiles()[int(tree.selection()[0])]
+        except (ValueError, IndexError):
+            return
+
+        values = {
+            "api.new_tsp_truck_profile_name": profile.get("name", ""),
+            "api.new_tsp_truck_profile_ids": profile.get("ids", ""),
+            "api.new_tsp_truck_profile_height": profile.get("height", "3.5"),
+            "api.new_tsp_truck_profile_width": profile.get("width", "2.5"),
+            "api.new_tsp_truck_profile_length": profile.get("length", "7.0"),
+            "api.new_tsp_truck_profile_weight": profile.get("weight", "10.0"),
+            "api.new_tsp_truck_profile_axle_load": profile.get("axle_load", "9.0"),
+            "api.new_tsp_truck_profile_axle_count": profile.get("axle_count", "2"),
+            "api.new_tsp_truck_profile_hazmat": str(profile.get("hazmat", "false")).lower() in {"1", "true", "yes", "on", "да"},
+            "api.new_tsp_truck_profile_hgv_no_access_penalty": profile.get("hgv_no_access_penalty", "43200"),
+        }
+        for key, value in values.items():
+            widget = self.widgets.get(key)
+            if widget is not None:
+                widget.set(value)
+
+    def _add_tsp_truck_profiles_editor(self, parent, row, api):
+        box = ttk.LabelFrame(parent, text="TSP Valhalla truck профили", padding=(14, 12))
+        box.pack(fill="x", expand=True, padx=2, pady=(0, 14))
+        box.columnconfigure(0, weight=1)
+        box.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            box,
+            text="Добави профил за конкретни driver/bus ID-та. Ако /tsp получи driver_id от този списък, матрицата и HTML линията се чертаят с Valhalla truck.",
+            style="Hint.TLabel",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 10))
+
+        form = ttk.LabelFrame(box, text="Профил", padding=(12, 10))
+        form.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        form.columnconfigure(1, weight=1)
+
+        table_box = ttk.LabelFrame(box, text="Създадени профили", padding=(12, 10))
+        table_box.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        table_box.columnconfigure(0, weight=1)
+
+        fields = [
+            ("api.new_tsp_truck_profile_name", "Име", "Лек камион", "str"),
+            ("api.new_tsp_truck_profile_ids", "ID-та", "", "str"),
+            ("api.new_tsp_truck_profile_height", "Височина (м)", "3.5", "str"),
+            ("api.new_tsp_truck_profile_width", "Ширина (м)", "2.5", "str"),
+            ("api.new_tsp_truck_profile_length", "Дължина (м)", "7.0", "str"),
+            ("api.new_tsp_truck_profile_weight", "Тегло (т)", "10.0", "str"),
+            ("api.new_tsp_truck_profile_axle_load", "Натоварване ос (т)", "9.0", "str"),
+            ("api.new_tsp_truck_profile_axle_count", "Брой оси", "2", "str"),
+        ]
+        for idx, (key, label, default, _field_type) in enumerate(fields):
+            ttk.Label(form, text=label, style="Surface.TLabel", width=18).grid(row=idx, column=0, sticky="w", padx=(0, 8), pady=4)
+            var = tk.StringVar(value=default)
+            entry = ttk.Entry(form, textvariable=var, width=28)
+            entry.grid(row=idx, column=1, sticky="we", pady=4)
+            self._bind_text_editing(entry)
+            self.widgets[key] = var
+
+        row_idx = len(fields)
+        ttk.Label(form, text="Опасен товар", style="Surface.TLabel", width=18).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=4)
+        hazmat_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, variable=hazmat_var).grid(row=row_idx, column=1, sticky="w", pady=4)
+        self.widgets["api.new_tsp_truck_profile_hazmat"] = hazmat_var
+        row_idx += 1
+
+        ttk.Label(form, text="HGV no-access глоба", style="Surface.TLabel", width=18).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=4)
+        hgv_var = tk.StringVar(value="43200")
+        hgv_entry = ttk.Entry(form, textvariable=hgv_var, width=28)
+        hgv_entry.grid(row=row_idx, column=1, sticky="we", pady=4)
+        self._bind_text_editing(hgv_entry)
+        self.widgets["api.new_tsp_truck_profile_hgv_no_access_penalty"] = hgv_var
+        row_idx += 1
+
+        ttk.Label(
+            form,
+            text="ID-тата може да са със запетая или интервал: 1004501008, 1004501012. HGV 43200 = забранява no-access пътища.",
+            style="Hint.TLabel",
+            wraplength=360,
+        ).grid(row=row_idx, column=0, columnspan=2, sticky="we", pady=(6, 8))
+        row_idx += 1
+
+        buttons = ttk.Frame(form, style="Surface.TFrame")
+        buttons.grid(row=row_idx, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(buttons, text="Добави / обнови", command=self._upsert_tsp_truck_profile_from_form).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Нова форма", command=self._clear_tsp_truck_profile_form).pack(side="left")
+
+        columns = ("name", "ids", "height", "width", "length", "weight", "axles", "hazmat")
+        tree = ttk.Treeview(table_box, columns=columns, show="headings", height=7)
+        headings = {
+            "name": "Име",
+            "ids": "ID-та",
+            "height": "H",
+            "width": "W",
+            "length": "L",
+            "weight": "Тегло",
+            "axles": "Оси",
+            "hazmat": "Hazmat",
+        }
+        widths = {"name": 110, "ids": 210, "height": 50, "width": 50, "length": 50, "weight": 60, "axles": 45, "hazmat": 60}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="w", stretch=(column == "ids"))
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.bind("<<TreeviewSelect>>", self._load_selected_tsp_truck_profile)
+        self.tsp_truck_profiles_tree = tree
+
+        table_buttons = ttk.Frame(table_box, style="Surface.TFrame")
+        table_buttons.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(table_buttons, text="Зареди избрания", command=self._load_selected_tsp_truck_profile).pack(side="left", padx=(0, 6))
+        ttk.Button(table_buttons, text="Изтрий избрания", command=self._remove_selected_tsp_truck_profile).pack(side="left")
+
+        hidden = tk.Text(box, width=1, height=1)
+        self.widgets["api.tsp_valhalla_truck_profiles"] = hidden
+        raw_profiles = getattr(api, "tsp_valhalla_truck_profiles", "")
+        profiles = self._parse_tsp_truck_profiles_text(raw_profiles)
+        if not profiles and str(getattr(api, "tsp_valhalla_truck_driver_ids", "") or "").strip():
+            profiles = [{
+                "name": "Default truck",
+                "ids": getattr(api, "tsp_valhalla_truck_driver_ids", ""),
+                "height": str(getattr(api, "tsp_valhalla_truck_height", 3.5)),
+                "width": str(getattr(api, "tsp_valhalla_truck_width", 2.5)),
+                "length": str(getattr(api, "tsp_valhalla_truck_length", 7.0)),
+                "weight": str(getattr(api, "tsp_valhalla_truck_weight", 10.0)),
+                "axle_load": str(getattr(api, "tsp_valhalla_truck_axle_load", 9.0)),
+                "axle_count": str(getattr(api, "tsp_valhalla_truck_axle_count", 2)),
+                "hazmat": "true" if getattr(api, "tsp_valhalla_truck_hazmat", False) else "false",
+                "hgv_no_access_penalty": str(getattr(api, "tsp_valhalla_truck_hgv_no_access_penalty", 43200)),
+            }]
+        self._sync_tsp_truck_profiles_widgets(profiles)
+        return row + 1
 
     def _format_polygon_text(self, polygon):
         return "\n".join(f"{float(lat)}, {float(lon)}" for lat, lon in polygon)
@@ -788,6 +2511,40 @@ locations.*:
             for name, coords in (depots or {}).items()
         )
 
+    def _depot_display_label(self, name, coords):
+        return f"{name}: {float(coords[0]):.5f}, {float(coords[1]):.5f}"
+
+    def _sync_depot_widgets(self, depots):
+        depots = depots or {}
+        depot_widget = self.widgets.get("locations.depot_locations")
+        if isinstance(depot_widget, tk.Text):
+            depot_widget.delete("1.0", "end")
+            depot_widget.insert("1.0", self._format_depots_text(depots))
+
+        if self.depot_listbox is not None:
+            self.depot_listbox.delete(0, "end")
+            for name, coords in depots.items():
+                self.depot_listbox.insert("end", self._depot_display_label(name, coords))
+
+        if self.depot_tree is not None:
+            for item in self.depot_tree.get_children():
+                self.depot_tree.delete(item)
+            for index, (name, coords) in enumerate(depots.items()):
+                self.depot_tree.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=(name, f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"),
+                )
+
+        depot_options = ["Главно депо", "Център", "Враца"]
+        for name in depots:
+            if name not in depot_options:
+                depot_options.append(name)
+        self.vehicle_depot_options = depot_options
+        for combo in getattr(self, "depot_choice_widgets", []):
+            combo.configure(values=depot_options)
+
     def _format_traffic_zones_text(self, zones):
         lines = []
         for zone in zones or []:
@@ -798,38 +2555,209 @@ locations.*:
             radius = float(getattr(zone, "radius_km", 0) or 0)
             multiplier = float(getattr(zone, "duration_multiplier", 1.0) or 1.0)
             enabled = "true" if getattr(zone, "enabled", True) else "false"
-            lines.append(f"{name}: {float(center[0])}, {float(center[1])}, {radius}, {multiplier}, {enabled}")
+            show_on_map = "true" if getattr(zone, "show_on_map", False) else "false"
+            lines.append(
+                f"{name}: {float(center[0])}, {float(center[1])}, {radius}, "
+                f"{multiplier}, {enabled}, {show_on_map}"
+            )
         return "\n".join(lines)
 
     def _format_center_zones_text(self, zones):
-        lines = []
-        for zone in zones or []:
-            name = getattr(zone, "name", "Център зона")
-            mode = str(getattr(zone, "mode", "circle") or "circle").lower()
-            if mode == "polygon":
-                points = getattr(zone, "polygon", []) or []
-                geometry = "; ".join(f"{float(lat)}, {float(lon)}" for lat, lon in points)
-                radius = ""
-            else:
-                center = getattr(zone, "center_coords", None)
-                if not center:
-                    continue
-                geometry = f"{float(center[0])}, {float(center[1])}"
-                radius = f"{float(getattr(zone, 'radius_km', 0) or 0):g}"
-            priority = ",".join(getattr(zone, "priority_vehicle_types", []) or [])
-            restricted = ",".join(getattr(zone, "restricted_vehicle_types", []) or [])
-            enabled = "true" if getattr(zone, "enabled", True) else "false"
-            discount = f"{float(getattr(zone, 'discount_priority_vehicle', 1.0) or 1.0):g}"
-            outside = f"{float(getattr(zone, 'priority_vehicle_outside_penalty', 0.0) or 0.0):g}"
-            penalties = ",".join(
-                f"{bus}={float(value):g}"
-                for bus, value in (getattr(zone, "vehicle_penalties", {}) or {}).items()
+        """Serialise zones for the hidden GUI widget without losing fields.
+
+        This text is an internal transfer format between the editor and the
+        config writer. JSON avoids the delimiter collisions of the legacy
+        ``name: mode | ...`` representation and preserves every field from
+        ``CenterZoneConfig``.
+        """
+        payload = [self._center_zone_to_data(zone) for zone in zones or []]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _center_zone_to_data(self, zone):
+        center = getattr(zone, "center_coords", None)
+        polygon = getattr(zone, "polygon", []) or []
+        return {
+            "name": str(getattr(zone, "name", "") or ""),
+            "mode": str(getattr(zone, "mode", "circle") or "circle").strip().lower(),
+            "center_coords": [float(center[0]), float(center[1])] if center else None,
+            "radius_km": float(getattr(zone, "radius_km", 0.0) or 0.0),
+            "polygon": [[float(lat), float(lon)] for lat, lon in polygon],
+            "enabled": bool(getattr(zone, "enabled", True)),
+            "show_on_map": bool(getattr(zone, "show_on_map", True)),
+            "enable_priority": bool(getattr(zone, "enable_priority", True)),
+            "enable_restrictions": bool(getattr(zone, "enable_restrictions", True)),
+            "priority_vehicle_types": list(getattr(zone, "priority_vehicle_types", []) or []),
+            "restricted_vehicle_types": list(getattr(zone, "restricted_vehicle_types", []) or []),
+            "discount_priority_vehicle": float(
+                getattr(zone, "discount_priority_vehicle", 0.9) or 0.9
+            ),
+            "priority_vehicle_outside_penalty": float(
+                getattr(zone, "priority_vehicle_outside_penalty", 0.0) or 0.0
+            ),
+            "vehicle_penalties": {
+                str(vehicle_type): float(value)
+                for vehicle_type, value in (getattr(zone, "vehicle_penalties", {}) or {}).items()
+            },
+        }
+
+    def _center_zone_bool(self, value, default=True):
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in ("0", "false", "no", "off", "не", "")
+
+    def _validate_center_zone_coords(self, coords, label="Координати"):
+        import math
+
+        try:
+            if coords is None or len(coords) != 2:
+                raise ValueError
+            lat, lon = float(coords[0]), float(coords[1])
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}: въведи координати във формат lat, lon.") from None
+
+        if not math.isfinite(lat) or not math.isfinite(lon):
+            raise ValueError(f"{label}: координатите трябва да са крайни числа.")
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise ValueError(f"{label}: latitude трябва да е -90..90, longitude -180..180.")
+        return (lat, lon)
+
+    def _parse_center_zone_polygon_strict(self, raw):
+        points = []
+        raw_lines = str(raw or "").replace(";", "\n").splitlines()
+        non_empty_lines = [line.strip() for line in raw_lines if line.strip()]
+        if not non_empty_lines:
+            raise ValueError("Полигонът трябва да съдържа поне 3 точки.")
+
+        for line_number, line in enumerate(non_empty_lines, start=1):
+            parts = [part.strip() for part in line.split(",")]
+            point = self._validate_center_zone_coords(
+                parts,
+                label=f"Точка {line_number}",
             )
-            lines.append(
-                f"{name}: {mode} | {geometry} | {radius} | {priority} | {restricted} | "
-                f"{enabled} | {discount} | {outside} | {penalties}"
+            points.append(point)
+
+        if len(points) < 3:
+            raise ValueError("Полигонът трябва да съдържа поне 3 точки.")
+        if len({(round(lat, 10), round(lon, 10)) for lat, lon in points}) < 3:
+            raise ValueError("Полигонът трябва да съдържа поне 3 различни точки.")
+        return points
+
+    def _parse_center_zone_geometry(self, mode, raw_coords, raw_radius):
+        import math
+
+        mode = str(mode or "").strip().lower()
+        if mode not in ("circle", "polygon"):
+            raise ValueError("Избери тип на зоната: circle или polygon.")
+
+        if mode == "polygon":
+            polygon = self._parse_center_zone_polygon_strict(raw_coords)
+            return polygon[0], 0.0, polygon
+
+        coords = self._parse_coords_text(raw_coords)
+        center = self._validate_center_zone_coords(coords, label="Център на кръга")
+        try:
+            radius = float(str(raw_radius or "").strip())
+        except (TypeError, ValueError):
+            raise ValueError("Радиусът трябва да е число.") from None
+        if not math.isfinite(radius) or radius <= 0:
+            raise ValueError("Радиусът трябва да е по-голям от 0.")
+        return center, radius, []
+
+    def _center_zone_from_data(self, data):
+        import math
+
+        if not isinstance(data, dict):
+            raise ValueError("Център зоната трябва да е JSON object.")
+
+        name = str(data.get("name", "") or "").strip()
+        if not name:
+            raise ValueError("Център зоната няма име.")
+        mode = str(data.get("mode", "circle") or "circle").strip().lower()
+        if mode not in ("circle", "polygon"):
+            raise ValueError(f"Неподдържан тип център зона: {mode}")
+
+        polygon = []
+        center_raw = data.get("center_coords")
+        if mode == "polygon":
+            polygon_raw = data.get("polygon") or []
+            polygon = [
+                self._validate_center_zone_coords(point, label=f"Полигон точка {index}")
+                for index, point in enumerate(polygon_raw, start=1)
+            ]
+            if len(polygon) < 3 or len({(round(lat, 10), round(lon, 10)) for lat, lon in polygon}) < 3:
+                raise ValueError(f"Център зона '{name}' има невалиден полигон.")
+            center_coords = (
+                self._validate_center_zone_coords(center_raw, label="Център на полигона")
+                if center_raw is not None
+                else polygon[0]
             )
-        return "\n".join(lines)
+            try:
+                radius = float(data.get("radius_km", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                raise ValueError(f"Център зона '{name}' има невалиден радиус.") from None
+            if not math.isfinite(radius) or radius < 0:
+                raise ValueError(f"Център зона '{name}' има невалиден радиус.")
+        else:
+            center_coords = self._validate_center_zone_coords(center_raw, label="Център на кръга")
+            try:
+                radius = float(data.get("radius_km", 0.0))
+            except (TypeError, ValueError):
+                raise ValueError(f"Център зона '{name}' има невалиден радиус.") from None
+            if not math.isfinite(radius) or radius <= 0:
+                raise ValueError(f"Център зона '{name}' има невалиден радиус.")
+            polygon = []
+
+        def unique_strings(values):
+            if values is None:
+                return []
+            if not isinstance(values, (list, tuple, set)):
+                raise ValueError(f"Център зона '{name}' има невалиден списък с типове бусове.")
+            return list(dict.fromkeys(str(item).strip() for item in values or [] if str(item).strip()))
+
+        priority_types = unique_strings(data.get("priority_vehicle_types"))
+        restricted_types = unique_strings(data.get("restricted_vehicle_types"))
+
+        try:
+            discount = float(data.get("discount_priority_vehicle", 0.9))
+            outside_penalty = float(data.get("priority_vehicle_outside_penalty", 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(f"Център зона '{name}' има невалидна отстъпка или глоба.") from None
+        if not math.isfinite(discount) or discount <= 0:
+            raise ValueError(f"Център зона '{name}' има невалидна отстъпка.")
+        if not math.isfinite(outside_penalty) or outside_penalty < 0:
+            raise ValueError(f"Център зона '{name}' има невалидна глоба навън.")
+
+        penalties = {}
+        penalties_raw = data.get("vehicle_penalties") or {}
+        if not isinstance(penalties_raw, dict):
+            raise ValueError(f"Център зона '{name}' има невалидни глоби по тип бус.")
+        for vehicle_type, raw_value in penalties_raw.items():
+            try:
+                penalty_value = float(raw_value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Център зона '{name}' има невалидна глоба за {vehicle_type}.") from None
+            if not math.isfinite(penalty_value) or penalty_value < 0:
+                raise ValueError(f"Център зона '{name}' има невалидна глоба за {vehicle_type}.")
+            penalties[str(vehicle_type).strip()] = penalty_value
+
+        return config.CenterZoneConfig(
+            name=name,
+            mode=mode,
+            center_coords=center_coords,
+            radius_km=radius,
+            polygon=polygon,
+            enabled=self._center_zone_bool(data.get("enabled"), True),
+            show_on_map=self._center_zone_bool(data.get("show_on_map"), True),
+            enable_priority=self._center_zone_bool(data.get("enable_priority"), True),
+            enable_restrictions=self._center_zone_bool(data.get("enable_restrictions"), True),
+            priority_vehicle_types=priority_types,
+            restricted_vehicle_types=restricted_types,
+            discount_priority_vehicle=discount,
+            priority_vehicle_outside_penalty=outside_penalty,
+            vehicle_penalties=penalties,
+        )
 
     def _parse_depots_text(self, raw):
         depots = {}
@@ -854,6 +2782,9 @@ locations.*:
             if not line or ":" not in line:
                 continue
             name, zone_raw = line.split(":", 1)
+            if not name.strip():
+                errors.append(f"Невалидна център зона без име: {line}")
+                continue
             parts = [part.strip() for part in zone_raw.split(",")]
             if len(parts) < 4:
                 continue
@@ -861,6 +2792,9 @@ locations.*:
                 enabled = True
                 if len(parts) >= 5:
                     enabled = parts[4].lower() not in ("0", "false", "no", "off", "не")
+                show_on_map = False
+                if len(parts) >= 6:
+                    show_on_map = parts[5].lower() not in ("0", "false", "no", "off", "не")
                 zones.append(
                     config.TrafficZoneConfig(
                         name=name.strip(),
@@ -868,21 +2802,56 @@ locations.*:
                         radius_km=float(parts[2]),
                         duration_multiplier=float(parts[3]),
                         enabled=enabled,
+                        show_on_map=show_on_map,
                     )
                 )
             except ValueError:
                 continue
         return zones
 
-    def _parse_center_zones_text(self, raw):
+    def _parse_center_zones_text(self, raw, strict=False):
+        text = str(raw or "").strip()
+        if not text:
+            return []
+
+        if text.startswith("["):
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                if strict:
+                    raise ValueError(f"Невалиден вътрешен JSON за център зоните: {exc}") from exc
+                return []
+            if not isinstance(payload, list):
+                if strict:
+                    raise ValueError("Център зоните трябва да са JSON list.")
+                return []
+
+            zones = []
+            errors = []
+            for index, item in enumerate(payload, start=1):
+                try:
+                    zones.append(self._center_zone_from_data(item))
+                except ValueError as exc:
+                    errors.append(f"Зона {index}: {exc}")
+            if errors and strict:
+                raise ValueError("; ".join(errors))
+            return zones
+
+        return self._parse_legacy_center_zones_text(text, strict=strict)
+
+    def _parse_legacy_center_zones_text(self, raw, strict=False):
         zones = []
+        errors = []
         for line in (raw or "").splitlines():
             line = line.strip()
             if not line or ":" not in line:
+                if line:
+                    errors.append(f"Невалиден ред: {line}")
                 continue
             name, zone_raw = line.split(":", 1)
             parts = [part.strip() for part in zone_raw.split("|")]
             if len(parts) < 5:
+                errors.append(f"Невалидна център зона: {name.strip() or line}")
                 continue
             try:
                 mode = (parts[0] or "circle").lower()
@@ -893,6 +2862,9 @@ locations.*:
                 enabled = True
                 if len(parts) >= 6 and parts[5]:
                     enabled = parts[5].lower() not in ("0", "false", "no", "off", "не")
+                show_on_map = True
+                if len(parts) >= 10 and parts[9]:
+                    show_on_map = parts[9].lower() not in ("0", "false", "no", "off", "не")
                 discount = float(parts[6]) if len(parts) >= 7 and parts[6] else 0.9
                 outside_penalty = float(parts[7]) if len(parts) >= 8 and parts[7] else 0.0
                 penalties = {}
@@ -906,38 +2878,31 @@ locations.*:
                     penalties = {bus: 40000.0 for bus in restricted_types}
 
                 if mode == "polygon":
-                    polygon = []
-                    for point_raw in geometry.split(";"):
-                        point_parts = [float(part.strip()) for part in point_raw.split(",") if part.strip()]
-                        if len(point_parts) == 2:
-                            polygon.append((point_parts[0], point_parts[1]))
-                    if len(polygon) < 3:
-                        continue
+                    polygon = self._parse_center_zone_polygon_strict(geometry)
                     center_coords = polygon[0]
                 else:
-                    coord_parts = [float(part.strip()) for part in geometry.split(",") if part.strip()]
-                    if len(coord_parts) != 2:
-                        continue
-                    center_coords = (coord_parts[0], coord_parts[1])
-                    polygon = []
+                    center_coords, radius, polygon = self._parse_center_zone_geometry(mode, geometry, radius)
 
-                zones.append(
-                    config.CenterZoneConfig(
-                        name=name.strip(),
-                        mode=mode,
-                        center_coords=center_coords,
-                        radius_km=radius,
-                        polygon=polygon,
-                        enabled=enabled,
-                        priority_vehicle_types=priority_types,
-                        restricted_vehicle_types=restricted_types,
-                        discount_priority_vehicle=discount,
-                        priority_vehicle_outside_penalty=outside_penalty,
-                        vehicle_penalties=penalties,
-                    )
-                )
-            except ValueError:
-                continue
+                zones.append(config.CenterZoneConfig(
+                    name=name.strip(),
+                    mode=mode,
+                    center_coords=center_coords,
+                    radius_km=radius,
+                    polygon=polygon,
+                    enabled=enabled,
+                    show_on_map=show_on_map,
+                    enable_priority=True,
+                    enable_restrictions=True,
+                    priority_vehicle_types=priority_types,
+                    restricted_vehicle_types=restricted_types,
+                    discount_priority_vehicle=discount,
+                    priority_vehicle_outside_penalty=outside_penalty,
+                    vehicle_penalties=penalties,
+                ))
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{name.strip() or 'Център зона'}: {exc}")
+        if errors and strict:
+            raise ValueError("; ".join(errors))
         return zones
 
     def _traffic_zone_display_label(self, zone):
@@ -946,10 +2911,11 @@ locations.*:
         multiplier = float(getattr(zone, "duration_multiplier", 1.0) or 1.0)
         delay_percent = max(0, round((multiplier - 1.0) * 100))
         status = "" if getattr(zone, "enabled", True) else " (изключена)"
+        map_status = "" if getattr(zone, "show_on_map", False) else " (скрита на картата)"
         return (
             f"{getattr(zone, 'name', 'Трафик зона')}: "
             f"{float(center[0]):.5f}, {float(center[1]):.5f} | "
-            f"{radius:g} км | +{delay_percent}%{status}"
+            f"{radius:g} км | +{delay_percent}%{status}{map_status}"
         )
 
     def _center_zone_display_label(self, zone):
@@ -964,9 +2930,10 @@ locations.*:
         priority = ", ".join(getattr(zone, "priority_vehicle_types", []) or []) or "-"
         restricted = ", ".join(getattr(zone, "restricted_vehicle_types", []) or []) or "-"
         status = "" if getattr(zone, "enabled", True) else " (изключена)"
+        map_status = "" if getattr(zone, "show_on_map", True) else " (скрита на картата)"
         return (
             f"{getattr(zone, 'name', 'Център зона')}: {geometry} | "
-            f"приоритет: {priority} | глоба: {restricted}{status}"
+            f"приоритет: {priority} | глоба: {restricted}{status}{map_status}"
         )
 
     def _next_traffic_zone_name(self, zones):
@@ -995,6 +2962,27 @@ locations.*:
             for zone in zones:
                 self.traffic_zone_listbox.insert("end", self._traffic_zone_display_label(zone))
 
+        if self.traffic_zone_tree is not None:
+            for item in self.traffic_zone_tree.get_children():
+                self.traffic_zone_tree.delete(item)
+            for index, zone in enumerate(zones):
+                center = getattr(zone, "center_coords", (0, 0))
+                multiplier = float(getattr(zone, "duration_multiplier", 1.0) or 1.0)
+                delay_percent = max(0, round((multiplier - 1.0) * 100))
+                self.traffic_zone_tree.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=(
+                        getattr(zone, "name", "Трафик зона"),
+                        f"{float(center[0]):.6f}, {float(center[1]):.6f}",
+                        f"{float(getattr(zone, 'radius_km', 0) or 0):g}",
+                        f"+{delay_percent}%",
+                        "активна" if getattr(zone, "enabled", True) else "изключена",
+                        "Да" if getattr(zone, "show_on_map", False) else "Не",
+                    ),
+                )
+
     def _sync_center_zone_widgets(self, zones):
         zones_text = self._format_center_zones_text(zones)
         zones_widget = self.widgets.get("locations.center_zones")
@@ -1006,6 +2994,31 @@ locations.*:
             self.center_zone_listbox.delete(0, "end")
             for zone in zones:
                 self.center_zone_listbox.insert("end", self._center_zone_display_label(zone))
+
+        if self.center_zone_tree is not None:
+            for item in self.center_zone_tree.get_children():
+                self.center_zone_tree.delete(item)
+            for index, zone in enumerate(zones):
+                mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+                if mode == "polygon":
+                    geometry = f"полигон, {len(getattr(zone, 'polygon', []) or [])} точки"
+                else:
+                    center = getattr(zone, "center_coords", (0, 0))
+                    geometry = f"{float(center[0]):.6f}, {float(center[1]):.6f} | {float(getattr(zone, 'radius_km', 0) or 0):g} км"
+                self.center_zone_tree.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=(
+                        getattr(zone, "name", "Център зона"),
+                        mode,
+                        geometry,
+                        ", ".join(getattr(zone, "priority_vehicle_types", []) or []) or "-",
+                        ", ".join(getattr(zone, "restricted_vehicle_types", []) or []) or "-",
+                        "активна" if getattr(zone, "enabled", True) else "изключена",
+                        "Да" if getattr(zone, "show_on_map", True) else "Не",
+                    ),
+                )
 
     def _parse_coords_text(self, raw):
         parts = [part.strip() for part in str(raw or "").replace(";", ",").split(",")]
@@ -1042,23 +3055,84 @@ locations.*:
             return
 
         depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        was_existing = name in depots
         depots[name] = coords
-        depot_widget.delete("1.0", "end")
-        depot_widget.insert("1.0", self._format_depots_text(depots))
-        depot_options = getattr(self, "vehicle_depot_options", list(self._named_depots().keys()))
-        if name not in depot_options:
-            depot_options.append(name)
-        self.vehicle_depot_options = depot_options
-        for combo in getattr(self, "depot_choice_widgets", []):
-            combo.configure(values=depot_options)
+        self._sync_depot_widgets(depots)
         name_widget.set("")
         coords_widget.set("")
-        self.status_var.set(f"Депо '{name}' е добавено в списъка. Натисни Запази, за да влезе в config.py.")
+        action = "обновено" if was_existing else "добавено"
+        self.status_var.set(f"Депо '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _remove_selected_depot(self):
+        depot_widget = self.widgets.get("locations.depot_locations")
+        if not isinstance(depot_widget, tk.Text):
+            return
+        index = self._selected_tree_index(self.depot_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.depot_listbox)
+        if index is None:
+            messagebox.showinfo("Няма избрано депо", "Избери депо от списъка.")
+            return
+
+        depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        names = list(depots.keys())
+        if index >= len(names):
+            return
+        name = names[index]
+        depots.pop(name, None)
+        self._sync_depot_widgets(depots)
+        self.status_var.set(f"Депо '{name}' е премахнато. Натисни Запази, за да се махне от config.py.")
+
+    def _load_selected_depot(self, event=None):
+        depot_widget = self.widgets.get("locations.depot_locations")
+        name_widget = self.widgets.get("locations.new_depot_name")
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        if not isinstance(depot_widget, tk.Text):
+            return
+        if not name_widget or not coords_widget:
+            return
+        index = self._selected_tree_index(self.depot_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.depot_listbox)
+        if index is None:
+            return
+
+        depots = self._parse_depots_text(depot_widget.get("1.0", "end-1c"))
+        items = list(depots.items())
+        if index >= len(items):
+            return
+        name, coords = items[index]
+        name_widget.set(name)
+        coords_widget.set(f"{float(coords[0])}, {float(coords[1])}")
+        self.status_var.set(f"Заредено е депо '{name}' за редакция.")
+
+    def _clear_depot_form(self):
+        name_widget = self.widgets.get("locations.new_depot_name")
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        if name_widget:
+            name_widget.set("")
+        if coords_widget:
+            coords_widget.set("")
+        if self.depot_listbox is not None:
+            self.depot_listbox.selection_clear(0, "end")
+        self._clear_tree_selection(self.depot_tree)
+        self.status_var.set("Формата за депо е изчистена.")
+
+    def _show_selected_depot_on_map(self):
+        self._load_selected_depot()
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        if coords is None:
+            messagebox.showinfo("Няма избрано депо", "Избери депо от таблицата.")
+            return
+        self._open_new_depot_editor()
 
     def _append_traffic_zone_from_fields(self):
+        name_widget = self.widgets.get("locations.new_traffic_zone_name")
         coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
         radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
         delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
+        show_on_map_widget = self.widgets.get("locations.new_traffic_zone_show_on_map")
         zones_widget = self.widgets.get("locations.traffic_zones")
         if not all((coords_widget, radius_widget, delay_widget)) or not isinstance(zones_widget, tk.Text):
             return
@@ -1079,20 +3153,145 @@ locations.*:
             return
 
         zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
-        name = self._next_traffic_zone_name(zones)
+        name = name_widget.get().strip() if name_widget else ""
+        if not name:
+            name = self._next_traffic_zone_name(zones)
         multiplier = 1.0 + (delay_percent / 100.0)
-        zones.append(
-            config.TrafficZoneConfig(
-                name=name,
-                center_coords=coords,
-                radius_km=radius,
-                duration_multiplier=multiplier,
-                enabled=True,
-            )
+        zone = config.TrafficZoneConfig(
+            name=name,
+            center_coords=coords,
+            radius_km=radius,
+            duration_multiplier=multiplier,
+            enabled=True,
+            show_on_map=bool(show_on_map_widget.get()) if show_on_map_widget is not None else False,
         )
+        existing_index = next((idx for idx, item in enumerate(zones) if item.name == name), None)
+        if existing_index is None:
+            zones.append(zone)
+            action = "добавена"
+        else:
+            zones[existing_index] = zone
+            action = "обновена"
         self._sync_traffic_zone_widgets(zones)
+        if name_widget:
+            name_widget.set("")
         coords_widget.set("")
-        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+        self.status_var.set(f"Трафик зона '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _load_selected_traffic_zone(self, event=None):
+        zones_widget = self.widgets.get("locations.traffic_zones")
+        if not isinstance(zones_widget, tk.Text):
+            return
+        index = self._selected_tree_index(self.traffic_zone_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.traffic_zone_listbox)
+        if index is None:
+            return
+        zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
+        if index >= len(zones):
+            return
+        zone = zones[index]
+        name_widget = self.widgets.get("locations.new_traffic_zone_name")
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
+        show_on_map_widget = self.widgets.get("locations.new_traffic_zone_show_on_map")
+        center = getattr(zone, "center_coords", (0, 0))
+        if name_widget:
+            name_widget.set(getattr(zone, "name", ""))
+        if coords_widget:
+            coords_widget.set(f"{float(center[0])}, {float(center[1])}")
+        if radius_widget:
+            radius_widget.set(f"{float(getattr(zone, 'radius_km', 0) or 0):g}")
+        if delay_widget:
+            delay_percent = max(0, (float(getattr(zone, "duration_multiplier", 1.0) or 1.0) - 1.0) * 100)
+            delay_widget.set(f"{delay_percent:g}")
+        if show_on_map_widget is not None:
+            show_on_map_widget.set(bool(getattr(zone, "show_on_map", False)))
+        self.status_var.set(f"Заредена е трафик зона '{getattr(zone, 'name', '')}' за редакция.")
+
+    def _clear_traffic_zone_form(self):
+        for key in (
+            "locations.new_traffic_zone_name",
+            "locations.new_traffic_zone_coords",
+            "locations.new_traffic_zone_radius",
+            "locations.new_traffic_zone_delay",
+        ):
+            widget = self.widgets.get(key)
+            if widget:
+                widget.set("")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        delay_widget = self.widgets.get("locations.new_traffic_zone_delay")
+        if radius_widget:
+            radius_widget.set("3")
+        if delay_widget:
+            delay_widget.set("30")
+        show_on_map_widget = self.widgets.get("locations.new_traffic_zone_show_on_map")
+        if show_on_map_widget is not None:
+            show_on_map_widget.set(False)
+        if self.traffic_zone_listbox is not None:
+            self.traffic_zone_listbox.selection_clear(0, "end")
+        self._clear_tree_selection(self.traffic_zone_tree)
+        self.status_var.set("Формата за трафик зона е изчистена.")
+
+    def _show_selected_traffic_zone_on_map(self):
+        self._load_selected_traffic_zone()
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        if coords is None:
+            messagebox.showinfo("Няма избрана зона", "Избери трафик зона от таблицата.")
+            return
+        self._open_new_traffic_zone_editor()
+
+    def _update_center_zone_shape_fields(self, event=None):
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        mode = str(mode_widget.get() if mode_widget is not None else "circle").strip().lower()
+        is_circle = mode == "circle"
+
+        label_widget = getattr(self, "_center_zone_coords_label", None)
+        if label_widget is not None:
+            label_widget.configure(text="Център (lat, lon)" if is_circle else "Полигон (lat, lon на ред)")
+        hint_var = getattr(self, "_center_zone_geometry_hint_var", None)
+        if hint_var is not None:
+            hint_var.set(
+                "Една GPS точка за центъра на кръга."
+                if is_circle
+                else "Минимум 3 различни GPS точки, по една на ред."
+            )
+        map_button = getattr(self, "_center_zone_map_button", None)
+        if map_button is not None:
+            map_button.configure(text="Избери кръг на карта" if is_circle else "Начертай полигон на карта")
+
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.configure(height=2 if is_circle else 6)
+
+        for widget in getattr(self, "_center_zone_radius_widgets", ()):
+            if is_circle:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _update_center_zone_rule_fields(self):
+        priority_enabled_var = self.widgets.get("locations.new_center_zone_enable_priority")
+        restrictions_enabled_var = self.widgets.get("locations.new_center_zone_enable_restrictions")
+        priority_enabled = bool(priority_enabled_var.get()) if priority_enabled_var is not None else True
+        restrictions_enabled = bool(restrictions_enabled_var.get()) if restrictions_enabled_var is not None else True
+
+        for widget in getattr(self, "_center_zone_priority_checkbuttons", {}).values():
+            widget.configure(state="normal" if priority_enabled else "disabled")
+        preset_combo = getattr(self, "_center_zone_rule_preset_combo", None)
+        if preset_combo is not None:
+            preset_combo.configure(state="readonly" if priority_enabled else "disabled")
+        for widget in getattr(self, "_center_zone_priority_value_widgets", ()):
+            widget.configure(state="normal" if priority_enabled else "disabled")
+
+        for widget in getattr(self, "_center_zone_restricted_checkbuttons", {}).values():
+            widget.configure(state="normal" if restrictions_enabled else "disabled")
+        for vehicle_type, widget in getattr(self, "_center_zone_penalty_entries", {}).items():
+            selected_var = self.center_zone_restricted_vars.get(vehicle_type)
+            selected = bool(selected_var.get()) if selected_var is not None else False
+            widget.configure(state="normal" if restrictions_enabled and selected else "disabled")
 
     def _append_center_zone_from_fields(self):
         name_widget = self.widgets.get("locations.new_center_zone_name")
@@ -1101,49 +3300,52 @@ locations.*:
         radius_widget = self.widgets.get("locations.new_center_zone_radius")
         discount_widget = self.widgets.get("locations.new_center_zone_discount")
         outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
-        penalty_widget = self.widgets.get("locations.new_center_zone_penalty")
+        enabled_widget = self.widgets.get("locations.new_center_zone_enabled")
+        show_on_map_widget = self.widgets.get("locations.new_center_zone_show_on_map")
+        enable_priority_widget = self.widgets.get("locations.new_center_zone_enable_priority")
+        enable_restrictions_widget = self.widgets.get("locations.new_center_zone_enable_restrictions")
         zones_widget = self.widgets.get("locations.center_zones")
-        if not all((name_widget, mode_widget, coords_widget, radius_widget, discount_widget, outside_widget, penalty_widget)):
+        if not all((name_widget, mode_widget, coords_widget, radius_widget, discount_widget, outside_widget)):
             return
         if not isinstance(zones_widget, tk.Text):
             return
 
-        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        try:
+            zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"), strict=True)
+        except ValueError as exc:
+            messagebox.showerror("Грешка в център зоните", str(exc))
+            return
         name = name_widget.get().strip() or self._next_center_zone_name(zones)
         mode = str(mode_widget.get() or "circle").strip().lower()
-        if mode not in ("circle", "polygon"):
-            mode = "circle"
-
-        try:
-            radius = float(radius_widget.get() or 0)
-            discount = float(discount_widget.get() or 0.9)
-            outside_penalty = float(outside_widget.get() or 0)
-            penalty = float(penalty_widget.get() or 0)
-        except ValueError:
-            messagebox.showwarning("Грешна център зона", "Радиусът, отстъпката и глобите трябва да са числа.")
-            return
 
         raw_coords = (
             coords_widget.get("1.0", "end-1c")
             if isinstance(coords_widget, tk.Text)
             else coords_widget.get()
         )
-        polygon = []
-        if mode == "polygon":
-            polygon = self._parse_polygon_points_text(raw_coords)
-            if len(polygon) < 3:
-                messagebox.showwarning("Грешен полигон", "За polygon въведи поне 3 точки. Може всяка точка на нов ред.")
-                return
-            center_coords = polygon[0]
-            radius = 0.0
-        else:
-            center_coords = self._parse_coords_text(raw_coords)
-            if center_coords is None:
-                messagebox.showwarning("Грешни координати", "Въведи координати във формат lat, lon.")
-                return
-            if radius <= 0:
-                messagebox.showwarning("Грешен радиус", "Радиусът трябва да е по-голям от 0.")
-                return
+        try:
+            center_coords, radius, polygon = self._parse_center_zone_geometry(
+                mode,
+                raw_coords,
+                radius_widget.get(),
+            )
+        except ValueError as exc:
+            messagebox.showwarning("Грешна геометрия", str(exc))
+            return
+
+        import math
+        try:
+            discount = float(discount_widget.get() or 0.9)
+            outside_penalty = float(outside_widget.get() or 0)
+        except (TypeError, ValueError):
+            messagebox.showwarning("Грешна център зона", "Отстъпката и глобата навън трябва да са числа.")
+            return
+        if not math.isfinite(discount) or discount <= 0:
+            messagebox.showwarning("Грешна отстъпка", "Отстъпката трябва да е положително число.")
+            return
+        if not math.isfinite(outside_penalty) or outside_penalty < 0:
+            messagebox.showwarning("Грешна глоба", "Глобата навън трябва да е число, по-голямо или равно на 0.")
+            return
 
         priority_types = [
             vehicle_type
@@ -1155,44 +3357,277 @@ locations.*:
             for vehicle_type, var in self.center_zone_restricted_vars.items()
             if var.get()
         ]
-        if not priority_types and not restricted_types:
-            messagebox.showwarning("Няма правила", "Избери поне един тип бус за приоритет или глоба.")
+        enable_priority = bool(enable_priority_widget.get()) if enable_priority_widget is not None else True
+        enable_restrictions = (
+            bool(enable_restrictions_widget.get()) if enable_restrictions_widget is not None else True
+        )
+        if enable_priority and not priority_types:
+            messagebox.showwarning("Няма приоритет", "Избери поне един приоритетен тип бус или изключи приоритетните правила.")
+            return
+        if enable_restrictions and not restricted_types:
+            messagebox.showwarning("Няма ограничения", "Избери поне един ограничен тип бус или изключи ограниченията.")
             return
 
-        zones.append(
-            config.CenterZoneConfig(
-                name=name,
-                mode=mode,
-                center_coords=center_coords,
-                radius_km=radius,
-                polygon=polygon,
-                enabled=True,
-                priority_vehicle_types=priority_types,
-                restricted_vehicle_types=restricted_types,
-                discount_priority_vehicle=discount,
-                priority_vehicle_outside_penalty=outside_penalty,
-                vehicle_penalties={vehicle_type: penalty for vehicle_type in restricted_types},
-            )
+        vehicle_penalties = dict(getattr(self, "_center_zone_unmapped_penalties", {}) or {})
+        loaded_penalty_keys = set(getattr(self, "_center_zone_loaded_penalty_keys", set()) or set())
+        penalty_vehicle_types = [
+            vehicle_type
+            for vehicle_type in getattr(self, "center_zone_penalty_vars", {})
+            if vehicle_type in restricted_types or vehicle_type in loaded_penalty_keys
+        ]
+        for vehicle_type in penalty_vehicle_types:
+            penalty_var = getattr(self, "center_zone_penalty_vars", {}).get(vehicle_type)
+            raw_penalty = penalty_var.get() if penalty_var is not None else "0"
+            try:
+                penalty = float(raw_penalty)
+            except (TypeError, ValueError):
+                messagebox.showwarning("Грешна глоба", f"Глобата за {vehicle_type} трябва да е число.")
+                return
+            if not math.isfinite(penalty) or penalty < 0:
+                messagebox.showwarning("Грешна глоба", f"Глобата за {vehicle_type} трябва да е поне 0.")
+                return
+            vehicle_penalties[vehicle_type] = penalty
+
+        edit_index = getattr(self, "_editing_center_zone_index", None)
+        if edit_index is not None and not 0 <= edit_index < len(zones):
+            edit_index = None
+        duplicate_index = next((idx for idx, item in enumerate(zones) if item.name == name), None)
+        if duplicate_index is not None and duplicate_index != edit_index:
+            messagebox.showwarning("Повтарящо се име", f"Вече има център зона с име '{name}'.")
+            return
+
+        zone = config.CenterZoneConfig(
+            name=name,
+            mode=mode,
+            center_coords=center_coords,
+            radius_km=radius,
+            polygon=polygon,
+            enabled=bool(enabled_widget.get()) if enabled_widget is not None else True,
+            show_on_map=bool(show_on_map_widget.get()) if show_on_map_widget is not None else True,
+            enable_priority=enable_priority,
+            enable_restrictions=enable_restrictions,
+            priority_vehicle_types=priority_types,
+            restricted_vehicle_types=restricted_types,
+            discount_priority_vehicle=discount,
+            priority_vehicle_outside_penalty=outside_penalty,
+            vehicle_penalties=vehicle_penalties,
         )
+        if edit_index is None:
+            zones.append(zone)
+            action = "добавена"
+        else:
+            zones[edit_index] = zone
+            action = "обновена"
         self._sync_center_zone_widgets(zones)
-        name_widget.set("")
+        self._clear_center_zone_form(set_status=False)
+        self.status_var.set(f"Център зона '{name}' е {action}. Натисни Запази, за да влезе в config.py.")
+
+    def _load_selected_center_zone(self, event=None):
+        zones_widget = self.widgets.get("locations.center_zones")
+        if not isinstance(zones_widget, tk.Text):
+            return
+        index = self._selected_tree_index(self.center_zone_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.center_zone_listbox)
+        if index is None:
+            return
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
+        if index >= len(zones):
+            return
+        zone = zones[index]
+        self._editing_center_zone_index = index
+
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        enabled_widget = self.widgets.get("locations.new_center_zone_enabled")
+        show_on_map_widget = self.widgets.get("locations.new_center_zone_show_on_map")
+        enable_priority_widget = self.widgets.get("locations.new_center_zone_enable_priority")
+        enable_restrictions_widget = self.widgets.get("locations.new_center_zone_enable_restrictions")
+        mode = str(getattr(zone, "mode", "circle") or "circle").lower()
+
+        if name_widget:
+            name_widget.set(getattr(zone, "name", ""))
+        if mode_widget:
+            mode_widget.set(mode)
         if isinstance(coords_widget, tk.Text):
             coords_widget.delete("1.0", "end")
-        else:
-            coords_widget.set("")
-        self.status_var.set(f"Добавена е {name}. Натисни Запази, за да влезе в config.py.")
+            if mode == "polygon":
+                coords_widget.insert("1.0", self._format_polygon_text(getattr(zone, "polygon", []) or []))
+            else:
+                center = getattr(zone, "center_coords", (0, 0))
+                coords_widget.insert("1.0", f"{float(center[0])}, {float(center[1])}")
+        if radius_widget:
+            radius_widget.set(f"{float(getattr(zone, 'radius_km', 0) or 0):g}")
+        if discount_widget:
+            discount_widget.set(f"{float(getattr(zone, 'discount_priority_vehicle', 0.9) or 0.9):g}")
+        if outside_widget:
+            outside_widget.set(f"{float(getattr(zone, 'priority_vehicle_outside_penalty', 0.0) or 0.0):g}")
+        if enabled_widget is not None:
+            enabled_widget.set(bool(getattr(zone, "enabled", True)))
+        if show_on_map_widget is not None:
+            show_on_map_widget.set(bool(getattr(zone, "show_on_map", True)))
+        if enable_priority_widget is not None:
+            enable_priority_widget.set(bool(getattr(zone, "enable_priority", True)))
+        if enable_restrictions_widget is not None:
+            enable_restrictions_widget.set(bool(getattr(zone, "enable_restrictions", True)))
+
+        penalties = getattr(zone, "vehicle_penalties", {}) or {}
+        self._center_zone_loaded_penalty_keys = set(penalties)
+        known_vehicle_types = set(getattr(self, "center_zone_penalty_vars", {}))
+        self._center_zone_unmapped_penalties = {
+            vehicle_type: float(value)
+            for vehicle_type, value in penalties.items()
+            if vehicle_type not in known_vehicle_types
+        }
+        for vehicle_type, penalty_var in getattr(self, "center_zone_penalty_vars", {}).items():
+            penalty_var.set(f"{float(penalties.get(vehicle_type, 40000.0)):g}")
+
+        priority_types = set(getattr(zone, "priority_vehicle_types", []) or [])
+        restricted_types = set(getattr(zone, "restricted_vehicle_types", []) or [])
+        for vehicle_type, var in self.center_zone_priority_vars.items():
+            var.set(vehicle_type in priority_types)
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(vehicle_type in restricted_types)
+
+        preset_widget = self.widgets.get("locations.new_center_zone_rule_preset")
+        if preset_widget is not None:
+            preset_widget.set("custom")
+
+        self._update_center_zone_shape_fields()
+        self._update_center_zone_rule_fields()
+        self.status_var.set(f"Заредена е център зона '{getattr(zone, 'name', '')}' за редакция.")
+
+    def _clear_center_zone_form(self, set_status=True):
+        name_widget = self.widgets.get("locations.new_center_zone_name")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        discount_widget = self.widgets.get("locations.new_center_zone_discount")
+        outside_widget = self.widgets.get("locations.new_center_zone_outside_penalty")
+        enabled_widget = self.widgets.get("locations.new_center_zone_enabled")
+        show_on_map_widget = self.widgets.get("locations.new_center_zone_show_on_map")
+        enable_priority_widget = self.widgets.get("locations.new_center_zone_enable_priority")
+        enable_restrictions_widget = self.widgets.get("locations.new_center_zone_enable_restrictions")
+        self._editing_center_zone_index = None
+        self._center_zone_unmapped_penalties = {}
+        self._center_zone_loaded_penalty_keys = set()
+        if name_widget:
+            name_widget.set("")
+        if mode_widget:
+            mode_widget.set("circle")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+        if radius_widget:
+            radius_widget.set("1.5")
+        if discount_widget:
+            discount_widget.set("0.9")
+        if outside_widget:
+            outside_widget.set("0")
+        if enabled_widget is not None:
+            enabled_widget.set(True)
+        if show_on_map_widget is not None:
+            show_on_map_widget.set(True)
+        if enable_priority_widget is not None:
+            enable_priority_widget.set(True)
+        if enable_restrictions_widget is not None:
+            enable_restrictions_widget.set(True)
+        for penalty_var in getattr(self, "center_zone_penalty_vars", {}).values():
+            penalty_var.set("40000")
+        for vehicle_type, var in self.center_zone_priority_vars.items():
+            var.set(vehicle_type == "center_bus")
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(vehicle_type != "center_bus")
+        if self.center_zone_listbox is not None:
+            self.center_zone_listbox.selection_clear(0, "end")
+        self._clear_tree_selection(self.center_zone_tree)
+        preset_widget = self.widgets.get("locations.new_center_zone_rule_preset")
+        if preset_widget is not None:
+            preset_widget.set("center_bus")
+        self._update_center_zone_shape_fields()
+        self._update_center_zone_rule_fields()
+        if set_status:
+            self.status_var.set("Формата за център зона е изчистена.")
+
+    def _apply_center_zone_rule_preset(self, event=None):
+        preset_widget = self.widgets.get("locations.new_center_zone_rule_preset")
+        preset = str(preset_widget.get() if preset_widget is not None else "custom").strip()
+        if preset == "custom":
+            return
+
+        for vehicle_type, var in self.center_zone_priority_vars.items():
+            var.set(False)
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(False)
+
+        if preset in self.center_zone_priority_vars:
+            self.center_zone_priority_vars[preset].set(True)
+        for vehicle_type, var in self.center_zone_restricted_vars.items():
+            var.set(vehicle_type != preset)
+        self._update_center_zone_rule_fields()
+
+    def _show_selected_center_zone_on_map(self):
+        self._load_selected_center_zone()
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        raw_coords = coords_widget.get("1.0", "end-1c") if isinstance(coords_widget, tk.Text) else ""
+        if not raw_coords.strip():
+            messagebox.showinfo("Няма избрана зона", "Избери център зона от таблицата.")
+            return
+        self._open_new_center_zone_editor()
+
+    def _toggle_selected_traffic_zone_visibility(self):
+        zones_widget = self.widgets.get("locations.traffic_zones")
+        index = self._selected_tree_index(self.traffic_zone_tree)
+        if not isinstance(zones_widget, tk.Text) or index is None:
+            messagebox.showinfo("Няма избрана зона", "Избери трафик зона от таблицата.")
+            return
+        zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
+        if not 0 <= index < len(zones):
+            return
+        zone = zones[index]
+        zone.show_on_map = not bool(getattr(zone, "show_on_map", False))
+        self._sync_traffic_zone_widgets(zones)
+        if self.traffic_zone_tree is not None:
+            self.traffic_zone_tree.selection_set(str(index))
+        self.status_var.set(
+            f"Зона '{zone.name}' {'ще се показва' if zone.show_on_map else 'няма да се показва'} "
+            "на картата след Запази."
+        )
+
+    def _toggle_selected_center_zone_visibility(self):
+        zones_widget = self.widgets.get("locations.center_zones")
+        index = self._selected_tree_index(self.center_zone_tree)
+        if not isinstance(zones_widget, tk.Text) or index is None:
+            messagebox.showinfo("Няма избрана зона", "Избери център зона от таблицата.")
+            return
+        zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"), strict=True)
+        if not 0 <= index < len(zones):
+            return
+        zone = zones[index]
+        zone.show_on_map = not bool(getattr(zone, "show_on_map", True))
+        self._sync_center_zone_widgets(zones)
+        if self.center_zone_tree is not None:
+            self.center_zone_tree.selection_set(str(index))
+        self.status_var.set(
+            f"Зона '{zone.name}' {'ще се показва' if zone.show_on_map else 'няма да се показва'} "
+            "на картата след Запази."
+        )
 
     def _remove_selected_traffic_zone(self):
         zones_widget = self.widgets.get("locations.traffic_zones")
-        if not isinstance(zones_widget, tk.Text) or self.traffic_zone_listbox is None:
+        if not isinstance(zones_widget, tk.Text):
             return
-        selection = self.traffic_zone_listbox.curselection()
-        if not selection:
+        index = self._selected_tree_index(self.traffic_zone_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.traffic_zone_listbox)
+        if index is None:
             messagebox.showinfo("Няма избрана зона", "Избери зона от списъка.")
             return
 
         zones = self._parse_traffic_zones_text(zones_widget.get("1.0", "end-1c"))
-        index = selection[0]
         if index >= len(zones):
             return
         removed = zones.pop(index)
@@ -1201,19 +3636,21 @@ locations.*:
 
     def _remove_selected_center_zone(self):
         zones_widget = self.widgets.get("locations.center_zones")
-        if not isinstance(zones_widget, tk.Text) or self.center_zone_listbox is None:
+        if not isinstance(zones_widget, tk.Text):
             return
-        selection = self.center_zone_listbox.curselection()
-        if not selection:
+        index = self._selected_tree_index(self.center_zone_tree)
+        if index is None:
+            index = self._selected_listbox_index(self.center_zone_listbox)
+        if index is None:
             messagebox.showinfo("Няма избрана зона", "Избери център зона от списъка.")
             return
 
         zones = self._parse_center_zones_text(zones_widget.get("1.0", "end-1c"))
-        index = selection[0]
         if index >= len(zones):
             return
         removed = zones.pop(index)
         self._sync_center_zone_widgets(zones)
+        self._clear_center_zone_form(set_status=False)
         self.status_var.set(f"Премахната е {removed.name}. Натисни Запази, за да се махне от config.py.")
 
     def _add_depot_choice_field(self, parent, row, key, label, value, options, tooltip=""):
@@ -1225,6 +3662,7 @@ locations.*:
         combo = ttk.Combobox(parent, textvariable=var, values=options, state="normal", width=34)
         combo.grid(row=row, column=1, sticky="w", padx=6, pady=6)
         self._bind_text_editing(combo)
+        self._bind_combobox_scrolling(combo)
         self.widgets[key] = var
         if key.endswith(".start_depot_name"):
             self.depot_choice_widgets.append(combo)
@@ -1300,13 +3738,47 @@ locations.*:
         mode_widget = self.widgets.get("locations.new_center_zone_mode")
         if mode_widget is not None:
             mode_widget.set("polygon")
+        self._update_center_zone_shape_fields()
+
+    def _set_new_depot_coords(self, coords):
+        widget = self.widgets.get("locations.new_depot_coords")
+        if widget is not None:
+            widget.set(f"{float(coords[0])}, {float(coords[1])}")
+
+    def _set_new_traffic_zone_circle(self, center, radius):
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        if coords_widget is not None:
+            coords_widget.set(f"{float(center[0])}, {float(center[1])}")
+        if radius_widget is not None:
+            radius_widget.set(f"{float(radius):g}")
+
+    def _set_new_center_zone_circle(self, center, radius):
+        coords_widget = self.widgets.get("locations.new_center_zone_coords")
+        radius_widget = self.widgets.get("locations.new_center_zone_radius")
+        if isinstance(coords_widget, tk.Text):
+            coords_widget.delete("1.0", "end")
+            coords_widget.insert("1.0", f"{float(center[0])}, {float(center[1])}")
+        if radius_widget is not None:
+            radius_widget.set(f"{float(radius):g}")
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        if mode_widget is not None:
+            mode_widget.set("circle")
+        self._update_center_zone_shape_fields()
+
+    def _default_map_center(self):
+        center_widget = self.widgets.get("locations.center_location")
+        if center_widget is not None:
+            try:
+                parts = [float(part.strip()) for part in center_widget.get().split(",")[:2]]
+                if len(parts) == 2:
+                    return [parts[0], parts[1]]
+            except Exception:
+                pass
+        return [42.69735652560932, 23.323809998750914]
 
     def _open_center_zone_editor(self):
-        center_raw = self.widgets.get("locations.center_location").get()
-        try:
-            center = [float(part.strip()) for part in center_raw.split(",")[:2]]
-        except Exception:
-            center = [42.69735652560932, 23.323809998750914]
+        center = self._default_map_center()
 
         polygon_widget = self.widgets.get("locations.center_zone_polygon")
         polygon_raw = polygon_widget.get("1.0", "end-1c") if isinstance(polygon_widget, tk.Text) else ""
@@ -1314,23 +3786,285 @@ locations.*:
 
         self._open_polygon_editor(center, polygon, self._set_center_zone_polygon)
 
+    def _open_new_depot_editor(self):
+        coords_widget = self.widgets.get("locations.new_depot_coords")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        center = [coords[0], coords[1]] if coords else self._default_map_center()
+        self._open_point_editor(center, self._set_new_depot_coords, "Избор на депо")
+
+    def _open_new_traffic_zone_editor(self):
+        coords_widget = self.widgets.get("locations.new_traffic_zone_coords")
+        radius_widget = self.widgets.get("locations.new_traffic_zone_radius")
+        coords = self._parse_coords_text(coords_widget.get()) if coords_widget is not None else None
+        center = [coords[0], coords[1]] if coords else self._default_map_center()
+        try:
+            radius = float(radius_widget.get() or 3) if radius_widget is not None else 3.0
+        except ValueError:
+            radius = 3.0
+        self._open_circle_editor(center, radius, self._set_new_traffic_zone_circle, "Трафик зона")
+
     def _open_new_center_zone_editor(self):
+        mode_widget = self.widgets.get("locations.new_center_zone_mode")
+        mode = str(mode_widget.get() if mode_widget is not None else "circle").strip().lower()
         coords_widget = self.widgets.get("locations.new_center_zone_coords")
         raw_coords = coords_widget.get("1.0", "end-1c") if isinstance(coords_widget, tk.Text) else ""
-        polygon = self._parse_polygon_points_text(raw_coords)
         center_coords = self._parse_coords_text(raw_coords)
+        center = [center_coords[0], center_coords[1]] if center_coords else self._default_map_center()
+        if mode == "circle":
+            radius_widget = self.widgets.get("locations.new_center_zone_radius")
+            try:
+                radius = float(radius_widget.get() or 1.5) if radius_widget is not None else 1.5
+            except ValueError:
+                radius = 1.5
+            self._open_circle_editor(center, radius, self._set_new_center_zone_circle, "Център зона")
+            return
+
+        polygon = self._parse_polygon_points_text(raw_coords)
         if polygon:
             center = [polygon[0][0], polygon[0][1]]
         elif center_coords:
             center = [center_coords[0], center_coords[1]]
         else:
-            center_raw = self.widgets.get("locations.center_location").get()
-            try:
-                center = [float(part.strip()) for part in center_raw.split(",")[:2]]
-            except Exception:
-                center = [42.69735652560932, 23.323809998750914]
+            center = self._default_map_center()
 
         self._open_polygon_editor(center, polygon, self._set_new_center_zone_polygon)
+
+    def _open_point_editor(self, center, on_save_callback, title):
+        gui = self
+        server_box = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, status, body, content_type="text/html; charset=utf-8"):
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._send(200, gui._point_editor_html(center, title))
+
+            def do_POST(self):
+                if self.path != "/save":
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = self.rfile.read(length).decode("utf-8")
+                try:
+                    data = json.loads(payload)
+                    point = data.get("point", [])
+                    saved_point = (float(point[0]), float(point[1]))
+                    gui.root.after(0, lambda: on_save_callback(saved_point))
+                    self._send(200, "OK", "text/plain; charset=utf-8")
+                    threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
+                except Exception as exc:
+                    self._send(400, str(exc), "text/plain; charset=utf-8")
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_box["server"] = server
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+
+    def _point_editor_html(self, center, title):
+        center_json = json.dumps(center)
+        title_json = json.dumps(title, ensure_ascii=False)
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; }}
+    body {{ font-family: Arial, sans-serif; }}
+    #panel {{
+      position: absolute; top: 10px; left: 50px; z-index: 1000;
+      background: white; border: 1px solid #777; border-radius: 4px;
+      padding: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+    }}
+    button {{ padding: 6px 10px; cursor: pointer; }}
+    #coords {{ margin-left: 8px; color: #255; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <button onclick="savePoint()">Запази точката</button>
+    <span id="coords"></span>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const center = {center_json};
+    const title = {title_json};
+    const map = L.map("map").setView(center, 13);
+    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }}).addTo(map);
+
+    const marker = L.marker(center, {{ draggable: true }}).addTo(map).bindPopup(title).openPopup();
+
+    function updateLabel() {{
+      const p = marker.getLatLng();
+      document.getElementById("coords").textContent = `${{p.lat.toFixed(6)}}, ${{p.lng.toFixed(6)}}`;
+    }}
+
+    marker.on("drag", updateLabel);
+    map.on("click", function(event) {{
+      marker.setLatLng(event.latlng);
+      updateLabel();
+    }});
+    updateLabel();
+
+    async function savePoint() {{
+      const p = marker.getLatLng();
+      const point = [Number(p.lat.toFixed(8)), Number(p.lng.toFixed(8))];
+      const response = await fetch("/save", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ point }})
+      }});
+      document.getElementById("coords").textContent = response.ok
+        ? "Запазено в GUI. Можеш да затвориш този прозорец."
+        : "Грешка при запис.";
+    }}
+  </script>
+</body>
+</html>"""
+
+    def _open_circle_editor(self, center, radius_km, on_save_callback, title):
+        gui = self
+        server_box = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, status, body, content_type="text/html; charset=utf-8"):
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._send(200, gui._circle_editor_html(center, radius_km, title))
+
+            def do_POST(self):
+                if self.path != "/save":
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = self.rfile.read(length).decode("utf-8")
+                try:
+                    data = json.loads(payload)
+                    center_point = data.get("center", [])
+                    saved_center = (float(center_point[0]), float(center_point[1]))
+                    saved_radius = float(data.get("radius_km", 0))
+                    gui.root.after(0, lambda: on_save_callback(saved_center, saved_radius))
+                    self._send(200, "OK", "text/plain; charset=utf-8")
+                    threading.Thread(target=server_box["server"].shutdown, daemon=True).start()
+                except Exception as exc:
+                    self._send(400, str(exc), "text/plain; charset=utf-8")
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_box["server"] = server
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+
+    def _circle_editor_html(self, center, radius_km, title):
+        center_json = json.dumps(center)
+        radius = max(0.1, float(radius_km or 1.0))
+        title_json = json.dumps(title, ensure_ascii=False)
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; }}
+    body {{ font-family: Arial, sans-serif; }}
+    #panel {{
+      position: absolute; top: 10px; left: 50px; z-index: 1000;
+      background: white; border: 1px solid #777; border-radius: 4px;
+      padding: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+      display: flex; align-items: center; gap: 8px;
+    }}
+    input {{ width: 80px; padding: 5px; }}
+    button {{ padding: 6px 10px; cursor: pointer; }}
+    #status {{ color: #255; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <button onclick="saveCircle()">Запази зоната</button>
+    <label>Радиус км <input id="radius" type="number" min="0.1" step="0.1" value="{radius:g}"></label>
+    <span id="status"></span>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const center = {center_json};
+    const title = {title_json};
+    const map = L.map("map").setView(center, 13);
+    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap"
+    }}).addTo(map);
+
+    const marker = L.marker(center, {{ draggable: true }}).addTo(map).bindPopup(title).openPopup();
+    const circle = L.circle(center, {{
+      radius: Number(document.getElementById("radius").value) * 1000,
+      color: "#2563eb",
+      fillColor: "#2563eb",
+      fillOpacity: 0.14
+    }}).addTo(map);
+
+    function updateCircle() {{
+      const p = marker.getLatLng();
+      const radiusKm = Number(document.getElementById("radius").value || 0);
+      circle.setLatLng(p);
+      circle.setRadius(Math.max(0.1, radiusKm) * 1000);
+      document.getElementById("status").textContent = `${{p.lat.toFixed(6)}}, ${{p.lng.toFixed(6)}}`;
+    }}
+
+    marker.on("drag", updateCircle);
+    document.getElementById("radius").addEventListener("input", updateCircle);
+    map.on("click", function(event) {{
+      marker.setLatLng(event.latlng);
+      updateCircle();
+    }});
+    updateCircle();
+    try {{ map.fitBounds(circle.getBounds(), {{ padding: [20, 20] }}); }} catch (err) {{}}
+
+    async function saveCircle() {{
+      const p = marker.getLatLng();
+      const radiusKm = Math.max(0.1, Number(document.getElementById("radius").value || 0));
+      const centerPoint = [Number(p.lat.toFixed(8)), Number(p.lng.toFixed(8))];
+      const response = await fetch("/save", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ center: centerPoint, radius_km: radiusKm }})
+      }});
+      document.getElementById("status").textContent = response.ok
+        ? "Запазено в GUI. Можеш да затвориш този прозорец."
+        : "Грешка при запис.";
+    }}
+  </script>
+</body>
+</html>"""
 
     def _open_polygon_editor(self, center, polygon, on_save_callback):
         gui = self
@@ -1524,7 +4258,7 @@ locations.*:
   Какво се отделя към склад преди solver-а.
 
 Солвър:
-  Избор PyVRP/OR-Tools, време, пропускане, работно време, OSRM/Valhalla и фини настройки.
+  Избор PyVRP/OR-Tools/VROOM/VRP-Rust, време, пропускане, работно време, OSRM/Valhalla и фини настройки.
 
 Локации:
   Главно депо, Враца, допълнителни депа, център зона, трафик зони и глоби.
@@ -1591,9 +4325,9 @@ locations.*:
 
 Искам различна output папка за всеки run:
   "output": {
-    "excel_output_dir": "H:\\Run1",
-    "routes_output_dir": "H:\\Run1\\Routes",
-    "csv_output_file": "H:\\Run1\\routes.csv"
+    "excel_output_dir": "H:/Run1",
+    "routes_output_dir": "H:/Run1/Routes",
+    "csv_output_file": "H:/Run1/routes.csv"
   }
                 """,
                 38,
@@ -1691,7 +4425,7 @@ CVRP Optimizer прави маршрути за бусове.
   2. Чете GPS, обем, документ, склад и работно време.
   3. Отделя невалидни/невъзможни заявки към склад/необслужени.
   4. Строи матрица с разстояния и времена чрез OSRM или Valhalla.
-  5. Решава задачата с PyVRP или OR-Tools.
+  5. Решава задачата с PyVRP, OR-Tools, VROOM или VRP-Rust.
   6. Избира най-доброто решение, когато има паралелни worker-и.
   7. Генерира Excel, CSV, HTML карти, route карти и графики.
   8. По желание изпраща готовите маршрути към Bizant чрез setData.
@@ -1780,7 +4514,8 @@ JSON/Excel field mapping:
 Работно време:
   WorkTime: "08:00 - 16:00"
   Поддържа и "08:00-13:00". Ако са подадени два реда, напр. 08:00-13:00 и 16:00-18:00,
-  програмата използва първия прозорец, защото solver-ите са настроени за един прозорец на клиент.
+  програмата нормализира и подава и двата валидни прозореца към избрания CVRP solver.
+  В JSON новият ред трябва да бъде escape \\n: "08:00-13:00\\n16:00-18:00".
   Ако липсва, клиентът се приема постоянно отворен.
 
 Коментар доставка:
@@ -1842,15 +4577,15 @@ capacity_toleranse:
   fixed_cost:
     Цена за използване на бус. По-висока стойност намалява желанието да се използва този тип.
   max_distance_km:
-    Максимално разстояние за маршрут. Празно = без лимит.
+    Максимален общ дневен пробег на физическия бус. Празно = без лимит.
   max_time_hours:
-    Максимално работно време.
+    Максимално общо работно време за деня.
   service_time_minutes:
     Време за обслужване на клиент.
   enabled:
     Дали типът е активен.
   start_location:
-    Координати на стартово депо.
+    Координати на стартово депо в config/API. В GUI стартът се избира по име на депо.
   end_location:
     Крайна GPS точка. Празно = същото като стартовото депо.
   start_depot_name:
@@ -1861,8 +4596,14 @@ capacity_toleranse:
     Депо за финална route подредба.
   start_time_minutes:
     480 = 08:00.
+  max_customers_per_day:
+    Общ брой клиенти на физическия бус през всички курсове за деня.
   max_customers_per_route:
-    Максимален брой клиенти в един маршрут.
+    Legacy fallback; използвай дневния лимит за нови настройки.
+  reload_location / reload_depot_name:
+    Депо за връщане между курсовете.
+  reload_time_minutes:
+    Време за презареждане между два курса.
 
 API варианти:
   vehicle_counts:
@@ -1927,6 +4668,10 @@ API пример:
     Общ градски multiplier.
   traffic_zones:
     Списък от допълнителни зони с center, radius_km, multiplier, enabled.
+
+Center zone правилата са soft цени/глоби, не абсолютна забрана. В pure time режим
+точният им ефект зависи от solver-а; за надеждно влияние на отстъпките използвай distance.
+Трафик зоните се прилагат само когато глобалното enable_city_traffic_adjustment е включено.
                 """,
                 38,
             ),
@@ -1935,16 +4680,31 @@ API пример:
                 """
 solver_type:
   pyvrp:
-    Основен качествен solver.
+    Стабилният PyVRP 0.13.x (минимум 0.13.4) и основният качествен solver.
     Добър при повече време и различни seed-ове.
+  pyvrp_experimental:
+    Изолиран PyVRP 0.14 sidecar за сравнение, без да заменя stable версията.
+    Изисква работещ companion worker; при липса връща грешка, освен ако fallback е разрешен.
   or_tools:
     Стабилен solver за сравнение и контрол.
+  vroom:
+    Официалният VROOM 1.15 sidecar за еднокурсни маршрути.
+  vrp:
+    Експерименталният VRP-Rust sidecar за независимо сравнение с PyVRP.
+    Поддържа повторни курсове и използва готовите OSRM/Valhalla матрици.
 
 objective_metric:
   distance:
     Solver-ът търси най-къси километри.
   time:
     Solver-ът търси най-кратко време по OSRM/Valhalla duration матрицата.
+
+time_objective_include_waiting:
+  True:
+    Минимизира целия работен ден: пътуване, обслужване, чакане и презареждане.
+    Fitness е само времето в секунди; реалните метри остават за ограничения и отчети.
+  False:
+    Запазва старото поведение: пътуване, обслужване и презареждане без директна цена за чакането.
 
 time_limit_seconds:
   Колко секунди solver-ът търси решение.
@@ -1971,10 +4731,10 @@ enable_customer_time_windows:
   При PyVRP worker-ите използват различни seed-ове.
   Накрая се избира най-добрият fitness score.
                 """,
-                32,
+                37,
             ),
             (
-                "8. PyVRP и OR-Tools фини настройки",
+                "8. PyVRP, OR-Tools, VROOM и VRP-Rust настройки",
                 """
 PyVRP:
   pyvrp_seed:
@@ -1987,12 +4747,44 @@ PyVRP:
     Колко дълго търпи липса на подобрение.
   pyvrp_ils_history_length:
     ILS история.
+  pyvrp_exhaustive_on_best:
+    Пуска по-задълбочено локално търсене при ново най-добро решение.
   pyvrp_use_extended_operators:
     По-тежки move operators.
   pyvrp_min_perturbations / pyvrp_max_perturbations:
     Сила на разбъркване при restart.
   pyvrp_display_progress:
     Показва прогрес лог.
+
+PyVRP experimental sidecar:
+  pyvrp_next_worker_path:
+    Optional път до отделния 0.14 worker. Празно = автоматично откриване до приложението.
+  pyvrp_next_worker_timeout_seconds:
+    0 = автоматичен timeout; положителна стойност = твърд лимит за worker процеса.
+  pyvrp_next_fallback_to_stable:
+    Разрешава изрична подмяна със stable 0.13 само ако experimental worker-ът се провали.
+
+VROOM sidecar:
+  vroom_worker_path:
+    Optional път до VROOM worker. Празно = автоматично откриване.
+  vroom_worker_timeout_seconds:
+    0 = автоматичен timeout; положителна стойност = твърд лимит.
+  vroom_threads:
+    0 = автоматичен брой вътрешни нишки.
+  vroom_exploration_level:
+    Качество 0..5; 5 е най-задълбоченото търсене.
+
+VRP-Rust experimental sidecar:
+  vrp_worker_path:
+    Optional път до отделния VRP-Rust worker. Празно = автоматично откриване.
+  vrp_worker_timeout_seconds:
+    0 = автоматичен timeout; положителна стойност = твърд лимит за worker процеса.
+  vrp_threads:
+    0 = автоматичен брой нишки; положителна стойност = точен брой вътрешни нишки.
+  vrp_max_generations:
+    Горна граница на поколенията; времевият лимит остава основната граница на run-а.
+  vrp_log_progress:
+    Показва progress съобщенията от VRP-Rust worker-а.
 
 OR-Tools:
   first_solution_strategy:
@@ -2010,7 +4802,7 @@ OR-Tools:
   log_search:
     OR-Tools search лог.
                 """,
-                36,
+                49,
             ),
             (
                 "9. Routing матрица, OSRM и Valhalla",
@@ -2055,7 +4847,7 @@ Valhalla:
                 """
 HTML карти:
   enable_interactive_map:
-    Генерира обща карта.
+    Генерира общата и индивидуалните карти заедно; няма отделен switch за тях.
   map_output_file:
     Файл за общата карта.
   routes_output_dir:
@@ -2063,11 +4855,13 @@ HTML карти:
   route_maps_upload_mode:
     disabled = не качва, legacy = старото поведение, effect_upload = качва HTML маршрутите към upload endpoint.
   route_maps_upload_url:
-    URL за качване, напр. https://effect.bg/dragon/hellbizante/upload-files.php
+    URL за качване, напр. https://example.com/upload-files.php
   route_maps_upload_token:
-    Token за pData. За Effect endpoint-а е Effect-Bizante-Token.
+    Използвай конфигурирания token за upload endpoint-а; не го публикувай в примери/логове.
   route_maps_upload_file_field:
     Обикновено files[], за да стигне до PHP като $_FILES['files'].
+  route_maps_upload_bus_id_field:
+    Обикновено pData2[], за да стигне до PHP като $_POST['pData2'] масив. Редът съвпада с files[].
   map_provider:
     osm или google.
   google_maps_api_key:
@@ -2075,15 +4869,15 @@ HTML карти:
 
 Excel:
   enable_excel_output:
-    Генерира Excel отчети.
+    Генерира един cvrp_report_<date>.xlsx с отделни sheets.
   excel_output_dir:
     Папка за Excel.
   routes_excel_file:
-    Маршрути.
+    Legacy име за съвместимост; активният workflow използва общия workbook.
   warehouse_excel_file:
-    Необслужени/склад.
+    Legacy име за съвместимост; необслужените са отделен sheet.
   efficiency_excel_file:
-    Ефективност.
+    Legacy име за съвместимост; обобщението е в общия workbook.
 
 CSV:
   enable_csv_output:
@@ -2098,9 +4892,9 @@ CSV:
     Папка за графики.
 
 Важно за output:
-  Output пътищата трябва да съществуват.
-  Програмата трябва да има права за писане.
-  Ако подадеш H:\\..., този drive/share трябва да е достъпен от компютъра, който стартира програмата.
+  Програмата създава липсващите подпапки, когато основният drive/share е достъпен.
+  Тя трябва да има права за писане.
+  Ако подадеш H:/..., този drive/share трябва да е достъпен от компютъра, който стартира програмата.
                 """,
                 34,
             ),
@@ -2217,7 +5011,7 @@ enable_make_group:
   - Ако маршрутът е дълъг, гледай дали Google Maps частите са логични.
 
 5. Solver сравнение:
-  - PyVRP и OR-Tools трябва да се сравняват върху едни и същи клиенти.
+  - PyVRP, OR-Tools, VROOM и VRP-Rust трябва да се сравняват върху едни и същи клиенти и ограничения.
   - Сравнявай километри, време, брой бусове и необслужени клиенти.
   - Не сравнявай само score, ако двата solver-а имат различни вътрешни скали.
                 """,
@@ -2248,7 +5042,8 @@ API key:
     Authorization: Bearer <key>
 
 Едновременно стартиране:
-  API пази само един активен run.
+  /run, /run_saturday и Web пазят само един активен основен run.
+  Синхронният /solve не участва в този lock и не трябва да се ползва като паралелна run queue.
   Ако върне 409, вече има текуща оптимизация.
 
 Callback:
@@ -2264,15 +5059,17 @@ POST /solve с клиенти, настройки, депа, бусове, outpu
 
 {
   "settings": {
-    "solver_type": "pyvrp",
+    "solver_type": "pyvrp_experimental",
+    "objective_metric": "distance",
     "time_limit_seconds": 180,
+    "enable_multiple_trips": true,
     "depots": {
       "main": [42.6957, 23.2316],
       "vratza": [43.2210, 23.5344]
     },
     "vehicles": [
-      { "vehicle_type": "internal_bus", "count": 7, "capacity": 385, "start_depot_name": "main", "end_location": [42.7000, 23.4000] },
-      { "vehicle_type": "vratza_bus", "count": 3, "capacity": 385, "start_depot_name": "vratza", "end_depot_name": "vratza" }
+      { "vehicle_type": "internal_bus", "count": 7, "capacity": 385, "max_time_hours": 8, "max_customers_per_day": 45, "start_depot_name": "main", "reload_depot_name": "main", "reload_time_minutes": 30, "end_location": [42.7000, 23.4000] },
+      { "vehicle_type": "vratza_bus", "count": 3, "capacity": 385, "start_depot_name": "vratza", "reload_depot_name": "vratza", "end_depot_name": "vratza" }
     ],
     "center_zone": {
       "mode": "circle",
@@ -2282,8 +5079,11 @@ POST /solve с клиенти, настройки, депа, бусове, outpu
       "external_bus_penalty": 40000,
       "vratza_bus_penalty": 40000
     },
+    "center_zones": [
+      { "name": "Видин", "mode": "circle", "center": [43.99,22.87], "radius_km": 8, "priority_vehicle_types": ["special_bus"], "restricted_vehicle_types": ["internal_bus"], "discount_priority_vehicle": 0.8, "vehicle_penalties": {"internal_bus": 40000}, "enabled": true, "show_on_map": true }
+    ],
     "traffic_zones": [
-      { "name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true }
+      { "name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true, "show_on_map": false }
     ],
     "osrm": {
       "base_url": "http://localhost:5000",
@@ -2292,28 +5092,115 @@ POST /solve с клиенти, настройки, депа, бусове, outpu
     },
     "output": {
       "enable_excel_output": true,
-      "excel_output_dir": "H:\\Out",
+      "excel_output_dir": "H:/Out",
       "enable_csv_output": true,
-      "csv_output_file": "H:\\Out\\routes.csv"
+      "csv_output_file": "H:/Out/routes.csv"
     },
     "set_data": {
       "enable_set_data_upload": false
     }
   },
   "customers": [
-    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00-13:00", "DeliveryComment": "Обади се 10 мин преди доставка" }
+    { "IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00-13:00\\n16:00-18:00", "ServiceTimeMinutes": 6, "Mandatory": true, "DeliveryComment": "Обади се 10 мин преди доставка" }
   ]
 }
                 """,
                 45,
             ),
             (
-                "16. Диагностика",
+                "16. Работни прозорци, обслужване и втори курсове",
+                """
+Няколко работни прозореца:
+  WorkTime може да бъде "08:00-13:00\\n16:00-18:00".
+  В JSON новият ред трябва да е escape \\n, а не суров control character.
+  Всички нормализирани прозорци се подават към solver адаптера.
+
+Обслужване при клиент:
+  JSON полето се избира от input.json_service_time_field.
+  Валидна клиентска стойност заменя времето от буса само за този клиент.
+  При липса/празна стойност се използва service_time_minutes на буса.
+  Това важи за пълния CVRP вход. /tsp използва една обща service_time_minutes стойност за заявката.
+
+Задължителен клиент:
+  JSON полето се избира от input.json_mandatory_field; default е Mandatory.
+  Excel колоната се избира от input.mandatory_column; default е Задължителен.
+  true/1/да забранява пропускането дори когато allow_customer_skipping е включено.
+  Ако такъв клиент е физически невъзможен, run-ът се отхвърля вместо да го прати тихо към склада.
+
+Втори курсове:
+  cvrp.enable_multiple_trips включва динамични допълнителни курсове.
+  Капацитетът е за курс; време, километри и max_customers_per_day са общи за деня.
+  reload_location и reload_time_minutes описват връщането между курсовете.
+  Броят курсове се определя от оставащите дневни лимити.
+  VROOM 1.15 изисква вторите курсове да са изключени.
+  VRP-Rust отказва комбинацията multiple trips + max_customers_per_day.
+  PyVRP използва точния OR-Tools backend при активен дневен клиентски лимит,
+  както и при time objective с реален max_distance_km лимит.
+
+Изход:
+  Един физически бус получава една индивидуална карта с филтър по курсове.
+  Всеки курс има отделен output номер и собствен списък клиенти.
+  Основният Excel добавя само колоната Курс; техническият CSV пази и ключове.
+                """,
+                31,
+            ),
+            (
+                "17. Web интерфейс и записване",
+                """
+Web GUI:
+  Отваря се от api.web_gui_endpoint, например /hell.
+  Потребителите се добавят/изтриват от Desktop Settings и се пазят в
+  data/web_gui_auth.json. Промяната им влиза веднага.
+
+Четири основни действия:
+  Стартирай с текущите настройки:
+    Пуска изолиран Web run и НЕ записва config.py.
+  Запази глобални настройки:
+    Записва позволените solver/output/setData полета в config.py без бусове.
+  Запази бусовете:
+    Записва само VehicleConfig редовете и не променя другите секции.
+  Отхвърли промените и зареди глобалните:
+    Връща Web формата към последно записаните стойности от config.py.
+
+Важно:
+  Временният Web run използва последно записаните input, routing, депа, зони и бусове.
+  Незапазени редакции по бусове не участват — първо използвай отделното им записване.
+  Legacy run-defaults поле/endpoint съществува, но текущата страница не го прилага.
+
+Web GUI показва status/log tail и може да спре активния child process.
+За достъп извън доверена LAN използвай HTTPS reverse proxy.
+                """,
+                28,
+            ),
+            (
+                "18. Съботен run и видимост на зоните",
+                """
+POST/GET /run_saturday:
+  Автоматично използва съботата от текущата седмица.
+  Нормалното номериране използва output.saturday_excel_bus_number_prefix и *_digits.
+  При включено center_bus_numbering_enabled CENTER_BUS запазва отделната серия
+  от center_bus_numbering_start_id; тя има предимство пред съботния prefix.
+  Добавя _събота след YYYY-MM-DD в картите и Excel файла.
+  CSV и chart имената запазват собствените си правила и не получават задължително suffix.
+  Настройките са request-local; нормалният prefix в config.py не се заменя.
+
+Зони:
+  enabled управлява дали правилото на допълнителна зона е активно.
+  Основната legacy center зона се изключва чрез изключване и на priority, и на restrictions.
+  show_on_map / Показвай на картата управлява само визуализацията.
+  Скритата зона продължава да дава отстъпка/penalty или traffic multiplier.
+
+За нормален run използвай /run. За клиенти директно в body използвай /solve.
+                """,
+                22,
+            ),
+            (
+                "19. Диагностика",
                 """
 API не отговаря:
   - Провери дали сървърът е стартиран.
   - Провери /health.
-  - Провери host 0.0.0.0 и port 8088.
+  - Провери host и активния api.api_port; виж точния URL в /health.
   - Провери firewall, VPN или Cloudflare tunnel.
 
 Връща 401:
@@ -2336,6 +5223,19 @@ API не отговаря:
   - Провери center_zone и traffic_zones.
   - Увеличи time_limit_seconds.
   - Пробвай различен pyvrp_seed.
+
+Липсва solver worker:
+  - Провери pyvrp-next, vroom и vrp-rust директориите до EXE-то.
+  - Стартирай съответния --self-check.
+  - Разпространявай цялата dist папка, не само Bizant.exe.
+
+Недостатъчно памет/pagefile:
+  - Намали cvrp.num_workers до конкретен безопасен брой.
+  - Автоматичният -1 използва CPU ядрата минус едно.
+
+Кандидатът е отхвърлен от hard-constraint audit:
+  - Виж точната причина в run log-а.
+  - Провери работни прозорци, дневно време, край и reload настройки.
 
 Липсва output:
   - Провери output.enable_*.
@@ -2458,6 +5358,10 @@ setData не трябва да се пуска:
                         tooltip="JSON поле за GET/POST отговор във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
         self._add_field(json_fields, gr, "input.json_delivery_comment_field", "Коментар доставка:", getattr(inp, "json_delivery_comment_field", "DeliveryComment"),
                         tooltip="JSON поле с коментар/инструкция към шофьора. Поддържат се и DeliveryNote, Comment, Note като fallback."); gr += 1
+        self._add_field(json_fields, gr, "input.json_service_time_field", "Обслужване (минути):", getattr(inp, "json_service_time_field", "ServiceTimeMinutes"),
+                        tooltip="Optional JSON поле за време при клиента. Ако липсва/е празно, се използва времето от избрания бус."); gr += 1
+        self._add_field(json_fields, gr, "input.json_mandatory_field", "Задължителен клиент:", getattr(inp, "json_mandatory_field", "Mandatory"),
+                        tooltip="JSON поле за абсолютно задължително посещение. Приема true/false, 1/0 или да/не. Задължителен клиент не може да бъде пропуснат."); gr += 1
 
         excel_fields, gr = self._add_grid_group(
             f,
@@ -2474,6 +5378,8 @@ setData не трябва да се пуска:
                         tooltip="Excel колона във формат 08:00 - 16:00. Празно/липсващо = работи постоянно."); gr += 1
         self._add_field(excel_fields, gr, "input.delivery_comment_column", "Коментар доставка:", getattr(inp, "delivery_comment_column", "Коментар доставка"),
                         tooltip="Excel колона с коментар/инструкция към шофьора."); gr += 1
+        self._add_field(excel_fields, gr, "input.mandatory_column", "Задължителен клиент:", getattr(inp, "mandatory_column", "Задължителен"),
+                        tooltip="Optional Excel колона. Приема true/false, 1/0 или да/не."); gr += 1
 
     # ── Tab: Превозни средства ───────────────────────────────
 
@@ -2491,6 +5397,15 @@ setData не трябва да се пуска:
         depot_options = list(self._named_depots().keys())
         self.vehicle_tab_frame = f
         self.vehicle_depot_options = depot_options
+
+        summary_box, gr = self._add_grid_group(
+            f,
+            r,
+            "Бусове",
+            "Табличен преглед на активните редове. За промяна избери реда по-долу във формите; за изтриване маркирай избрания ред и натисни Запази.",
+        )
+        self._add_vehicle_summary_table(summary_box, gr)
+        r += 1
 
         add_box, gr = self._add_grid_group(
             f,
@@ -2540,6 +5455,14 @@ setData не трябва да се пуска:
             self._add_field(
                 vehicle_box,
                 gr,
+                f"{prefix}.config_id",
+                "Стабилно ID:",
+                getattr(v, "config_id", "") or f"{vtype}_{i + 1}",
+                tooltip="Уникален технически ID за този ред. Използва се за един и същ физически бус при няколко курса.",
+            ); gr += 1
+            self._add_field(
+                vehicle_box,
+                gr,
                 f"{prefix}.remove",
                 "Премахни при запис:",
                 False,
@@ -2553,12 +5476,13 @@ setData не трябва да се пуска:
             self._add_field(vehicle_box, gr, f"{prefix}.capacity", "Капацитет (ст.):", v.capacity); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.max_distance_km", "Макс. км:",
                             "" if v.max_distance_km is None else v.max_distance_km,
-                            tooltip="Празно = без лимит."); gr += 1
-            self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Макс. време (ч.):", v.max_time_hours); gr += 1
+                            tooltip="Празно = без лимит. При повторни курсове лимитът е общ за целия ден."); gr += 1
+            self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", v.max_time_hours,
+                            tooltip="Общото време включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.service_time_minutes", "Обслужване (мин):", v.service_time_minutes); gr += 1
-            self._add_field(vehicle_box, gr, f"{prefix}.max_customers_per_route", "Макс. клиенти:",
-                             v.max_customers_per_route if v.max_customers_per_route else "",
-                             tooltip="Празно = без ограничение"); gr += 1
+            self._add_field(vehicle_box, gr, f"{prefix}.max_customers_per_day", "Макс. клиенти за деня:",
+                             getattr(v, "max_customers_per_day", None) or getattr(v, "max_customers_per_route", None) or "",
+                             tooltip="Общ лимит за всички курсове на физическия бус. Празно = без ограничение."); gr += 1
             self._add_depot_choice_field(vehicle_box, gr, f"{prefix}.start_depot_name", "Депо тръгване:",
                                          self._depot_name_for_coords(v.start_location),
                                          depot_options,
@@ -2566,11 +5490,24 @@ setData не трябва да се пуска:
             self._add_field(vehicle_box, gr, f"{prefix}.end_location", "Крайна точка GPS:",
                             self._format_optional_coords(getattr(v, "end_location", None)),
                             tooltip="По желание във формат lat, lon. Празно = маршрутът завършва в депото на тръгване."); gr += 1
+            self._add_depot_choice_field(
+                vehicle_box,
+                gr,
+                f"{prefix}.reload_depot_name",
+                "Депо за презареждане:",
+                self._depot_name_for_coords(getattr(v, "reload_location", None) or v.start_location),
+                depot_options,
+                tooltip="При нужда от нов товар бусът се връща тук. Обикновено е същото като депото на тръгване.",
+            ); gr += 1
+            self._add_field(vehicle_box, gr, f"{prefix}.reload_time_minutes", "Презареждане (мин):",
+                            getattr(v, "reload_time_minutes", 30),
+                            tooltip="Времето се начислява само между два курса и влиза в работния ден."); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.start_time_minutes", "Старт (мин от 00:00):", v.start_time_minutes,
                              tooltip="480 = 08:00"); gr += 1
 
         self.vehicle_next_index = len(self.cfg.vehicles)
         self.vehicle_next_row = r
+        self._sync_vehicle_tree_from_widgets()
 
     # ── Tab: Склад ───────────────────────────────────────────
 
@@ -2591,6 +5528,110 @@ setData не трябва да се пуска:
         }
         return labels.get(str(vehicle_type_value), str(vehicle_type_value))
 
+    def _add_vehicle_summary_table(self, parent, row):
+        parent.columnconfigure(0, weight=1)
+        self.vehicle_tree = ttk.Treeview(
+            parent,
+            columns=("type", "name", "count", "capacity", "depot", "end", "status"),
+            show="headings",
+            height=7,
+            selectmode="browse",
+        )
+        for column, title, width in (
+            ("type", "Тип", 120),
+            ("name", "Име", 130),
+            ("count", "Брой", 60),
+            ("capacity", "Капацитет", 80),
+            ("depot", "Депо", 130),
+            ("end", "Край", 150),
+            ("status", "Статус", 95),
+        ):
+            self.vehicle_tree.heading(column, text=title)
+            self.vehicle_tree.column(column, width=width, minwidth=55, stretch=True)
+        self.vehicle_tree.grid(row=row, column=0, columnspan=3, sticky="we", padx=8, pady=6)
+
+        actions = ttk.Frame(parent, style="Surface.TFrame")
+        actions.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 0))
+        ttk.Button(actions, text="Добави", command=self._add_new_vehicle_row).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Изтрий избрания", command=self._mark_selected_vehicle_for_remove).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Покажи депото", command=self._show_selected_vehicle_depot_on_map).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Обнови таблицата", command=self._sync_vehicle_tree_from_widgets).pack(side="left")
+        return row + 2
+
+    def _vehicle_widget_indices(self):
+        import re
+
+        return sorted({
+            int(match.group(1))
+            for key in self.widgets
+            for match in [re.match(r"vehicle\.(\d+)\.vehicle_type$", key)]
+            if match
+        })
+
+    def _sync_vehicle_tree_from_widgets(self):
+        if self.vehicle_tree is None:
+            return
+
+        for item in self.vehicle_tree.get_children():
+            self.vehicle_tree.delete(item)
+
+        for index in self._vehicle_widget_indices():
+            prefix = f"vehicle.{index}"
+            vehicle_type = str(self._widget_value(self.widgets.get(f"{prefix}.vehicle_type"), "internal_bus"))
+            name = str(self._widget_value(self.widgets.get(f"{prefix}.name"), "") or "")
+            count = str(self._widget_value(self.widgets.get(f"{prefix}.count"), ""))
+            capacity = str(self._widget_value(self.widgets.get(f"{prefix}.capacity"), ""))
+            depot = str(self._widget_value(self.widgets.get(f"{prefix}.start_depot_name"), ""))
+            end_location = str(self._widget_value(self.widgets.get(f"{prefix}.end_location"), "") or "").strip()
+            enabled = self._parse_bool_value(self._widget_value(self.widgets.get(f"{prefix}.enabled"), True))
+            remove = self._parse_bool_value(self._widget_value(self.widgets.get(f"{prefix}.remove"), False))
+            status = "за изтриване" if remove else ("активен" if enabled else "изключен")
+            self.vehicle_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    self._vehicle_label(vehicle_type),
+                    name or "-",
+                    count,
+                    capacity,
+                    depot or "Главно депо",
+                    end_location or "депото",
+                    status,
+                ),
+            )
+
+    def _selected_vehicle_prefix(self):
+        index = self._selected_tree_index(self.vehicle_tree)
+        if index is None:
+            messagebox.showinfo("Няма избран бус", "Избери ред от таблицата с бусовете.")
+            return None
+        return f"vehicle.{index}"
+
+    def _mark_selected_vehicle_for_remove(self):
+        prefix = self._selected_vehicle_prefix()
+        if not prefix:
+            return
+        remove_widget = self.widgets.get(f"{prefix}.remove")
+        if remove_widget is None:
+            return
+        remove_widget.set(True)
+        self._sync_vehicle_tree_from_widgets()
+        self.status_var.set("Бусът е маркиран за изтриване. Натисни Запази, за да се премахне от config.py.")
+
+    def _show_selected_vehicle_depot_on_map(self):
+        prefix = self._selected_vehicle_prefix()
+        if not prefix:
+            return
+        values = self._collect_values()
+        depot_name = str(values.get(f"{prefix}.start_depot_name", "") or "Главно депо").strip()
+        depots = self._depot_lookup_for_values(values)
+        coords = depots.get(depot_name)
+        if not coords:
+            messagebox.showinfo("Няма GPS", "Не намирам координати за избраното депо.")
+            return
+        self._open_point_editor([float(coords[0]), float(coords[1])], lambda selected: None, f"Депо: {depot_name}")
+
     def _new_vehicle_template(self, vehicle_type_value):
         for vehicle in reversed(self.cfg.vehicles or []):
             if vehicle.vehicle_type.value == vehicle_type_value:
@@ -2599,6 +5640,7 @@ setData не трябва да се пуска:
                 clone.enabled = True
                 clone.name = ""
                 clone.end_location = None
+                clone.config_id = ""
                 return clone
 
         try:
@@ -2617,6 +5659,10 @@ setData не трябва да се пуска:
             service_time_minutes=8,
             enabled=True,
             max_customers_per_route=None,
+            config_id="",
+            reload_location=depot,
+            reload_time_minutes=30,
+            max_customers_per_day=None,
             start_location=depot,
             end_location=None,
             start_time_minutes=480,
@@ -2662,6 +5708,14 @@ setData не трябва да се пуска:
         self._add_field(
             vehicle_box,
             gr,
+            f"{prefix}.config_id",
+            "Стабилно ID:",
+            getattr(vehicle, "config_id", "") or f"{vehicle.vehicle_type.value}_{index + 1}",
+            tooltip="Уникален технически ID за физическите бусове от този ред.",
+        ); gr += 1
+        self._add_field(
+            vehicle_box,
+            gr,
             f"{prefix}.remove",
             "Премахни при запис:",
             False,
@@ -2685,17 +5739,18 @@ setData не трябва да се пуска:
             f"{prefix}.max_distance_km",
             "Макс. км:",
             "" if vehicle.max_distance_km is None else vehicle.max_distance_km,
-            tooltip="Празно = без лимит.",
+            tooltip="Празно = без лимит. При повторни курсове лимитът е общ за деня.",
         ); gr += 1
-        self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Макс. време (ч.):", vehicle.max_time_hours); gr += 1
+        self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", vehicle.max_time_hours,
+                        tooltip="Включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
         self._add_field(vehicle_box, gr, f"{prefix}.service_time_minutes", "Обслужване (мин):", vehicle.service_time_minutes); gr += 1
         self._add_field(
             vehicle_box,
             gr,
-            f"{prefix}.max_customers_per_route",
-            "Макс. клиенти:",
-            vehicle.max_customers_per_route if vehicle.max_customers_per_route else "",
-            tooltip="Празно = без ограничение.",
+            f"{prefix}.max_customers_per_day",
+            "Макс. клиенти за деня:",
+            getattr(vehicle, "max_customers_per_day", None) or getattr(vehicle, "max_customers_per_route", None) or "",
+            tooltip="Общ лимит за всички курсове. Празно = без ограничение.",
         ); gr += 1
         self._add_depot_choice_field(
             vehicle_box,
@@ -2714,6 +5769,23 @@ setData не трябва да се пуска:
             self._format_optional_coords(getattr(vehicle, "end_location", None)),
             tooltip="По желание във формат lat, lon. Празно = маршрутът завършва в депото на тръгване.",
         ); gr += 1
+        self._add_depot_choice_field(
+            vehicle_box,
+            gr,
+            f"{prefix}.reload_depot_name",
+            "Депо за презареждане:",
+            self._depot_name_for_coords(getattr(vehicle, "reload_location", None) or vehicle.start_location),
+            getattr(self, "vehicle_depot_options", list(self._named_depots().keys())),
+            tooltip="Депото, в което бусът се връща за следващ товар.",
+        ); gr += 1
+        self._add_field(
+            vehicle_box,
+            gr,
+            f"{prefix}.reload_time_minutes",
+            "Презареждане (мин):",
+            getattr(vehicle, "reload_time_minutes", 30),
+            tooltip="Начислява се само между два курса.",
+        ); gr += 1
         self._add_field(
             vehicle_box,
             gr,
@@ -2725,6 +5797,7 @@ setData не трябва да се пуска:
 
         self.vehicle_next_index = index + 1
         self.vehicle_next_row = row + 1
+        self._sync_vehicle_tree_from_widgets()
         self.status_var.set("Добавен е нов ред за превозно средство. Натисни Запази, за да влезе в config.py.")
 
     def _add_warehouse_tab(self, nb):
@@ -2760,13 +5833,48 @@ setData не трябва да се пуска:
         basic, r = self._add_group(
             f,
             "Основни настройки",
-            "Избор на решител и общ лимит за търсене. PyVRP е основният режим, OR-Tools е полезен за сравнение.",
+            "Избор на решител и общ лимит за търсене. VROOM и експерименталният VRP-Rust са отделни open-source алтернативи за сравнение с PyVRP.",
         )
-        self._add_field(basic, r, "cvrp.solver_type", "Тип солвър:", c.solver_type,
-                         "combo", ["pyvrp", "or_tools"]); r += 1
+        solver_options = [
+            self.SOLVER_LABELS.get(value, value)
+            for value in config.CVRP_SOLVER_TYPES
+        ]
+        self._add_field(
+            basic,
+            r,
+            "cvrp.solver_type",
+            "Тип солвър:",
+            self.SOLVER_LABELS.get(c.solver_type, c.solver_type),
+            "combo",
+            solver_options,
+                         tooltip="pyvrp = стабилната линия 0.13.x (минимум 0.13.4); pyvrp_experimental = 0.14 sidecar; or_tools = OR-Tools; vroom = official VROOM 1.15 sidecar (без повторни курсове); vrp = VRP-Rust experimental sidecar."); r += 1
         self._add_field(basic, r, "cvrp.objective_metric", "Цел на оптимизацията:", getattr(c, "objective_metric", "distance"),
                          "combo", ["distance", "time"],
                          tooltip="distance = най-къси километри. time = най-кратко време по OSRM/Valhalla duration матрицата."); r += 1
+        self._add_field(
+            basic,
+            r,
+            "cvrp.time_objective_include_waiting",
+            "Включи чакането в целта:",
+            getattr(c, "time_objective_include_waiting", True),
+            "bool",
+            tooltip=(
+                "Важи при цел time. Включено = минимизира целия работен ден: пътуване, "
+                "обслужване, чакане и презареждане. Fitness е само времето в секунди; "
+                "реалните метри остават за ограниченията и отчетите. "
+                "Изключено = старото поведение без директна цена за чакането. "
+                "VROOM спазва и отчита чакането, но native objective-ът му не може да го цени директно."
+            ),
+        ); r += 1
+        self._add_field(
+            basic,
+            r,
+            "cvrp.enable_multiple_trips",
+            "Разреши повторни курсове:",
+            getattr(c, "enable_multiple_trips", False),
+            "bool",
+            tooltip="Обща настройка за всички бусове. Изключено = максимум един курс; включено = връщане и презареждане, докато дневните лимити позволяват.",
+        ); r += 1
         self._add_field(basic, r, "cvrp.time_limit_seconds", "Време за решение (сек):", c.time_limit_seconds); r += 1
 
         pyvrp_quality, r = self._add_group(
@@ -2778,12 +5886,157 @@ setData не трябва да се пуска:
                         tooltip="Празно поле = използва seed базата. В единичен режим това е точният seed."); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_num_neighbours", "Съседи:", getattr(c, "pyvrp_num_neighbours", 100),
                         tooltip="Практичен диапазон при две депа: 80-120."); r += 1
+        self._add_field(pyvrp_quality, r, "cvrp.pyvrp_weight_wait_time", "Тежест на чакането:", getattr(c, "pyvrp_weight_wait_time", 0.2),
+                        tooltip="Участва в proximity оценката за neighbourhood-а. PyVRP default: 0.2."); r += 1
+        self._add_field(pyvrp_quality, r, "cvrp.pyvrp_symmetric_proximity", "Симетрична proximity:", getattr(c, "pyvrp_symmetric_proximity", True), "bool"); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_ils_no_improvement", "ILS без подобрение:", getattr(c, "pyvrp_ils_no_improvement", 300000)); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_ils_history_length", "ILS история:", getattr(c, "pyvrp_ils_history_length", 500)); r += 1
+        self._add_field(pyvrp_quality, r, "cvrp.pyvrp_exhaustive_on_best", "Exhaustive при best:", getattr(c, "pyvrp_exhaustive_on_best", True), "bool",
+                        tooltip="Пуска по-скъпо пълно локално търсене при всяко ново най-добро решение."); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_use_extended_operators", "Разширени оператори:", getattr(c, "pyvrp_use_extended_operators", True), "bool"); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_min_perturbations", "Мин. perturbations:", getattr(c, "pyvrp_min_perturbations", 1)); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_max_perturbations", "Макс. perturbations:", getattr(c, "pyvrp_max_perturbations", 40)); r += 1
         self._add_field(pyvrp_quality, r, "cvrp.pyvrp_display_progress", "PyVRP progress лог:", getattr(c, "pyvrp_display_progress", False), "bool"); r += 1
+        self._add_field(pyvrp_quality, r, "cvrp.pyvrp_display_interval_seconds", "Progress интервал (сек):", getattr(c, "pyvrp_display_interval_seconds", 5.0)); r += 1
+
+        pyvrp_penalty, r = self._add_group(
+            f,
+            "PyVRP penalty manager",
+            "Penalty manager-ът балансира търсенето между валидни и временно невалидни решения. Library defaults са препоръчителната начална точка.",
+        )
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_use_library_penalty_defaults", "Library defaults:", getattr(c, "pyvrp_use_library_penalty_defaults", True), "bool",
+                        tooltip="Включено = всяка версия използва собствените си проверени defaults. Изключи за ръчен контрол на полетата отдолу."); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_solutions_between_updates", "Решения между updates:", getattr(c, "pyvrp_penalty_solutions_between_updates", 500)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_increase", "Увеличение:", getattr(c, "pyvrp_penalty_increase", 1.5)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_decrease", "Намаление:", getattr(c, "pyvrp_penalty_decrease", 0.9)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_target_feasible", "Target feasible:", getattr(c, "pyvrp_penalty_target_feasible", 0.65)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_feas_tolerance", "Feasible tolerance:", getattr(c, "pyvrp_penalty_feas_tolerance", 0.05)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_min", "Минимална penalty:", getattr(c, "pyvrp_penalty_min", 0.1)); r += 1
+        self._add_field(pyvrp_penalty, r, "cvrp.pyvrp_penalty_max", "Максимална penalty:", getattr(c, "pyvrp_penalty_max", 100000.0),
+                        tooltip="Не задавай прекалено голяма стойност: PyVRP предупреждава за риск от integer overflow."); r += 1
+
+        pyvrp_next, r = self._add_group(
+            f,
+            "PyVRP 0.14 experimental sidecar",
+            "Стабилният PyVRP 0.13.x остава в приложението. Тези настройки се използват само при solver_type=pyvrp_experimental.",
+        )
+        self._add_field(
+            pyvrp_next,
+            r,
+            "cvrp.pyvrp_next_worker_path",
+            "Worker път:",
+            getattr(c, "pyvrp_next_worker_path", ""),
+            tooltip="Празно = търси стандартния companion worker до приложението. Може да е отделен Python/EXE worker за PyVRP 0.14.",
+        ); r += 1
+        self._add_field(
+            pyvrp_next,
+            r,
+            "cvrp.pyvrp_next_worker_timeout_seconds",
+            "Worker timeout (сек):",
+            getattr(c, "pyvrp_next_worker_timeout_seconds", 0),
+            tooltip="0 = лимитът на решителя плюс автоматичен резерв за стартиране и IPC.",
+        ); r += 1
+        self._add_field(
+            pyvrp_next,
+            r,
+            "cvrp.pyvrp_next_fallback_to_stable",
+            "Fallback към stable:",
+            getattr(c, "pyvrp_next_fallback_to_stable", False),
+            "bool",
+            tooltip="Ако experimental worker-ът липсва или се провали, използва стабилния PyVRP 0.13. Изключено = ясна грешка без скрита подмяна.",
+        ); r += 1
+
+        vroom_group, r = self._add_group(
+            f,
+            "VROOM 1.15",
+            "Официалният VROOM работи в изолиран companion worker и използва готовите OSRM/Valhalla матрици. Поддържа еднокурсни маршрути; при повторни курсове приложението спира с ясна грешка.",
+        )
+        self._add_field(
+            vroom_group,
+            r,
+            "cvrp.vroom_worker_path",
+            "Worker път:",
+            getattr(c, "vroom_worker_path", ""),
+            tooltip="Празно = .venv-vroom при source run или dist\\vroom\\CVRP_VROOM_Worker при EXE.",
+        ); r += 1
+        self._add_field(
+            vroom_group,
+            r,
+            "cvrp.vroom_worker_timeout_seconds",
+            "Worker timeout (сек):",
+            getattr(c, "vroom_worker_timeout_seconds", 0),
+            tooltip="0 = общият solver time limit плюс автоматичен резерв за startup и JSON обмен.",
+        ); r += 1
+        self._add_field(
+            vroom_group,
+            r,
+            "cvrp.vroom_threads",
+            "Вътрешни threads:",
+            getattr(c, "vroom_threads", 0),
+            tooltip="0 = автоматично използва логическите ядра без едно. VROOM не стартира външни паралелни workers.",
+        ); r += 1
+        self._add_field(
+            vroom_group,
+            r,
+            "cvrp.vroom_exploration_level",
+            "Exploration (0-5):",
+            getattr(c, "vroom_exploration_level", 5),
+            tooltip="5 = максимално качество според официалния VROOM параметър; по-ниско е по-бързо.",
+        ); r += 1
+
+        vrp_group, r = self._add_group(
+            f,
+            "VRP-Rust experimental",
+            "Експериментален open-source sidecar за независимо сравнение с PyVRP. Използва готовите OSRM/Valhalla матрици и поддържа повторни курсове. В distance режим зоните влияят на избора; pure time режимът минимизира само продължителността.",
+        )
+        self._add_field(
+            vrp_group,
+            r,
+            "cvrp.vrp_worker_path",
+            "Worker път:",
+            getattr(c, "vrp_worker_path", ""),
+            tooltip="Празно = автоматично откриване на .venv-vrp-rust при source run или companion worker до приложението.",
+        ); r += 1
+        self._add_field(
+            vrp_group,
+            r,
+            "cvrp.vrp_worker_timeout_seconds",
+            "Worker timeout (сек):",
+            getattr(c, "vrp_worker_timeout_seconds", 0),
+            tooltip="0 = общият solver time limit плюс автоматичен резерв за startup и JSON обмен.",
+        ); r += 1
+        self._add_field(
+            vrp_group,
+            r,
+            "cvrp.vrp_threads",
+            "Вътрешни threads:",
+            getattr(c, "vrp_threads", 0),
+            tooltip="0 = автоматичен избор според наличните логически ядра; положителна стойност задава точен брой нишки.",
+        ); r += 1
+        try:
+            vrp_max_generations_value = int(getattr(c, "vrp_max_generations", 1_000_000) or 1_000_000)
+        except (TypeError, ValueError):
+            vrp_max_generations_value = 1_000_000
+        # Migrate the short-lived out-of-range default transparently so an old
+        # config can be opened and saved without forcing a manual correction.
+        vrp_max_generations_value = min(max(vrp_max_generations_value, 1), 1_000_000_000_000)
+        self._add_field(
+            vrp_group,
+            r,
+            "cvrp.vrp_max_generations",
+            "Макс. поколения:",
+            vrp_max_generations_value,
+            tooltip="Горна граница на търсенето. Общият времеви лимит може да прекрати run-а по-рано.",
+        ); r += 1
+        self._add_field(
+            vrp_group,
+            r,
+            "cvrp.vrp_log_progress",
+            "VRP-Rust progress лог:",
+            getattr(c, "vrp_log_progress", True),
+            "bool",
+            tooltip="Показва progress съобщенията от отделния VRP-Rust worker.",
+        ); r += 1
 
         ortools, r = self._add_group(
             f,
@@ -2812,6 +6065,7 @@ setData не трябва да се пуска:
             "Работно време на клиенти",
             "Когато е включено, solver-ите спазват входното поле 'Работно време'. Празна стойност означава постоянно отворен обект.",
         )
+        self.solver_fine_anchor = time_windows
         self._add_field(time_windows, r, "cvrp.enable_customer_time_windows", "Спазвай работно време:", getattr(c, "enable_customer_time_windows", False), "bool",
                         tooltip="Изключено = маршрутите се решават както досега."); r += 1
 
@@ -2880,84 +6134,171 @@ setData не трябва да се пуска:
         parallel, r = self._add_group(
             f,
             "Паралелно търсене",
-            "При OR-Tools пуска различни стратегии. При PyVRP пуска различни seed-ове и избира най-добрия резултат.",
+            "Тази секция се показва само за PyVRP и OR-Tools. Общите полета управляват външните процеси, а долната част се сменя според избрания solver.",
         )
         self._add_field(parallel, r, "cvrp.enable_parallel_solving", "Включено:", c.enable_parallel_solving, "bool"); r += 1
         self._add_field(parallel, r, "cvrp.num_workers", "Брой процеси:", c.num_workers,
                          tooltip="-1 = всички ядра без едно"); r += 1
-        self._add_field(parallel, r, "cvrp.pyvrp_seed_base", "PyVRP seed база:", getattr(c, "pyvrp_seed_base", 42),
-                         tooltip="При PyVRP worker-ите използват seed база + номер на worker."); r += 1
-        self._add_list_field(parallel, r, "cvrp.parallel_first_solution_strategies",
-                             "First solution стратегии:", c.parallel_first_solution_strategies); r += 1
-        self._add_list_field(parallel, r, "cvrp.parallel_local_search_metaheuristics",
-                             "Метаевристики:", c.parallel_local_search_metaheuristics); r += 1
+
+        self.pyvrp_parallel_specific = ttk.Frame(parallel, style="Surface.TFrame")
+        self.pyvrp_parallel_specific.grid(row=r, column=0, columnspan=3, sticky="we")
+        self.pyvrp_parallel_specific.columnconfigure(1, weight=1)
+        self._add_field(
+            self.pyvrp_parallel_specific,
+            0,
+            "cvrp.pyvrp_seed_base",
+            "PyVRP seed база:",
+            getattr(c, "pyvrp_seed_base", 42),
+            tooltip="При PyVRP worker-ите използват seed база + номер на worker.",
+        )
+        r += 1
+
+        self.ortools_parallel_specific = ttk.Frame(parallel, style="Surface.TFrame")
+        self.ortools_parallel_specific.grid(row=r, column=0, columnspan=3, sticky="we")
+        self.ortools_parallel_specific.columnconfigure(1, weight=1)
+        self._add_list_field(
+            self.ortools_parallel_specific,
+            0,
+            "cvrp.parallel_first_solution_strategies",
+            "First solution стратегии:",
+            c.parallel_first_solution_strategies,
+        )
+        self._add_list_field(
+            self.ortools_parallel_specific,
+            1,
+            "cvrp.parallel_local_search_metaheuristics",
+            "Метаевристики:",
+            c.parallel_local_search_metaheuristics,
+        )
+
+        self.solver_fine_panels = {
+            "pyvrp": (pyvrp_quality, pyvrp_penalty, parallel),
+            "pyvrp_experimental": (pyvrp_quality, pyvrp_penalty, pyvrp_next, parallel),
+            "or_tools": (ortools, parallel),
+            "vroom": (vroom_group,),
+            "vrp": (vrp_group,),
+        }
 
     # ── Tab: Локации ─────────────────────────────────────────
 
     def _add_center_zones_editor(self, parent, row, loc):
+        self._editing_center_zone_index = None
+        self._center_zone_unmapped_penalties = {}
+        self._center_zone_loaded_penalty_keys = set()
         box = ttk.LabelFrame(parent, text="Допълнителни център зони", padding=(14, 12))
         box.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(6, 14))
-        box.columnconfigure(0, weight=0)
-        box.columnconfigure(1, weight=1)
-        box.columnconfigure(2, weight=0)
-        box.columnconfigure(3, weight=0)
+        box.columnconfigure(0, weight=1)
 
-        ttk.Label(
-            box,
-            text=(
-                "Добави отделна център зона. Избери кои бусове са приоритетни за нея "
-                "и кои бусове да получават глоба, ако влязат вътре."
-            ),
-            style="Hint.TLabel",
-            wraplength=900,
-        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+        form = ttk.LabelFrame(box, text="Нова или редакция", padding=(12, 10))
+        form.grid(row=0, column=0, sticky="nsew", pady=(2, 8))
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(2, weight=0)
 
-        ttk.Label(box, text="Име:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        list_frame = ttk.LabelFrame(box, text="Създадени зони", padding=(12, 10))
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 2))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
         name_var = tk.StringVar(value="")
-        name_entry = ttk.Entry(box, textvariable=name_var, width=34)
-        name_entry.grid(row=1, column=1, sticky="we", padx=(0, 8), pady=6)
+        name_entry = ttk.Entry(form, textvariable=name_var, width=28)
+        name_entry.grid(row=0, column=1, columnspan=2, sticky="we", padx=(0, 0), pady=5)
         self._bind_text_editing(name_entry)
         self.widgets["locations.new_center_zone_name"] = name_var
-        ttk.Label(box, text="Празно = автоматично име.", style="Hint.TLabel").grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Label(box, text="Тип:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Тип", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         mode_var = tk.StringVar(value="circle")
-        mode_combo = ttk.Combobox(box, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
-        mode_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        mode_combo = ttk.Combobox(form, textvariable=mode_var, values=["circle", "polygon"], width=12, state="readonly")
+        mode_combo.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=5)
+        mode_combo.bind("<<ComboboxSelected>>", self._update_center_zone_shape_fields)
         self.widgets["locations.new_center_zone_mode"] = mode_var
+        ttk.Label(form, text="circle = радиус, polygon = начертана зона", style="Hint.TLabel").grid(
+            row=1, column=2, sticky="w", padx=(0, 0), pady=5
+        )
 
-        ttk.Label(box, text="Координати:", style="Surface.TLabel").grid(row=3, column=0, sticky="nw", padx=(8, 8), pady=6)
-        coords_text = tk.Text(box, height=3, width=54, font=("Segoe UI", 9), wrap="none")
-        coords_text.grid(row=3, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        self._center_zone_coords_label = ttk.Label(form, text="Център (lat, lon)", style="Surface.TLabel")
+        self._center_zone_coords_label.grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=5)
+        coords_text = tk.Text(form, height=4, width=46, font=("Segoe UI", 9), wrap="none", relief="solid", borderwidth=1)
+        coords_text.grid(row=2, column=1, columnspan=2, sticky="we", padx=(0, 0), pady=5)
         self._bind_text_editing(coords_text)
         self._bind_text_scrolling(coords_text)
         self.widgets["locations.new_center_zone_coords"] = coords_text
-        ttk.Button(box, text="Постави", command=lambda: self._paste_to_text_widget(coords_text)).grid(
-            row=3, column=3, sticky="nw", padx=(0, 8), pady=(6, 0)
+        coord_actions = ttk.Frame(form, style="Surface.TFrame")
+        coord_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Button(coord_actions, text="Постави координати", command=lambda: self._paste_to_text_widget(coords_text)).pack(side="left", padx=(0, 6))
+        self._center_zone_map_button = ttk.Button(
+            coord_actions,
+            text="Избери кръг на карта",
+            command=self._open_new_center_zone_editor,
         )
-        ttk.Button(box, text="Чертай", command=self._open_new_center_zone_editor).grid(
-            row=3, column=3, sticky="sw", padx=(0, 8), pady=(0, 6)
-        )
+        self._center_zone_map_button.pack(side="left")
+        self._center_zone_geometry_hint_var = tk.StringVar(value="Една GPS точка за центъра на кръга.")
         ttk.Label(
-            box,
-            text="За circle: 42.6977, 23.3219. За polygon натисни Чертай или постави точки на нов ред.",
+            form,
+            textvariable=self._center_zone_geometry_hint_var,
             style="Hint.TLabel",
-            wraplength=850,
-        ).grid(row=4, column=1, columnspan=3, sticky="we", padx=(0, 8), pady=(0, 6))
+        ).grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
 
-        ttk.Label(box, text="Радиус:", style="Surface.TLabel").grid(row=5, column=0, sticky="w", padx=(8, 8), pady=6)
+        radius_label = ttk.Label(form, text="Радиус км", style="Surface.TLabel")
+        radius_label.grid(row=4, column=0, sticky="w", padx=(0, 8), pady=5)
         radius_var = tk.StringVar(value="1.5")
-        radius_combo = ttk.Combobox(box, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
-        radius_combo.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=6)
+        radius_combo = ttk.Combobox(form, textvariable=radius_var, values=["0.5", "1", "1.5", "2", "3", "5"], width=10, state="normal")
+        radius_combo.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(radius_combo)
         self.widgets["locations.new_center_zone_radius"] = radius_var
-        ttk.Label(box, text="км; при polygon не се използва", style="Hint.TLabel").grid(row=5, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        radius_hint = ttk.Label(form, text="трябва да е по-голям от 0", style="Hint.TLabel")
+        radius_hint.grid(row=4, column=2, sticky="w", pady=5)
+        self._center_zone_radius_widgets = (radius_label, radius_combo, radius_hint)
 
-        rules = ttk.Frame(box, style="Surface.TFrame")
-        rules.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(8, 6))
+        ttk.Label(form, text="Състояние", style="Surface.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=5)
+        state_frame = ttk.Frame(form, style="Surface.TFrame")
+        state_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=5)
+        enabled_var = tk.BooleanVar(value=True)
+        show_on_map_var = tk.BooleanVar(value=True)
+        enable_priority_var = tk.BooleanVar(value=True)
+        enable_restrictions_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(state_frame, text="Активна", variable=enabled_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(state_frame, text="Показвай на картата", variable=show_on_map_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
+            state_frame,
+            text="Приоритет",
+            variable=enable_priority_var,
+            command=self._update_center_zone_rule_fields,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
+            state_frame,
+            text="Ограничения",
+            variable=enable_restrictions_var,
+            command=self._update_center_zone_rule_fields,
+        ).pack(side="left")
+        self.widgets["locations.new_center_zone_enabled"] = enabled_var
+        self.widgets["locations.new_center_zone_show_on_map"] = show_on_map_var
+        self.widgets["locations.new_center_zone_enable_priority"] = enable_priority_var
+        self.widgets["locations.new_center_zone_enable_restrictions"] = enable_restrictions_var
+
+        ttk.Label(form, text="Правило за бусове", style="Surface.TLabel").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=5)
+        preset_var = tk.StringVar(value="center_bus")
+        preset_combo = ttk.Combobox(
+            form,
+            textvariable=preset_var,
+            values=["center_bus", "internal_bus", "external_bus", "special_bus", "vratza_bus", "custom"],
+            width=18,
+            state="readonly",
+        )
+        preset_combo.grid(row=6, column=1, sticky="w", padx=(0, 8), pady=5)
+        preset_combo.bind("<<ComboboxSelected>>", self._apply_center_zone_rule_preset)
+        self._center_zone_rule_preset_combo = preset_combo
+        self.widgets["locations.new_center_zone_rule_preset"] = preset_var
+        ttk.Label(form, text="избира кой бус е приоритетен; custom оставя ръчните отметки", style="Hint.TLabel").grid(
+            row=6, column=2, sticky="w", pady=5
+        )
+
+        rules = ttk.Frame(form, style="Surface.TFrame")
+        rules.grid(row=7, column=0, columnspan=3, sticky="we", pady=(8, 6))
         ttk.Label(rules, text="Тип бус", style="Surface.TLabel", width=18).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 4))
-        ttk.Label(rules, text="Приоритет в зоната", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
-        ttk.Label(rules, text="Глоба в зоната", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Label(rules, text="Приоритет", style="Surface.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 22), pady=(0, 4))
+        ttk.Label(rules, text="Ограничен", style="Surface.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 12), pady=(0, 4))
+        ttk.Label(rules, text="Глоба", style="Surface.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(0, 4))
         vehicle_labels = [
             ("center_bus", "Център бус"),
             ("internal_bus", "Вътрешен бус"),
@@ -2967,55 +6308,101 @@ setData не трябва да се пуска:
         ]
         self.center_zone_priority_vars = {}
         self.center_zone_restricted_vars = {}
+        self.center_zone_penalty_vars = {}
+        self._center_zone_priority_checkbuttons = {}
+        self._center_zone_restricted_checkbuttons = {}
+        self._center_zone_penalty_entries = {}
+        penalty_defaults = {
+            "center_bus": 40000.0,
+            "internal_bus": float(getattr(loc, "internal_bus_center_penalty", 40000.0) or 40000.0),
+            "external_bus": float(getattr(loc, "external_bus_center_penalty", 40000.0) or 40000.0),
+            "special_bus": float(getattr(loc, "special_bus_center_penalty", 40000.0) or 40000.0),
+            "vratza_bus": float(getattr(loc, "vratza_bus_center_penalty", 40000.0) or 40000.0),
+        }
         for idx, (vehicle_type, label) in enumerate(vehicle_labels, start=1):
             ttk.Label(rules, text=label, style="Surface.TLabel").grid(row=idx, column=0, sticky="w", padx=(0, 12), pady=2)
             priority_var = tk.BooleanVar(value=(vehicle_type == "center_bus"))
             restricted_var = tk.BooleanVar(value=(vehicle_type != "center_bus"))
-            ttk.Checkbutton(rules, variable=priority_var).grid(row=idx, column=1, sticky="w", padx=(0, 22), pady=2)
-            ttk.Checkbutton(rules, variable=restricted_var).grid(row=idx, column=2, sticky="w", padx=(0, 8), pady=2)
+            priority_check = ttk.Checkbutton(rules, variable=priority_var)
+            priority_check.grid(row=idx, column=1, sticky="w", padx=(0, 22), pady=2)
+            restricted_check = ttk.Checkbutton(
+                rules,
+                variable=restricted_var,
+                command=self._update_center_zone_rule_fields,
+            )
+            restricted_check.grid(row=idx, column=2, sticky="w", padx=(0, 12), pady=2)
+            penalty_var = tk.StringVar(value=f"{penalty_defaults[vehicle_type]:g}")
+            penalty_entry = ttk.Entry(rules, textvariable=penalty_var, width=12)
+            penalty_entry.grid(row=idx, column=3, sticky="w", padx=(0, 8), pady=2)
+            self._bind_text_editing(penalty_entry)
             self.center_zone_priority_vars[vehicle_type] = priority_var
             self.center_zone_restricted_vars[vehicle_type] = restricted_var
+            self.center_zone_penalty_vars[vehicle_type] = penalty_var
+            self._center_zone_priority_checkbuttons[vehicle_type] = priority_check
+            self._center_zone_restricted_checkbuttons[vehicle_type] = restricted_check
+            self._center_zone_penalty_entries[vehicle_type] = penalty_entry
 
-        ttk.Label(box, text="Отстъпка:", style="Surface.TLabel").grid(row=7, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Отстъпка", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=5)
         discount_var = tk.StringVar(value="0.9")
-        discount_combo = ttk.Combobox(box, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
-        discount_combo.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=6)
+        discount_combo = ttk.Combobox(form, textvariable=discount_var, values=["0.7", "0.8", "0.9", "1.0"], width=10, state="normal")
+        discount_combo.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(discount_combo)
         self.widgets["locations.new_center_zone_discount"] = discount_var
-        ttk.Label(box, text="0.9 = 10% по-ниска цена за приоритетен бус.", style="Hint.TLabel").grid(row=7, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(form, text="0.9 = 10% по-ниска цена", style="Hint.TLabel").grid(row=8, column=2, sticky="w", pady=5)
 
-        ttk.Label(box, text="Глоба навън:", style="Surface.TLabel").grid(row=8, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(form, text="Глоба навън", style="Surface.TLabel").grid(row=9, column=0, sticky="w", padx=(0, 8), pady=5)
         outside_var = tk.StringVar(value="0")
-        outside_entry = ttk.Entry(box, textvariable=outside_var, width=12)
-        outside_entry.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=6)
+        outside_entry = ttk.Entry(form, textvariable=outside_var, width=12)
+        outside_entry.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=5)
         self._bind_text_editing(outside_entry)
         self.widgets["locations.new_center_zone_outside_penalty"] = outside_var
+        self._center_zone_priority_value_widgets = (discount_combo, outside_entry)
 
-        ttk.Label(box, text="Глоба вътре:", style="Surface.TLabel").grid(row=9, column=0, sticky="w", padx=(8, 8), pady=6)
-        default_penalty = float(getattr(loc, "internal_bus_center_penalty", 40000.0) or 40000.0)
-        penalty_var = tk.StringVar(value=f"{default_penalty:g}")
-        penalty_entry = ttk.Entry(box, textvariable=penalty_var, width=12)
-        penalty_entry.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=6)
-        self._bind_text_editing(penalty_entry)
-        self.widgets["locations.new_center_zone_penalty"] = penalty_var
-        ttk.Label(box, text="Прилага се на всички маркирани в колоната 'Глоба в зоната'.", style="Hint.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=6)
+        buttons = ttk.Frame(form, style="Surface.TFrame")
+        buttons.grid(row=10, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(buttons, text="Добави / обнови", command=self._append_center_zone_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Нова празна форма", command=self._clear_center_zone_form).pack(side="left")
 
-        ttk.Button(box, text="Добави център зона", command=self._append_center_zone_from_fields).grid(
-            row=10, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
+        ttk.Label(
+            list_frame,
+            text="Избери зона, за да я заредиш във формата. После можеш да я обновиш или премахнеш.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        self.center_zone_tree = ttk.Treeview(
+            list_frame,
+            columns=("name", "mode", "geometry", "priority", "restricted", "status", "map_visibility"),
+            show="headings",
+            height=7,
+            selectmode="browse",
         )
-        ttk.Button(box, text="Премахни избраната", command=self._remove_selected_center_zone).grid(
-            row=10, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
-
-        ttk.Label(box, text="Добавени център зони:", style="Surface.TLabel").grid(
-            row=11, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4)
-        )
-        self.center_zone_listbox = tk.Listbox(box, height=5, font=("Segoe UI", 9), exportselection=False)
-        self.center_zone_listbox.grid(row=12, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
+        for column, title, width in (
+            ("name", "Име", 130),
+            ("mode", "Тип", 70),
+            ("geometry", "GPS/полигон", 180),
+            ("priority", "Приоритет", 110),
+            ("restricted", "Глоба за", 140),
+            ("status", "Статус", 80),
+            ("map_visibility", "На карта", 85),
+        ):
+            self.center_zone_tree.heading(column, text=title)
+            self.center_zone_tree.column(column, width=width, minwidth=60, stretch=True)
+        self.center_zone_tree.grid(row=1, column=0, sticky="nsew")
+        center_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.center_zone_tree.yview)
+        center_scroll.grid(row=1, column=1, sticky="ns")
+        self.center_zone_tree.configure(yscrollcommand=center_scroll.set)
+        self.center_zone_tree.bind("<<TreeviewSelect>>", self._load_selected_center_zone)
+        zone_actions = ttk.Frame(list_frame, style="Surface.TFrame")
+        zone_actions.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(zone_actions, text="Покажи на карта", command=self._show_selected_center_zone_on_map).pack(side="left", padx=(0, 6))
+        ttk.Button(zone_actions, text="Покажи / скрий в картите", command=self._toggle_selected_center_zone_visibility).pack(side="left", padx=(0, 6))
+        ttk.Button(zone_actions, text="Премахни избраната", command=self._remove_selected_center_zone).pack(side="left")
 
         hidden_zones = tk.Text(box, width=1, height=1)
         self.widgets["locations.center_zones"] = hidden_zones
         self._sync_center_zone_widgets(getattr(loc, "center_zones", []) or [])
+        self._update_center_zone_shape_fields()
+        self._update_center_zone_rule_fields()
 
     def _add_locations_tab(self, nb):
         tab = ttk.Frame(nb)
@@ -3043,26 +6430,69 @@ setData не трябва да се пуска:
             "Депа",
             "Добави депо с име и координати. След Запази депото може да се избира при бусове.",
         ); r += 1
-        self._add_field(depot_add, gr, "locations.new_depot_name", "Име:", ""); gr += 1
-        self._add_field(
-            depot_add,
-            gr,
-            "locations.new_depot_coords",
-            "Координати:",
-            "",
-            tooltip="Формат: lat, lon. Пример: 43.22104, 23.53440.",
-        ); gr += 1
-        ttk.Button(depot_add, text="Добави / обнови депо", command=self._append_depot_from_fields).grid(
-            row=gr, column=1, sticky="w", padx=6, pady=(4, 8)
+        depot_add.columnconfigure(0, weight=1)
+        depot_add.columnconfigure(1, weight=1)
+        depot_form = ttk.LabelFrame(depot_add, text="Ново или редакция", padding=(12, 10))
+        depot_form.grid(row=gr, column=0, sticky="nsew", padx=(0, 8), pady=2)
+        depot_form.columnconfigure(1, weight=1)
+        depot_list_frame = ttk.LabelFrame(depot_add, text="Допълнителни депа", padding=(12, 10))
+        depot_list_frame.grid(row=gr, column=1, columnspan=2, sticky="nsew", padx=(8, 0), pady=2)
+        depot_list_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(depot_form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        depot_name_var = tk.StringVar(value="")
+        depot_name_entry = ttk.Entry(depot_form, textvariable=depot_name_var, width=28)
+        depot_name_entry.grid(row=0, column=1, sticky="we", pady=5)
+        self._bind_text_editing(depot_name_entry)
+        self.widgets["locations.new_depot_name"] = depot_name_var
+
+        ttk.Label(depot_form, text="Координати", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        depot_coords_var = tk.StringVar(value="")
+        depot_coords_entry = ttk.Entry(depot_form, textvariable=depot_coords_var, width=28)
+        depot_coords_entry.grid(row=1, column=1, sticky="we", pady=5)
+        self._bind_text_editing(depot_coords_entry)
+        self.widgets["locations.new_depot_coords"] = depot_coords_var
+
+        depot_buttons = ttk.Frame(depot_form, style="Surface.TFrame")
+        depot_buttons.grid(row=2, column=1, sticky="w", pady=(2, 8))
+        ttk.Button(depot_buttons, text="Постави", command=lambda: self._paste_to_var(depot_coords_var)).pack(side="left", padx=(0, 6))
+        ttk.Button(depot_buttons, text="Избери на карта", command=self._open_new_depot_editor).pack(side="left")
+
+        depot_actions = ttk.Frame(depot_form, style="Surface.TFrame")
+        depot_actions.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(depot_actions, text="Добави / обнови", command=self._append_depot_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(depot_actions, text="Нова празна форма", command=self._clear_depot_form).pack(side="left")
+
+        ttk.Label(
+            depot_list_frame,
+            text="Избери депо, за да го заредиш във формата. Главно депо, Център и Враца се настройват горе.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        self.depot_tree = ttk.Treeview(
+            depot_list_frame,
+            columns=("name", "gps"),
+            show="headings",
+            height=6,
+            selectmode="browse",
         )
-        self._add_list_field(
-            depot_add,
-            gr + 1,
-            "locations.depot_locations",
-            "Списък депа:",
-            self._format_depots_text(getattr(loc, "depot_locations", {}) or {}).splitlines(),
-            tooltip="Формат: Име: lat, lon. След запис/презареждане депото ще е налично за избор при бусове.",
-        )
+        self.depot_tree.heading("name", text="Име")
+        self.depot_tree.heading("gps", text="GPS")
+        self.depot_tree.column("name", width=170, minwidth=100, stretch=True)
+        self.depot_tree.column("gps", width=190, minwidth=130, stretch=True)
+        self.depot_tree.grid(row=1, column=0, sticky="nsew")
+        depot_scroll = ttk.Scrollbar(depot_list_frame, orient="vertical", command=self.depot_tree.yview)
+        depot_scroll.grid(row=1, column=1, sticky="ns")
+        self.depot_tree.configure(yscrollcommand=depot_scroll.set)
+        self.depot_tree.bind("<<TreeviewSelect>>", self._load_selected_depot)
+        depot_table_actions = ttk.Frame(depot_list_frame, style="Surface.TFrame")
+        depot_table_actions.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(depot_table_actions, text="Покажи на карта", command=self._show_selected_depot_on_map).pack(side="left", padx=(0, 6))
+        ttk.Button(depot_table_actions, text="Премахни избраното", command=self._remove_selected_depot).pack(side="left")
+
+        hidden_depots = tk.Text(depot_add, width=1, height=1)
+        self.widgets["locations.depot_locations"] = hidden_depots
+        self._sync_depot_widgets(getattr(loc, "depot_locations", {}) or {})
 
         center_zone, gr = self._add_grid_group(
             f,
@@ -3074,6 +6504,8 @@ setData не трябва да се пуска:
                          "combo", ["circle", "polygon"]); gr += 1
         self._add_field(center_zone, gr, "locations.center_zone_radius_km", "Радиус (км):", loc.center_zone_radius_km); gr += 1
         self._add_polygon_field(center_zone, gr, "locations.center_zone_polygon", "Начертана зона:", getattr(loc, "center_zone_polygon", [])); gr += 1
+        self._add_field(center_zone, gr, "locations.show_center_zone_on_map", "Показвай на картата:",
+                        getattr(loc, "show_center_zone_on_map", True), "bool"); gr += 1
         self._add_field(center_zone, gr, "locations.enable_center_zone_priority", "Приоритет:", loc.enable_center_zone_priority, "bool"); gr += 1
         self._add_field(center_zone, gr, "locations.enable_center_zone_restrictions", "Ограничения:", loc.enable_center_zone_restrictions, "bool"); gr += 1
         self._add_field(center_zone, gr, "locations.discount_center_bus", "Отстъпка CENTER_BUS:", loc.discount_center_bus,
@@ -3105,6 +6537,8 @@ setData не трябва да се пуска:
         self._add_field(city_traffic, gr, "locations.city_traffic_radius_km", "Радиус (км):", loc.city_traffic_radius_km); gr += 1
         self._add_field(city_traffic, gr, "locations.city_traffic_duration_multiplier", "Множител:", loc.city_traffic_duration_multiplier,
                          tooltip="1.4 = +40% заради трафик"); gr += 1
+        self._add_field(city_traffic, gr, "locations.show_city_traffic_zone_on_map", "Показвай на картата:",
+                        getattr(loc, "show_city_traffic_zone_on_map", False), "bool"); gr += 1
 
         traffic_add = ttk.LabelFrame(f, text="Трафик зони", padding=(14, 12))
         traffic_add.grid(row=r, column=0, columnspan=3, sticky="we", padx=2, pady=(6, 14))
@@ -3113,53 +6547,95 @@ setData не трябва да се пуска:
         traffic_add.columnconfigure(2, weight=0)
         traffic_add.columnconfigure(3, weight=0)
 
-        ttk.Label(
-            traffic_add,
-            text="Добави зона с център, радиус и забавяне. Пример координати: 42.6977, 23.3219",
-            style="Hint.TLabel",
-            wraplength=820,
-        ).grid(row=0, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 10))
+        traffic_add.columnconfigure(0, weight=1)
+        traffic_add.columnconfigure(1, weight=1)
+        traffic_form = ttk.LabelFrame(traffic_add, text="Нова или редакция", padding=(12, 10))
+        traffic_form.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=2)
+        traffic_form.columnconfigure(1, weight=1)
+        traffic_list_frame = ttk.LabelFrame(traffic_add, text="Създадени трафик зони", padding=(12, 10))
+        traffic_list_frame.grid(row=0, column=1, columnspan=3, sticky="nsew", padx=(8, 0), pady=2)
+        traffic_list_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(traffic_add, text="Координати:", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(traffic_form, text="Име", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        traffic_name_var = tk.StringVar(value="")
+        traffic_name_entry = ttk.Entry(traffic_form, textvariable=traffic_name_var, width=28)
+        traffic_name_entry.grid(row=0, column=1, sticky="we", pady=5)
+        self._bind_text_editing(traffic_name_entry)
+        self.widgets["locations.new_traffic_zone_name"] = traffic_name_var
+
+        ttk.Label(traffic_form, text="Център", style="Surface.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         coords_var = tk.StringVar(value="")
-        coords_entry = ttk.Entry(traffic_add, textvariable=coords_var, width=38)
-        coords_entry.grid(row=1, column=1, columnspan=2, sticky="we", padx=(0, 8), pady=6)
+        coords_entry = ttk.Entry(traffic_form, textvariable=coords_var, width=28)
+        coords_entry.grid(row=1, column=1, sticky="we", pady=5)
         self._bind_text_editing(coords_entry)
         self.widgets["locations.new_traffic_zone_coords"] = coords_var
-        ttk.Button(traffic_add, text="Постави", command=lambda: self._paste_to_var(coords_var)).grid(
-            row=1, column=3, sticky="w", padx=(0, 8), pady=6
-        )
 
-        ttk.Label(traffic_add, text="Радиус:", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(8, 8), pady=6)
+        traffic_coord_buttons = ttk.Frame(traffic_form, style="Surface.TFrame")
+        traffic_coord_buttons.grid(row=2, column=1, sticky="w", pady=(2, 8))
+        ttk.Button(traffic_coord_buttons, text="Постави", command=lambda: self._paste_to_var(coords_var)).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_coord_buttons, text="Избери кръг на карта", command=self._open_new_traffic_zone_editor).pack(side="left")
+
+        ttk.Label(traffic_form, text="Радиус км", style="Surface.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=5)
         radius_var = tk.StringVar(value="3")
-        radius_combo = ttk.Combobox(traffic_add, textvariable=radius_var, values=["1", "2", "3", "5", "8", "10"], width=10, state="normal")
-        radius_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=6)
+        radius_combo = ttk.Combobox(traffic_form, textvariable=radius_var, values=["1", "2", "3", "5", "8", "10"], width=10, state="normal")
+        radius_combo.grid(row=3, column=1, sticky="w", pady=5)
         self._bind_text_editing(radius_combo)
         self.widgets["locations.new_traffic_zone_radius"] = radius_var
-        ttk.Label(traffic_add, text="км", style="Hint.TLabel").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Label(traffic_add, text="Забавяне:", style="Surface.TLabel").grid(row=3, column=0, sticky="w", padx=(8, 8), pady=6)
+        ttk.Label(traffic_form, text="Забавяне %", style="Surface.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=5)
         delay_var = tk.StringVar(value="30")
-        delay_combo = ttk.Combobox(traffic_add, textvariable=delay_var, values=["10", "20", "30", "40", "50"], width=10, state="normal")
-        delay_combo.grid(row=3, column=1, sticky="w", padx=(0, 8), pady=6)
+        delay_combo = ttk.Combobox(traffic_form, textvariable=delay_var, values=["10", "20", "30", "40", "50"], width=10, state="normal")
+        delay_combo.grid(row=4, column=1, sticky="w", pady=5)
         self._bind_text_editing(delay_combo)
         self.widgets["locations.new_traffic_zone_delay"] = delay_var
-        ttk.Label(traffic_add, text="%", style="Hint.TLabel").grid(row=3, column=2, sticky="w", padx=(0, 8), pady=6)
 
-        ttk.Button(traffic_add, text="Добави зона", command=self._append_traffic_zone_from_fields).grid(
-            row=4, column=1, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
-        ttk.Button(traffic_add, text="Премахни избраната", command=self._remove_selected_traffic_zone).grid(
-            row=4, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(10, 8)
-        )
+        show_on_map_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            traffic_form,
+            text="Показвай зоната на картата",
+            variable=show_on_map_var,
+        ).grid(row=5, column=1, sticky="w", pady=5)
+        self.widgets["locations.new_traffic_zone_show_on_map"] = show_on_map_var
+
+        traffic_buttons = ttk.Frame(traffic_form, style="Surface.TFrame")
+        traffic_buttons.grid(row=6, column=1, sticky="w", pady=(10, 0))
+        ttk.Button(traffic_buttons, text="Добави / обнови", command=self._append_traffic_zone_from_fields).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_buttons, text="Нова празна форма", command=self._clear_traffic_zone_form).pack(side="left")
+
         ttk.Label(
-            traffic_add,
-            text="Добавени зони:",
-            style="Surface.TLabel",
-        ).grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4))
+            traffic_list_frame,
+            text="Избери зона, за да я заредиш във формата. Забавянето се записва като множител на времето.",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
-        self.traffic_zone_listbox = tk.Listbox(traffic_add, height=4, font=("Segoe UI", 9), exportselection=False)
-        self.traffic_zone_listbox.grid(row=6, column=0, columnspan=4, sticky="we", padx=8, pady=(0, 2))
+        self.traffic_zone_tree = ttk.Treeview(
+            traffic_list_frame,
+            columns=("name", "gps", "radius", "delay", "status", "map_visibility"),
+            show="headings",
+            height=8,
+            selectmode="browse",
+        )
+        for column, title, width in (
+            ("name", "Име", 150),
+            ("gps", "GPS", 190),
+            ("radius", "Радиус км", 80),
+            ("delay", "Забавяне", 80),
+            ("status", "Статус", 85),
+            ("map_visibility", "На карта", 85),
+        ):
+            self.traffic_zone_tree.heading(column, text=title)
+            self.traffic_zone_tree.column(column, width=width, minwidth=60, stretch=True)
+        self.traffic_zone_tree.grid(row=1, column=0, sticky="nsew")
+        traffic_scroll = ttk.Scrollbar(traffic_list_frame, orient="vertical", command=self.traffic_zone_tree.yview)
+        traffic_scroll.grid(row=1, column=1, sticky="ns")
+        self.traffic_zone_tree.configure(yscrollcommand=traffic_scroll.set)
+        self.traffic_zone_tree.bind("<<TreeviewSelect>>", self._load_selected_traffic_zone)
+        traffic_table_actions = ttk.Frame(traffic_list_frame, style="Surface.TFrame")
+        traffic_table_actions.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(traffic_table_actions, text="Покажи на карта", command=self._show_selected_traffic_zone_on_map).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_table_actions, text="Покажи / скрий в картите", command=self._toggle_selected_traffic_zone_visibility).pack(side="left", padx=(0, 6))
+        ttk.Button(traffic_table_actions, text="Премахни избраната", command=self._remove_selected_traffic_zone).pack(side="left")
 
         hidden_zones = tk.Text(traffic_add, width=1, height=1)
         self.widgets["locations.traffic_zones"] = hidden_zones
@@ -3198,18 +6674,27 @@ setData не трябва да се пуска:
         ); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_url", "Upload URL:", getattr(out, "route_maps_upload_url", ""),
                          tooltip="Endpoint за индивидуалните route HTML файлове."); gr += 1
-        self._add_field(maps, gr, "output.route_maps_upload_token", "Upload token:", getattr(out, "route_maps_upload_token", ""),
-                         tooltip="Стойност за pData. За Effect endpoint-а е Effect-Bizante-Token."); gr += 1
+        self._add_field(
+            maps,
+            gr,
+            "output.route_maps_upload_token",
+            "Upload token:",
+            getattr(out, "route_maps_upload_token", ""),
+            "secret",
+            tooltip="Стойност за pData. Използвай token-а за конкретния upload endpoint и не го публикувай.",
+        ); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_token_field", "Token поле:", getattr(out, "route_maps_upload_token_field", "pData"),
                          tooltip="Име на POST полето за token-а."); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_file_field", "File поле:", getattr(out, "route_maps_upload_file_field", "files[]"),
                          tooltip="За PHP $_FILES['files'] с много файлове използвай files[]."); gr += 1
+        self._add_field(maps, gr, "output.route_maps_upload_bus_id_field", "Bus ID поле:", getattr(out, "route_maps_upload_bus_id_field", "pData2[]"),
+                         tooltip="За PHP масив с ID-та на бусовете използвай pData2[]. Редът съвпада с files[]."); gr += 1
         self._add_field(maps, gr, "output.route_maps_upload_timeout_seconds", "Upload timeout:", getattr(out, "route_maps_upload_timeout_seconds", 60), "int"); gr += 1
         self._add_field(maps, gr, "output.map_provider", "Map provider:", out.map_provider,
                          tooltip='google за Google Maps визуализация или osm за Folium/OpenStreetMap.'); gr += 1
         self._add_field(maps, gr, "output.folium_tiles", "Folium tiles:", out.folium_tiles,
                          tooltip='Например "Esri.WorldStreetMap", "Esri.WorldTopoMap", "CartoDB Voyager"'); gr += 1
-        self._add_field(maps, gr, "output.google_maps_api_key", "Google Maps key:", out.google_maps_api_key,
+        self._add_field(maps, gr, "output.google_maps_api_key", "Google Maps key:", out.google_maps_api_key, "secret",
                          tooltip="Може и чрез GOOGLE_MAPS_API_KEY env variable."); gr += 1
 
         excel, gr = self._add_grid_group(
@@ -3225,6 +6710,14 @@ setData не трябва да се пуска:
         self._add_field(excel, gr, "output.efficiency_excel_file", "Ефективност:", out.efficiency_excel_file); gr += 1
         self._add_field(excel, gr, "output.excel_bus_number_prefix", "Префикс ID бус:", getattr(out, "excel_bus_number_prefix", "10045010")); gr += 1
         self._add_field(excel, gr, "output.excel_bus_number_digits", "Цифри:", getattr(out, "excel_bus_number_digits", 2), "int"); gr += 1
+        self._add_field(excel, gr, "output.saturday_excel_bus_number_prefix", "Префикс за събота:", getattr(out, "saturday_excel_bus_number_prefix", "100450121"),
+                        tooltip="Използва се автоматично за normal номерирането при HTTP /run_saturday. Активното CENTER_BUS ID правило има предимство."); gr += 1
+        self._add_field(excel, gr, "output.saturday_excel_bus_number_digits", "Цифри за събота:", getattr(out, "saturday_excel_bus_number_digits", 1), "int",
+                        tooltip="Брой цифри след съботния префикс, например 1 дава ...1, ...2, ...3."); gr += 1
+        self._add_field(excel, gr, "output.center_bus_numbering_enabled", "Център ID правило:", getattr(out, "center_bus_numbering_enabled", True), "bool",
+                         tooltip="Включено: CENTER_BUS получава зададения ID и следващите център бусове вървят нагоре; другите бусове си тръгват от 1004501001 нагоре."); gr += 1
+        self._add_field(excel, gr, "output.center_bus_numbering_start_id", "ID център бус:", getattr(out, "center_bus_numbering_start_id", "1004501015"),
+                         tooltip="Първи ID за CENTER_BUS. Ако има повече център бусове: този ID, после +1, +2. Другите бусове остават по стандартната последователност от 1004501001."); gr += 1
 
         csv_group, gr = self._add_grid_group(
             f,
@@ -3256,7 +6749,10 @@ setData не трябва да се пуска:
         base_url = self._api_base_url_preview(api)
         solve_path = self._api_path_preview(api, "api_endpoint", "/solve")
         trigger_path = self._api_path_preview(api, "trigger_endpoint", "/run")
+        saturday_trigger_path = self._api_path_preview(api, "saturday_trigger_endpoint", "/run_saturday")
+        tsp_path = self._api_path_preview(api, "tsp_endpoint", "/tsp")
         health_path = self._api_path_preview(api, "health_endpoint", "/health")
+        shutdown_path = self._api_path_preview(api, "shutdown_endpoint", "/shutdown")
         api_key = str(getattr(api, "api_key", "") or "").strip()
         auth_header = f' -H "X-CVRP-API-Key: {api_key}"' if api_key else ""
 
@@ -3275,6 +6771,13 @@ setData не трябва да се пуска:
         r = self._add_copyable_command(
             quick,
             r,
+            "Съботен старт:",
+            f'curl{auth_header} "{base_url}{saturday_trigger_path}"',
+            "Автоматично използва съботата и отделния normal префикс; CENTER_BUS серията има предимство, ако е включена.",
+        )
+        r = self._add_copyable_command(
+            quick,
+            r,
             "Провери статус:",
             f'curl "{base_url}{health_path}"',
             "Показва дали API-то е живо, URL-ите и текущия/последния run статус.",
@@ -3289,8 +6792,15 @@ setData не трябва да се пуска:
         r = self._add_copyable_command(
             quick,
             r,
+            "Текущ TSP:",
+            f'curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"driver_id\\":\\"1004501001\\",\\"driver_location\\":\\"42.6977,23.3219\\",\\"end_location\\":\\"42.7000,23.4000\\",\\"service_time_minutes\\":8,\\"customers\\":[{{\\"id\\":\\"1\\",\\"document\\":\\"0004384359\\",\\"gps\\":\\"42.6629,23.37682\\",\\"quantity\\":5}}]}}"',
+            "Подрежда текущ маршрут за един шофьор; връща JSON или директно HTML карта според настройката TSP HTML и upload -> Отговор от /tsp.",
+        )
+        r = self._add_copyable_command(
+            quick,
+            r,
             "Run + настройки:",
-            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\",\\"routes_output_dir\\":\\"H:\\\\\\\\Hell_Bizant_files\\\\\\\\Bizant_with_vratza\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
+            f'curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json"{auth_header} -d "{{\\"settings\\":{{\\"solver_type\\":\\"pyvrp\\",\\"objective_metric\\":\\"time\\",\\"time_limit_seconds\\":180,\\"osrm_base_url\\":\\"http://localhost:5000\\",\\"vehicles\\":[{{\\"vehicle_type\\":\\"internal_bus\\",\\"count\\":7,\\"capacity\\":385}}],\\"output\\":{{\\"excel_output_dir\\":\\"C:\\\\\\\\CVRP\\\\\\\\output\\",\\"routes_output_dir\\":\\"C:\\\\\\\\CVRP\\\\\\\\output\\\\\\\\Routes\\"}},\\"set_data\\":{{\\"enable_set_data_upload\\":false}}}}}}"',
             "Стартира /run, но само за тази заявка сменя solver, OSRM, бусове, изходни пътища и setData настройки.",
         )
         r = self._add_copyable_command(
@@ -3343,8 +6853,48 @@ setData не трябва да се пуска:
             "api.api_key",
             "API ключ:",
             getattr(api, "api_key", ""),
+            "secret",
             tooltip="По желание. Ако е попълнен, /run и /solve искат header X-CVRP-API-Key.",
         )
+
+        web_gui, r = self._add_group(
+            f,
+            "Уеб управление от други компютри",
+            "Това отваря удобен browser екран за старт, прогрес, логове, бусове и основни настройки. Ползва същия порт като API сървъра.",
+        )
+        self._add_note_row(
+            web_gui,
+            r,
+            "Най-често попълваш само: 1) път за отваряне, например /hell; "
+            "2) име в мрежата, например bizant; 3) потребители за вход. "
+            f"Портът идва от полето API порт по-горе. Пример: http://bizant:{getattr(api, 'api_port', 8088)}/hell",
+        ); r += 1
+        self._add_field(web_gui, r, "api.web_gui_enabled", "Пусни уеб управлението:", getattr(api, "web_gui_enabled", True), "bool",
+                        tooltip="Когато е включено, можеш да отвориш управлението от browser на друг компютър."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_endpoint", "Път за отваряне:", getattr(api, "web_gui_endpoint", "/ui"),
+                        tooltip="Краткото име след порта. Примери: /ui, /hell, /cvrp. Не е целият адрес."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_public_host", "Име в мрежата:", getattr(api, "web_gui_public_host", ""),
+                        tooltip="Напиши само името или IP-то, например bizant или 10.10.10.155. Празно = програмата сама показва IP-то на машината."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_public_url", "Готов външен адрес:", getattr(api, "web_gui_public_url", ""),
+                        tooltip="Обикновено остави празно. Попълва се само при Cloudflare/reverse proxy, например https://firma.example.com/hell."); r += 1
+        self._add_field(web_gui, r, "api.web_gui_title", "Име на този сървър:", getattr(api, "web_gui_title", "CVRP Optimizer"),
+                        tooltip="Това име се вижда най-отгоре в уеб екрана, например София, Враца или Тестова машина."); r += 1
+        self._add_field(
+            web_gui,
+            r,
+            "api.web_gui_trusted_proxy_ips",
+            "Доверени reverse proxy IP/CIDR:",
+            getattr(api, "web_gui_trusted_proxy_ips", "127.0.0.1,::1"),
+            tooltip="Само тези директни адреси могат да задават Forwarded/X-Forwarded-For. Пример: 127.0.0.1,::1 или 10.0.0.5/32.",
+        ); r += 1
+        self._add_web_gui_user_controls(web_gui, r); r += 1
+        self._add_note_row(
+            web_gui,
+            r,
+            "Как да го четеш: ако API портът е 8087, пътят е /hell и името в мрежата е bizant, "
+            "адресът за отваряне ще бъде http://bizant:8087/hell. "
+            "Полето 'Готов външен адрес' прескача тази логика и се използва директно.",
+        ); r += 1
 
         endpoints, r = self._add_group(
             f,
@@ -3355,13 +6905,117 @@ setData не трябва да се пуска:
                         tooltip="POST с JSON клиенти. Сървърът чака решението и връща пълен резултат."); r += 1
         self._add_field(endpoints, r, "api.trigger_endpoint", "Старт без вход:", getattr(api, "trigger_endpoint", "/run"),
                         tooltip="GET/POST без body. Стартира програмата във фонова нишка."); r += 1
+        self._add_field(endpoints, r, "api.saturday_trigger_endpoint", "Съботен старт:", getattr(api, "saturday_trigger_endpoint", "/run_saturday"),
+                        tooltip="GET/POST. Задава съботната дата и normal префикс; специалното CENTER_BUS номериране има предимство."); r += 1
+        self._add_field(endpoints, r, "api.tsp_endpoint", "Текущ TSP:", getattr(api, "tsp_endpoint", "/tsp"),
+                        tooltip="POST. Подрежда текущ маршрут за един шофьор с текуща GPS позиция и optional крайна точка."); r += 1
+        self._add_field(endpoints, r, "api.tsp_report_endpoint", "TSP отчет:", getattr(api, "tsp_report_endpoint", "/tsp-report"),
+                        tooltip="GET/POST. Генерира Excel отчет за TSP маршрутите за деня."); r += 1
+        self._add_field(endpoints, r, "api.shutdown_endpoint", "Спиране:", getattr(api, "shutdown_endpoint", "/shutdown"),
+                        tooltip="GET/POST. Спира API сървъра/програмата. Ползвай API key при отдалечен достъп."); r += 1
         self._add_field(endpoints, r, "api.health_endpoint", "Статус:", getattr(api, "health_endpoint", "/health"),
                         tooltip="GET. Проверка дали API-то е живо и дали има активен run."); r += 1
 
+        docs, r = self._add_group(
+            f,
+            "API документация",
+            "Избери endpoint и виж какво прави, как се вика, какъв JSON приема и какъв отговор връща.",
+        )
+        self._add_api_docs_notebook(
+            docs,
+            r,
+            self._api_endpoint_docs(base_url, solve_path, trigger_path, saturday_trigger_path, tsp_path, health_path, auth_header, shutdown_path),
+        )
+
+        tsp_optimization, r = self._add_group(
+            f,
+            "TSP оптимизация",
+            "Тези стойности управляват как /tsp подрежда текущ маршрут, когато POST заявката не ги подаде.",
+        )
+        self._add_field(tsp_optimization, r, "api.tsp_objective_metric", "Цел:", getattr(api, "tsp_objective_metric", "time"),
+                        tooltip="time = най-кратко време, distance = най-къси километри. POST metric/objective има приоритет."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_default_service_time_minutes", "Обслужване (мин):", getattr(api, "tsp_default_service_time_minutes", 8), "int",
+                        tooltip="Default service_time_minutes за TSP. Ако POST подаде service_time_minutes, POST стойността има приоритет."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_use_time_windows", "Отчитай работно време:", getattr(api, "tsp_use_time_windows", True), "bool",
+                        tooltip="Ако е включено, TSP предпочита ред, който намалява чакането и закъсненията спрямо работното време."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_time_window_wait_weight", "Тежест чакане:", getattr(api, "tsp_time_window_wait_weight", 1.0), "float",
+                        tooltip="Колко силно чакането влияе на TSP подреждането. 0 = почти не го интересува чакането."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_time_window_late_weight", "Тежест закъснение:", getattr(api, "tsp_time_window_late_weight", 20.0), "float",
+                        tooltip="Колко силно закъснението след работно време влияе на TSP подреждането. По-високо = по-строго."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_enable_two_opt", "2-opt подобрение:", getattr(api, "tsp_enable_two_opt", True), "bool",
+                        tooltip="Прави допълнително локално подобрение след първоначалното greedy подреждане."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_two_opt_max_passes", "2-opt обходи:", getattr(api, "tsp_two_opt_max_passes", 30), "int",
+                        tooltip="Повече обходи могат леко да подобрят реда, но забавят TSP при много клиенти."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_worker_timeout_seconds", "Worker timeout (сек):", getattr(api, "tsp_worker_timeout_seconds", 30), "int",
+                        tooltip="Максимално време за отделния TSP процес, когато основният CVRP solver вече работи."); r += 1
+
+        r = self._add_tsp_truck_profiles_editor(f, r, api)
+
+        tsp_html, r = self._add_group(
+            f,
+            "TSP HTML и upload",
+            "Тези настройки важат само за /tsp картите и не променят нормалните CVRP route карти.",
+        )
+        self._add_field(tsp_html, r, "api.tsp_response_format", "Отговор от /tsp:", getattr(api, "tsp_response_format", "json"), "combo",
+                        options=["json", "html"],
+                        tooltip="json = връща реда и ETA като JSON. html = връща самия HTML на картата като response body. Това не управлява локалното записване на файл."); r += 1
+        self._add_field(tsp_html, r, "api.tsp_generate_html_map", "Локална HTML карта:", getattr(api, "tsp_generate_html_map", True), "bool",
+                        tooltip="Само за /tsp. Управлява дали да се записва HTML файл на диска. Не променя дали HTTP отговорът е JSON или HTML."); r += 1
+        self._add_field(tsp_html, r, "api.tsp_upload_html_map", "Качвай HTML карта:", getattr(api, "tsp_upload_html_map", True), "bool",
+                        tooltip="Само за /tsp. Качването използва Output -> Route maps upload URL/token. Работи когато локалната TSP HTML карта е включена."); r += 1
+
+        tsp_report, r = self._add_group(
+            f,
+            "TSP дневен Excel отчет",
+            "API сървърът записва всяка успешна /tsp заявка и може автоматично да генерира дневен Excel отчет в зададен час.",
+        )
+        self._add_field(tsp_report, r, "api.tsp_daily_report_enabled", "Автоматичен отчет:", getattr(api, "tsp_daily_report_enabled", False), "bool",
+                        tooltip="Ако е включено, API сървърът генерира TSP Excel отчет веднъж дневно в зададения час."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_time", "Час:", getattr(api, "tsp_daily_report_time", "18:00"),
+                        tooltip="Формат HH:MM, например 18:00."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_output_dir", "Папка за отчети:", getattr(api, "tsp_daily_report_output_dir", ""),
+                        tooltip="Ако е празно, използва Output -> Excel директория."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_history_file", "TSP дневник:", getattr(api, "tsp_daily_report_history_file", ""),
+                        tooltip="JSONL файл с история на /tsp маршрутите. Ако е празно, използва logs/tsp_routes_history.jsonl."); r += 1
+        self._add_field(tsp_report, r, "api.tsp_daily_report_include_details", "Лист с клиенти:", getattr(api, "tsp_daily_report_include_details", True), "bool",
+                        tooltip="Добавя подробен лист с всички клиенти/стопове към Excel отчета."); r += 1
+
+        tsp_fields, r = self._add_group(
+            f,
+            "TSP полета във входната заявка",
+            "Тук настройваш как се казват полетата, които външната система изпраща към /tsp. Може да зададеш повече от едно име, разделени със запетая; първото намерено поле се използва.",
+        )
+        self._add_field(tsp_fields, r, "api.tsp_driver_id_field", "ID шофьор/бус:", getattr(api, "tsp_driver_id_field", "driver_id"),
+                        tooltip="Пример: driver_id или DriverID."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_driver_name_field", "Име шофьор/бус:", getattr(api, "tsp_driver_name_field", "driver_name"),
+                        tooltip="Optional. Ако липсва, картата използва ID-то."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_driver_location_field", "Стартова GPS точка:", getattr(api, "tsp_driver_location_field", "driver_location"),
+                        tooltip="Пример: driver_location,current_location,gps."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_end_location_field", "Крайна GPS точка:", getattr(api, "tsp_end_location_field", "end_location"),
+                        tooltip="Optional. Ако липсва, TSP маршрутът е отворен."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customers_field", "Списък клиенти:", getattr(api, "tsp_customers_field", "customers"),
+                        tooltip="Пример: customers,clients,orders,data."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_id_field", "Клиент ID:", getattr(api, "tsp_customer_id_field", "id"),
+                        tooltip="Пример: id,IdCust,customer_id."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_name_field", "Име клиент:", getattr(api, "tsp_customer_name_field", "name"),
+                        tooltip="Пример: name,CustName,client_name."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_order_field", "Номер документ:", getattr(api, "tsp_customer_order_field", "document"),
+                        tooltip="Пример: document,order,DocNo."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_gps_field", "GPS координати:", getattr(api, "tsp_customer_gps_field", "gps"),
+                        tooltip="Пример: gps,GPS,coordinates,location."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_quantity_field", "Количество/стекове:", getattr(api, "tsp_customer_quantity_field", "quantity"),
+                        tooltip="Пример: quantity,Volume,stacks."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_turnover_field", "Оборот:", getattr(api, "tsp_customer_turnover_field", "turnover"),
+                        tooltip="Пример: turnover,amount,oborot."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_work_time_field", "Работно време:", getattr(api, "tsp_customer_work_time_field", "work_time"),
+                        tooltip="Пример: work_time,WorkTime,TimeWindow."); r += 1
+        self._add_field(tsp_fields, r, "api.tsp_customer_comment_field", "Коментар доставка:", getattr(api, "tsp_customer_comment_field", "comment"),
+                        tooltip="Пример: comment,note,remark,DeliveryComment."); r += 1
+
         commands, r = self._add_group(
             f,
-            "API справочник",
-            "Тук са отделени командите, JSON body примерите и всички settings полета, които могат да се подават временно.",
+            "Експертен API справочник",
+            "Подробен списък с aliases и settings полета за напреднали. За ежедневна работа използвай табовата API документация по-горе.",
         )
         r = self._add_readonly_text(
             commands,
@@ -3418,6 +7072,20 @@ POST {trigger_path}
     curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"return_result\":true,\"settings\":{{\"objective_metric\":\"time\",\"time_limit_seconds\":180}}}}"
     curl -X POST "{base_url}{trigger_path}" -H "Content-Type: application/json" -d "{{\"callback_url\":\"https://example.com/cvrp-finished\"}}"
 
+GET/POST {saturday_trigger_path}
+  За какво е:
+    Стартира същия CVRP workflow за съботата от текущата седмица.
+  Поведение:
+    Използва request-local съботна дата, output.saturday_excel_bus_number_prefix
+    и output.saturday_excel_bus_number_digits. Картите и общият Excel получават
+    suffix _събота; normal prefix-ът в config.py не се променя.
+    Ако center_bus_numbering_enabled=true, CENTER_BUS запазва серията от
+    center_bus_numbering_start_id и тя има предимство пред съботния prefix.
+  Връща:
+    202 started за background run, 200 при синхронен POST, 409 при активен основен run.
+  Пример:
+    curl -X POST "{base_url}{saturday_trigger_path}"
+
 POST {solve_path}
   За какво е:
     Външната система подава клиентите директно в заявката и получава JSON резултат.
@@ -3430,6 +7098,35 @@ POST {solve_path}
     200 с пълния JSON резултат от решението.
   Пример:
     curl -X POST "{base_url}{solve_path}" -H "Content-Type: application/json" -d "{{\"customers\":[{{\"IdCust\":\"1\",\"GPS\":\"42.6977,23.3219\",\"Volume\":10}}]}}"
+
+POST {base_url}{tsp_path}
+  За какво е:
+    Подрежда текущ маршрут за един шофьор, без да пуска CVRP solver.
+    Стартира от текущата GPS позиция на шофьора и ако има end_location,
+    оптимизира реда така, че маршрутът да завърши в тази крайна точка.
+  Body:
+    {{
+      "driver_id": "1004501001",
+      "driver_location": "42.6977,23.3219",
+      "end_location": "42.7000,23.4000",
+      "service_time_minutes": 8,
+      "customers": [{{"id":"1","name":"Клиент","document":"0004384359","gps":"42.6629,23.37682","work_time":"08:00-13:00","turnover":120.5,"quantity":5,"comment":"Обади се 10 мин преди доставка"}}]
+    }}
+  Field names:
+    driver_id, driver_location, document, gps, work_time, quantity, turnover and comment
+    are configurable in the "TSP полета във входната заявка" section.
+  Defaults:
+    Ако service_time_minutes липсва, /tsp използва "TSP оптимизация -> Обслужване (мин)".
+    Стойността е обща за всички stops; клиентско ServiceTimeMinutes не се прилага в /tsp.
+    Работните прозорци са soft score/ETA: късен stop може да остане в резултата.
+    Форматът на HTTP отговора се управлява от "TSP HTML и upload -> Отговор от /tsp".
+    Локалното записване и качването на TSP HTML карта са отделни настройки.
+  Връща:
+    При json: driver_id, ред на доставка, ETA, общи км/минути, map_file и upload статус.
+    При html: Content-Type text/html и самият HTML на картата като body, без задължително да се записва локален файл.
+    Ако route_maps_upload_mode=effect_upload, картата се качва с pData2[]=driver_id.
+  Пример:
+    curl -X POST "{base_url}{tsp_path}" -H "Content-Type: application/json" -d "{{\"driver_id\":\"1004501001\",\"driver_location\":\"42.6977,23.3219\",\"end_location\":\"42.7000,23.4000\",\"service_time_minutes\":8,\"customers\":[{{\"id\":\"1\",\"document\":\"0004384359\",\"gps\":\"42.6629,23.37682\",\"quantity\":5}}]}}"
 
 POST {solve_path}?cmd=run
   За какво е:
@@ -3474,18 +7171,19 @@ POST {trigger_path} - run с временни настройки, без да п
     "vehicle_counts": {{"internal_bus": 7, "vratza_bus": 3}},
     "output": {{
       "enable_excel_output": true,
-      "excel_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza",
-      "routes_output_dir": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\Routes",
+      "excel_output_dir": "C:\\\\CVRP\\\\output",
+      "routes_output_dir": "C:\\\\CVRP\\\\output\\\\Routes",
       "enable_csv_output": true,
-      "csv_output_file": "H:\\\\Hell_Bizant_files\\\\Bizant_with_vratza\\\\routes.csv",
+      "csv_output_file": "C:\\\\CVRP\\\\output\\\\routes.csv",
       "route_maps_upload_mode": "effect_upload",
-      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
-      "route_maps_upload_token": "Effect-Bizante-Token",
-      "route_maps_upload_file_field": "files[]"
+      "route_maps_upload_url": "https://example.com/upload-files.php",
+      "route_maps_upload_token": "<UPLOAD_TOKEN>",
+      "route_maps_upload_file_field": "files[]",
+      "route_maps_upload_bus_id_field": "pData2[]"
     }},
     "set_data": {{
       "enable_set_data_upload": false,
-      "set_data_url": "http://sio.effect.bg:7080/lubiv_Bizant",
+      "set_data_url": "https://example.com/setData",
       "set_data_http_method": "GET",
       "set_data_done_flag": "1973",
       "set_data_id_skld": "106",
@@ -3529,9 +7227,26 @@ POST {solve_path} - клиенти + настройки в една заявка
     "set_data.enable_set_data_upload": false
   }},
   "customers": [
-    {{"IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00 - 16:00"}}
+    {{"IdCust": "1", "CustName": "Клиент", "GPS": "42.6977,23.3219", "Volume": 10, "WorkTime": "08:00-13:00\\n16:00-18:00", "ServiceTimeMinutes": 6, "Mandatory": true}}
   ]
 }}
+
+POST {base_url}{tsp_path} - текущ TSP маршрут за един шофьор:
+{{
+  "driver_id": "1004501001",
+  "driver_location": "42.6977,23.3219",
+  "end_location": "42.7000,23.4000",
+  "service_time_minutes": 8,
+  "customers": [
+    {{"id": "1", "name": "Клиент 1", "document": "0004384359", "gps": "42.6629,23.37682", "work_time": "08:00-13:00", "turnover": 120.50, "quantity": 5, "comment": "Обади се 10 мин преди доставка"}},
+    {{"id": "2", "name": "Клиент 2", "document": "0004385134", "gps": "42.66119,23.39272", "work_time": "16:00-18:00", "turnover": 80.00, "quantity": 3, "comment": ""}}
+  ]
+}}
+
+TSP имената на полетата се настройват от GUI:
+  API сървър -> TSP полета във входната заявка.
+  Ако външната система праща GPS като Coord или коментар като Note,
+  попълни съответното име там, без да променяш кода.
 
 Формат за vehicles patch:
 {{
@@ -3542,7 +7257,7 @@ POST {solve_path} - клиенти + настройки в една заявка
       "north": [42.8000, 23.4000]
     }},
     "vehicles": [
-      {{"vehicle_type": "internal_bus", "count": 7, "capacity": 385, "name": "HELL", "start_depot_name": "main", "end_location": [42.7000, 23.4000]}},
+      {{"config_id": "internal-main", "vehicle_type": "internal_bus", "count": 7, "capacity": 385, "name": "HELL", "max_time_hours": 8, "max_distance_km": 250, "max_customers_per_day": 45, "start_depot_name": "main", "reload_depot_name": "main", "reload_time_minutes": 30, "end_location": [42.7000, 23.4000]}},
       {{"vehicle_type": "vratza_bus", "count": 3, "start_depot_name": "vratza", "end_depot_name": "vratza"}}
     ],
     "center_zone": {{
@@ -3565,11 +7280,12 @@ POST {solve_path} - клиенти + настройки в една заявка
         "discount_priority_vehicle": 0.9,
         "priority_vehicle_outside_penalty": 0,
         "vehicle_penalties": {{"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000}},
-        "enabled": true
+        "enabled": true,
+        "show_on_map": true
       }}
     ],
     "traffic_zones": [
-      {{"name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true}}
+      {{"name": "Center traffic", "center": [42.6977, 23.3219], "radius_km": 3.0, "multiplier": 1.3, "enabled": true, "show_on_map": false}}
     ]
   }}
 }}
@@ -3594,7 +7310,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "Когато е включено, след успешно решение програмата изпраща маршрутите обратно през setData.",
         ); r += 1
         self._add_field(connection, gr, "set_data.enable_set_data_upload", "Изпращай setData:", getattr(set_data, "enable_set_data_upload", False), "bool"); gr += 1
-        self._add_field(connection, gr, "set_data.set_data_url", "URL:", getattr(set_data, "set_data_url", "http://sio.effect.bg:7080/lubiv_Bizant")); gr += 1
+        self._add_field(connection, gr, "set_data.set_data_url", "URL:", getattr(set_data, "set_data_url", "")); gr += 1
         self._add_field(connection, gr, "set_data.set_data_http_method", "Метод:", getattr(set_data, "set_data_http_method", "GET"),
                          "combo", ["GET", "POST"]); gr += 1
         self._add_field(connection, gr, "set_data.set_data_command", "cmd:", getattr(set_data, "set_data_command", "setData")); gr += 1
@@ -3739,7 +7455,7 @@ POST {solve_path} - клиенти + настройки в една заявка
         btn_frame.grid(row=gr, column=0, columnspan=3, sticky="w", padx=8, pady=6)
         ttk.Button(btn_frame, text="✅ Създай задача", command=self._create_scheduled_task).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="🗑️ Премахни задача", command=self._remove_scheduled_task).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="🔄 Провери статус", command=self._check_task_status).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Провери статус", command=self._check_task_status_async).pack(side="left", padx=4)
 
         status_box, gr = self._add_grid_group(
             f,
@@ -3752,7 +7468,7 @@ POST {solve_path} - клиенти + настройки в една заявка
         self._sched_status.grid(row=gr, column=0, columnspan=3, sticky="we", padx=8, pady=6)
 
         # Auto-check status on load
-        self.root.after(300, self._check_task_status)
+        self.root.after(300, self._check_task_status_async)
 
     def _get_program_command(self):
         """Връща команда за стартиране, подходяща за schtasks и локално изпълнение"""
@@ -3763,17 +7479,19 @@ POST {solve_path} - клиенти + настройки в една заявка
                 return f'cmd /c ""{batch_path}""', exe_dir
             return f'"{sys.executable}"', exe_dir
 
-        exe = os.path.abspath(os.path.join(_base_dir, "..", "dist", "CVRP_Optimizer.exe"))
-        if os.path.isfile(exe):
-            batch_path = os.path.join(os.path.dirname(exe), "start_cvrp.bat")
-            if os.path.isfile(batch_path):
-                return f'cmd /c ""{batch_path}""', os.path.dirname(exe)
-            return f'"{exe}"', os.path.dirname(exe)
+        dist_dir = os.path.abspath(os.path.join(_base_dir, "..", "dist"))
+        for executable_name in ("Bizant.exe", "CVRP_Optimizer.exe"):
+            exe = os.path.join(dist_dir, executable_name)
+            if os.path.isfile(exe):
+                batch_path = os.path.join(os.path.dirname(exe), "start_cvrp.bat")
+                if os.path.isfile(batch_path):
+                    return f'cmd /c ""{batch_path}""', os.path.dirname(exe)
+                return f'"{exe}"', os.path.dirname(exe)
 
         main_py = os.path.join(_base_dir, "main.py")
         return f'"{sys.executable}" "{main_py}"', _base_dir
 
-    def _set_status(self, text):
+    def _set_scheduler_status(self, text):
         self._sched_status.configure(state="normal")
         self._sched_status.delete("1.0", "end")
         self._sched_status.insert("1.0", text)
@@ -3832,7 +7550,7 @@ POST {solve_path} - клиенти + настройки в една заявка
 
         result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
         if result.returncode == 0:
-            self._set_status(f"Задачата е създадена/обновена.\n"
+            self._set_scheduler_status(f"Задачата е създадена/обновена.\n"
                              f"Име: {task_name}\n"
                              f"Час: {time_str}\n"
                              f"Дни: {days_str}\n"
@@ -3841,7 +7559,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             messagebox.showinfo("Готово", f"Задачата '{task_name}' е създадена/обновена.")
         else:
             err = result.stderr.strip() or result.stdout.strip()
-            self._set_status(f"Грешка при създаване:\n{err}")
+            self._set_scheduler_status(f"Грешка при създаване:\n{err}")
             messagebox.showerror("Грешка", f"Не може да се създаде задачата:\n{err}")
 
     def _remove_scheduled_task(self):
@@ -3852,13 +7570,45 @@ POST {solve_path} - клиенти + настройки в една заявка
             capture_output=True, text=True, creationflags=0x08000000
         )
         if result.returncode == 0:
-            self._set_status(f"Задачата '{task_name}' е премахната.")
+            self._set_scheduler_status(f"Задачата '{task_name}' е премахната.")
             messagebox.showinfo("Готово", f"Задачата '{task_name}' е премахната.")
         else:
             err = result.stderr.strip() or result.stdout.strip()
-            self._set_status(f"Грешка при премахване:\n{err}")
+            self._set_scheduler_status(f"Грешка при премахване:\n{err}")
+
+    def _check_task_status_async(self):
+        self._set_scheduler_status("Проверявам Windows задачите...")
+        task_name = self._get_scheduler_task_name()
+
+        def worker():
+            import subprocess
+
+            result = subprocess.run(
+                ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"],
+                capture_output=True,
+                text=True,
+                creationflags=0x08000000,
+            )
+            task_lines = [
+                f"- {name} | Следващо: {next_run} | Статус: {status}"
+                for name, next_run, status in self._list_scheduler_tasks()
+            ]
+            all_tasks_text = "\n\nВсички CVRP задачи:\n" + (
+                "\n".join(task_lines) if task_lines else "Няма намерени CVRP задачи."
+            )
+            if result.returncode == 0:
+                message = f"Избраната задача съществува:\n{result.stdout.strip()}{all_tasks_text}"
+            else:
+                message = f"Избраната задача '{task_name}' не съществува.{all_tasks_text}"
+            self.root.after(0, lambda: self._set_scheduler_status(message))
+
+        threading.Thread(target=worker, name="CVRPSchedulerStatus", daemon=True).start()
 
     def _check_task_status(self):
+        """Backward-compatible entry point used by older callers."""
+        self._check_task_status_async()
+
+    def _check_task_status_sync_legacy(self):
         import subprocess
         task_name = self._get_scheduler_task_name()
         result = subprocess.run(
@@ -3869,9 +7619,9 @@ POST {solve_path} - клиенти + настройки в една заявка
                       for name, next_run, status in self._list_scheduler_tasks()]
         all_tasks_text = "\n\nВсички CVRP задачи:\n" + ("\n".join(task_lines) if task_lines else "Няма намерени CVRP задачи.")
         if result.returncode == 0:
-            self._set_status(f"Избраната задача съществува:\n{result.stdout.strip()}{all_tasks_text}")
+            self._set_scheduler_status(f"Избраната задача съществува:\n{result.stdout.strip()}{all_tasks_text}")
         else:
-            self._set_status(f"Избраната задача '{task_name}' не съществува.{all_tasks_text}")
+            self._set_scheduler_status(f"Избраната задача '{task_name}' не съществува.{all_tasks_text}")
 
     # ── Save logic ───────────────────────────────────────────
 
@@ -3883,6 +7633,9 @@ POST {solve_path} - клиенти + настройки в една заявка
                 values[key] = widget.get("1.0", "end-1c")
             else:
                 values[key] = widget.get()
+        solver_display = values.get("cvrp.solver_type")
+        if solver_display in self.SOLVER_VALUES_BY_LABEL:
+            values["cvrp.solver_type"] = self.SOLVER_VALUES_BY_LABEL[solver_display]
         return values
 
     def _apply_to_config_file(self, values: dict):
@@ -3915,6 +7668,8 @@ POST {solve_path} - клиенти + настройки в една заявка
             "input.json_id_skld_field": ("json_id_skld_field", "str"),
             "input.json_time_window_field": ("json_time_window_field", "str"),
             "input.json_delivery_comment_field": ("json_delivery_comment_field", "str"),
+            "input.json_service_time_field": ("json_service_time_field", "str"),
+            "input.json_mandatory_field": ("json_mandatory_field", "str"),
             "input.gps_column": ("gps_column", "str"),
             "input.client_id_column": ("client_id_column", "str"),
             "input.client_name_column": ("client_name_column", "str"),
@@ -3922,6 +7677,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "input.document_column": ("document_column", "str"),
             "input.time_window_column": ("time_window_column", "str"),
             "input.delivery_comment_column": ("delivery_comment_column", "str"),
+            "input.mandatory_column": ("mandatory_column", "str"),
             "input.enable_customer_document_grouping": ("enable_customer_document_grouping", "bool"),
             # Routing
             "routing.engine": ("engine", "routing_engine"),
@@ -3939,6 +7695,8 @@ POST {solve_path} - клиенти + настройки в една заявка
             # CVRP
             "cvrp.solver_type": ("solver_type", "str"),
             "cvrp.objective_metric": ("objective_metric", "str"),
+            "cvrp.time_objective_include_waiting": ("time_objective_include_waiting", "bool"),
+            "cvrp.enable_multiple_trips": ("enable_multiple_trips", "bool"),
             "cvrp.time_limit_seconds": ("time_limit_seconds", "int"),
             "cvrp.allow_customer_skipping": ("allow_customer_skipping", "bool"),
             "cvrp.distance_penalty_disjunction": ("distance_penalty_disjunction", "int"),
@@ -3965,15 +7723,40 @@ POST {solve_path} - клиенти + настройки в една заявка
             "cvrp.pyvrp_seed_base": ("pyvrp_seed_base", "int"),
             "cvrp.pyvrp_seed": ("pyvrp_seed", "optional_int"),
             "cvrp.pyvrp_num_neighbours": ("pyvrp_num_neighbours", "int"),
+            "cvrp.pyvrp_weight_wait_time": ("pyvrp_weight_wait_time", "float"),
+            "cvrp.pyvrp_symmetric_proximity": ("pyvrp_symmetric_proximity", "bool"),
             "cvrp.pyvrp_ils_no_improvement": ("pyvrp_ils_no_improvement", "int"),
             "cvrp.pyvrp_ils_history_length": ("pyvrp_ils_history_length", "int"),
+            "cvrp.pyvrp_exhaustive_on_best": ("pyvrp_exhaustive_on_best", "bool"),
             "cvrp.pyvrp_use_extended_operators": ("pyvrp_use_extended_operators", "bool"),
             "cvrp.pyvrp_min_perturbations": ("pyvrp_min_perturbations", "int"),
             "cvrp.pyvrp_max_perturbations": ("pyvrp_max_perturbations", "int"),
             "cvrp.pyvrp_display_progress": ("pyvrp_display_progress", "bool"),
+            "cvrp.pyvrp_display_interval_seconds": ("pyvrp_display_interval_seconds", "float"),
+            "cvrp.pyvrp_use_library_penalty_defaults": ("pyvrp_use_library_penalty_defaults", "bool"),
+            "cvrp.pyvrp_penalty_solutions_between_updates": ("pyvrp_penalty_solutions_between_updates", "int"),
+            "cvrp.pyvrp_penalty_increase": ("pyvrp_penalty_increase", "float"),
+            "cvrp.pyvrp_penalty_decrease": ("pyvrp_penalty_decrease", "float"),
+            "cvrp.pyvrp_penalty_target_feasible": ("pyvrp_penalty_target_feasible", "float"),
+            "cvrp.pyvrp_penalty_feas_tolerance": ("pyvrp_penalty_feas_tolerance", "float"),
+            "cvrp.pyvrp_penalty_min": ("pyvrp_penalty_min", "float"),
+            "cvrp.pyvrp_penalty_max": ("pyvrp_penalty_max", "float"),
+            "cvrp.pyvrp_next_worker_path": ("pyvrp_next_worker_path", "str"),
+            "cvrp.pyvrp_next_worker_timeout_seconds": ("pyvrp_next_worker_timeout_seconds", "int"),
+            "cvrp.pyvrp_next_fallback_to_stable": ("pyvrp_next_fallback_to_stable", "bool"),
+            "cvrp.vroom_worker_path": ("vroom_worker_path", "str"),
+            "cvrp.vroom_worker_timeout_seconds": ("vroom_worker_timeout_seconds", "int"),
+            "cvrp.vroom_threads": ("vroom_threads", "int"),
+            "cvrp.vroom_exploration_level": ("vroom_exploration_level", "int"),
+            "cvrp.vrp_worker_path": ("vrp_worker_path", "str"),
+            "cvrp.vrp_worker_timeout_seconds": ("vrp_worker_timeout_seconds", "int"),
+            "cvrp.vrp_threads": ("vrp_threads", "int"),
+            "cvrp.vrp_max_generations": ("vrp_max_generations", "int"),
+            "cvrp.vrp_log_progress": ("vrp_log_progress", "bool"),
             # Locations
             "locations.center_zone_mode": ("center_zone_mode", "str"),
             "locations.center_zone_radius_km": ("center_zone_radius_km", "float"),
+            "locations.show_center_zone_on_map": ("show_center_zone_on_map", "bool"),
             "locations.enable_center_zone_priority": ("enable_center_zone_priority", "bool"),
             "locations.enable_center_zone_restrictions": ("enable_center_zone_restrictions", "bool"),
             "locations.discount_center_bus": ("discount_center_bus", "float"),
@@ -3983,6 +7766,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "locations.special_bus_center_penalty": ("special_bus_center_penalty", "float"),
             "locations.vratza_bus_center_penalty": ("vratza_bus_center_penalty", "float"),
             "locations.enable_city_traffic_adjustment": ("enable_city_traffic_adjustment", "bool"),
+            "locations.show_city_traffic_zone_on_map": ("show_city_traffic_zone_on_map", "bool"),
             "locations.city_traffic_radius_km": ("city_traffic_radius_km", "float"),
             "locations.city_traffic_duration_multiplier": ("city_traffic_duration_multiplier", "float"),
             # Output
@@ -3994,6 +7778,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             "output.route_maps_upload_token_field": ("route_maps_upload_token_field", "str"),
             "output.route_maps_upload_token": ("route_maps_upload_token", "str"),
             "output.route_maps_upload_file_field": ("route_maps_upload_file_field", "str"),
+            "output.route_maps_upload_bus_id_field": ("route_maps_upload_bus_id_field", "str"),
             "output.route_maps_upload_timeout_seconds": ("route_maps_upload_timeout_seconds", "int"),
             "output.map_provider": ("map_provider", "str"),
             "output.folium_tiles": ("folium_tiles", "str"),
@@ -4005,6 +7790,10 @@ POST {solve_path} - клиенти + настройки в една заявка
             "output.efficiency_excel_file": ("efficiency_excel_file", "str"),
             "output.excel_bus_number_prefix": ("excel_bus_number_prefix", "str"),
             "output.excel_bus_number_digits": ("excel_bus_number_digits", "int"),
+            "output.saturday_excel_bus_number_prefix": ("saturday_excel_bus_number_prefix", "str"),
+            "output.saturday_excel_bus_number_digits": ("saturday_excel_bus_number_digits", "int"),
+            "output.center_bus_numbering_enabled": ("center_bus_numbering_enabled", "bool"),
+            "output.center_bus_numbering_start_id": ("center_bus_numbering_start_id", "str"),
             "output.enable_csv_output": ("enable_csv_output", "bool"),
             "output.csv_output_file": ("csv_output_file", "path"),
             "output.enable_charts": ("enable_charts", "bool"),
@@ -4016,7 +7805,56 @@ POST {solve_path} - клиенти + настройки в една заявка
             "api.api_key": ("api_key", "str"),
             "api.api_endpoint": ("api_endpoint", "str"),
             "api.trigger_endpoint": ("trigger_endpoint", "str"),
+            "api.saturday_trigger_endpoint": ("saturday_trigger_endpoint", "str"),
+            "api.tsp_endpoint": ("tsp_endpoint", "str"),
+            "api.tsp_report_endpoint": ("tsp_report_endpoint", "str"),
+            "api.shutdown_endpoint": ("shutdown_endpoint", "str"),
             "api.health_endpoint": ("health_endpoint", "str"),
+            "api.web_gui_enabled": ("web_gui_enabled", "bool"),
+            "api.web_gui_endpoint": ("web_gui_endpoint", "str"),
+            "api.web_gui_title": ("web_gui_title", "str"),
+            "api.web_gui_public_host": ("web_gui_public_host", "str"),
+            "api.web_gui_public_url": ("web_gui_public_url", "str"),
+            "api.web_gui_trusted_proxy_ips": ("web_gui_trusted_proxy_ips", "str"),
+            "api.tsp_default_service_time_minutes": ("tsp_default_service_time_minutes", "int"),
+            "api.tsp_objective_metric": ("tsp_objective_metric", "str"),
+            "api.tsp_use_time_windows": ("tsp_use_time_windows", "bool"),
+            "api.tsp_time_window_wait_weight": ("tsp_time_window_wait_weight", "float"),
+            "api.tsp_time_window_late_weight": ("tsp_time_window_late_weight", "float"),
+            "api.tsp_enable_two_opt": ("tsp_enable_two_opt", "bool"),
+            "api.tsp_two_opt_max_passes": ("tsp_two_opt_max_passes", "int"),
+            "api.tsp_response_format": ("tsp_response_format", "str"),
+            "api.tsp_generate_html_map": ("tsp_generate_html_map", "bool"),
+            "api.tsp_upload_html_map": ("tsp_upload_html_map", "bool"),
+            "api.tsp_worker_timeout_seconds": ("tsp_worker_timeout_seconds", "int"),
+            "api.tsp_valhalla_truck_profiles": ("tsp_valhalla_truck_profiles", "str"),
+            "api.tsp_valhalla_truck_driver_ids": ("tsp_valhalla_truck_driver_ids", "str"),
+            "api.tsp_valhalla_truck_height": ("tsp_valhalla_truck_height", "float"),
+            "api.tsp_valhalla_truck_width": ("tsp_valhalla_truck_width", "float"),
+            "api.tsp_valhalla_truck_length": ("tsp_valhalla_truck_length", "float"),
+            "api.tsp_valhalla_truck_weight": ("tsp_valhalla_truck_weight", "float"),
+            "api.tsp_valhalla_truck_axle_load": ("tsp_valhalla_truck_axle_load", "float"),
+            "api.tsp_valhalla_truck_axle_count": ("tsp_valhalla_truck_axle_count", "int"),
+            "api.tsp_valhalla_truck_hazmat": ("tsp_valhalla_truck_hazmat", "bool"),
+            "api.tsp_valhalla_truck_hgv_no_access_penalty": ("tsp_valhalla_truck_hgv_no_access_penalty", "int"),
+            "api.tsp_daily_report_enabled": ("tsp_daily_report_enabled", "bool"),
+            "api.tsp_daily_report_time": ("tsp_daily_report_time", "str"),
+            "api.tsp_daily_report_output_dir": ("tsp_daily_report_output_dir", "str"),
+            "api.tsp_daily_report_history_file": ("tsp_daily_report_history_file", "str"),
+            "api.tsp_daily_report_include_details": ("tsp_daily_report_include_details", "bool"),
+            "api.tsp_driver_id_field": ("tsp_driver_id_field", "str"),
+            "api.tsp_driver_name_field": ("tsp_driver_name_field", "str"),
+            "api.tsp_driver_location_field": ("tsp_driver_location_field", "str"),
+            "api.tsp_end_location_field": ("tsp_end_location_field", "str"),
+            "api.tsp_customers_field": ("tsp_customers_field", "str"),
+            "api.tsp_customer_id_field": ("tsp_customer_id_field", "str"),
+            "api.tsp_customer_name_field": ("tsp_customer_name_field", "str"),
+            "api.tsp_customer_order_field": ("tsp_customer_order_field", "str"),
+            "api.tsp_customer_gps_field": ("tsp_customer_gps_field", "str"),
+            "api.tsp_customer_quantity_field": ("tsp_customer_quantity_field", "str"),
+            "api.tsp_customer_turnover_field": ("tsp_customer_turnover_field", "str"),
+            "api.tsp_customer_work_time_field": ("tsp_customer_work_time_field", "str"),
+            "api.tsp_customer_comment_field": ("tsp_customer_comment_field", "str"),
             # Bizant setData
             "set_data.enable_set_data_upload": ("enable_set_data_upload", "bool"),
             "set_data.set_data_url": ("set_data_url", "str"),
@@ -4118,8 +7956,31 @@ POST {solve_path} - клиенти + настройки в една заявка
                 content = self._replace_vehicle_field(content, vtype, i, values, prefix)
 
         if content != original:
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            compile(content, config_path, "exec")
+            backup_dir = os.path.join(os.path.dirname(config_path), "config_backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup_path = os.path.join(backup_dir, f"config_desktop_gui_{timestamp}.py")
+            shutil.copy2(config_path, backup_path)
+
+            temp_handle, temp_path = tempfile.mkstemp(
+                prefix="config_gui_",
+                suffix=".tmp",
+                dir=os.path.dirname(config_path),
+                text=True,
+            )
+            try:
+                with os.fdopen(temp_handle, "w", encoding="utf-8", newline="") as output:
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp_path, config_path)
+            except Exception:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
             return True
         return False
 
@@ -4134,37 +7995,62 @@ POST {solve_path} - клиенти + настройки в една заявка
         elif ftype == "int":
             try:
                 val = int(raw_val)
-                pattern = rf'({field_name}\s*(?::\s*int\s*)?=\s*)-?\d+'
+                # Match the complete Python integer literal, including digit
+                # separators.  Matching only up to the first underscore left
+                # suffixes such as ``_000_000`` behind and multiplied values
+                # on every GUI save.
+                pattern = rf'({field_name}\s*(?::\s*int\s*)?=\s*)-?\d[\d_]*'
                 content = re.sub(pattern, rf'\g<1>{val}', content)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Полето {field_name} трябва да бъде цяло число.") from exc
         elif ftype == "optional_int":
             raw_text = str(raw_val).strip()
-            pattern = rf'({field_name}\s*(?::\s*Optional\[int\]\s*)?=\s*)(?:None|-?\d+)'
+            pattern = rf'({field_name}\s*(?::\s*Optional\[int\]\s*)?=\s*)(?:None|-?\d[\d_]*)'
             if raw_text == "" or raw_text.lower() == "none":
                 content = re.sub(pattern, rf'\g<1>None', content)
             else:
                 try:
                     val = int(raw_text)
                     content = re.sub(pattern, rf'\g<1>{val}', content)
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"Полето {field_name} трябва да бъде цяло число или празно.") from exc
         elif ftype == "float":
             try:
                 val = float(raw_val)
-                pattern = rf'({field_name}\s*(?::\s*float\s*)?=\s*)[\d.]+'
+                pattern = rf'({field_name}\s*(?::\s*float\s*)?=\s*)-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
                 content = re.sub(pattern, rf'\g<1>{val}', content)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Полето {field_name} трябва да бъде число.") from exc
         elif ftype in ("str", "path"):
-            escaped = str(raw_val).replace("\\", "\\\\").replace('"', '\\"')
+            escaped = (
+                str(raw_val)
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .replace("\n", "\\n")
+            )
             pattern = rf'({field_name}\s*(?::\s*str\s*)?=\s*(?:_abs_path\()?")[^"]*(")'
-            content = re.sub(pattern, lambda match: f'{match.group(1)}{escaped}{match.group(2)}', content)
+            content, replacements = re.subn(
+                pattern,
+                lambda match: f'{match.group(1)}{escaped}{match.group(2)}',
+                content,
+            )
+            if replacements == 0 and field_name == "google_maps_api_key":
+                env_pattern = r'(google_maps_api_key\s*:\s*str\s*=\s*os\.environ\.get\("GOOGLE_MAPS_API_KEY",\s*")[^"]*("\))'
+                content = re.sub(
+                    env_pattern,
+                    lambda match: f'{match.group(1)}{escaped}{match.group(2)}',
+                    content,
+                    count=1,
+                )
         elif ftype == "routing_engine":
             engine = str(raw_val).strip().upper()
             if engine in ("OSRM", "VALHALLA"):
                 pattern = rf'({field_name}\s*:\s*RoutingEngine\s*=\s*)RoutingEngine\.[A-Z_]+'
                 content = re.sub(pattern, rf'\g<1>RoutingEngine.{engine}', content)
+            else:
+                raise ValueError("Routing engine трябва да бъде OSRM или VALHALLA.")
         return content
 
     def _replace_scoped_field_value(self, content, class_name, field_name, raw_val, ftype):
@@ -4183,13 +8069,14 @@ POST {solve_path} - клиенти + настройки в една заявка
         """Замества tuple стойност (lat, lon) в config.py"""
         import re
         try:
-            parts = [float(x.strip()) for x in raw_val.split(",")]
-            if len(parts) == 2:
-                new_tuple = f"({parts[0]}, {parts[1]})"
-                pattern = rf'({field_name}\s*(?::\s*Tuple\[float,\s*float\]\s*)?=\s*)\([^)]+\)'
-                content = re.sub(pattern, rf'\g<1>{new_tuple}', content)
-        except ValueError:
-            pass
+            parts = [float(x.strip()) for x in str(raw_val).split(",")]
+        except ValueError as exc:
+            raise ValueError(f"Полето {field_name} трябва да бъде във формат lat, lon.") from exc
+        if len(parts) != 2 or not (-90 <= parts[0] <= 90 and -180 <= parts[1] <= 180):
+            raise ValueError(f"Полето {field_name} съдържа невалидни GPS координати.")
+        new_tuple = f"({parts[0]}, {parts[1]})"
+        pattern = rf'({field_name}\s*(?::\s*Tuple\[float,\s*float\]\s*)?=\s*)\([^)]+\)'
+        content = re.sub(pattern, rf'\g<1>{new_tuple}', content)
         return content
 
     def _replace_polygon_value(self, content, field_name, raw_val):
@@ -4240,6 +8127,7 @@ POST {solve_path} - клиенти + настройки в една заявка
                     f"    radius_km={float(zone.radius_km)},",
                     f"    duration_multiplier={float(zone.duration_multiplier)},",
                     f"    enabled={'True' if zone.enabled else 'False'},",
+                    f"    show_on_map={'True' if getattr(zone, 'show_on_map', False) else 'False'},",
                     ")",
                 ])
                 for zone in zones
@@ -4257,7 +8145,7 @@ POST {solve_path} - клиенти + настройки в една заявка
     def _replace_center_zones_value(self, content, raw_val):
         import re
 
-        zones = self._parse_center_zones_text(raw_val)
+        zones = self._parse_center_zones_text(raw_val, strict=True)
         if zones:
             zone_blocks = []
             for zone in zones:
@@ -4265,22 +8153,28 @@ POST {solve_path} - клиенти + настройки в една заявка
                 polygon_block = "[" + ", ".join(f"({float(lat)}, {float(lon)})" for lat, lon in polygon) + "]"
                 center = getattr(zone, "center_coords", None)
                 center_block = f"({float(center[0])}, {float(center[1])})" if center else "None"
-                priority = "[" + ", ".join(f'"{item}"' for item in (zone.priority_vehicle_types or [])) + "]"
-                restricted = "[" + ", ".join(f'"{item}"' for item in (zone.restricted_vehicle_types or [])) + "]"
+                priority = "[" + ", ".join(
+                    self._string_literal(item) for item in (zone.priority_vehicle_types or [])
+                ) + "]"
+                restricted = "[" + ", ".join(
+                    self._string_literal(item) for item in (zone.restricted_vehicle_types or [])
+                ) + "]"
                 penalties = "{" + ", ".join(
-                    f'"{bus}": {float(value)}'
+                    f'{self._string_literal(bus)}: {float(value)}'
                     for bus, value in (zone.vehicle_penalties or {}).items()
                 ) + "}"
-                safe_name = zone.name.replace(chr(34), chr(92) + chr(34))
                 zone_blocks.append(
                     "\n        ".join([
                         "CenterZoneConfig(",
-                        f'    name="{safe_name}",',
-                        f'    mode="{zone.mode}",',
+                        f"    name={self._string_literal(zone.name)},",
+                        f"    mode={self._string_literal(zone.mode)},",
                         f"    center_coords={center_block},",
                         f"    radius_km={float(zone.radius_km)},",
                         f"    polygon={polygon_block},",
                         f"    enabled={'True' if zone.enabled else 'False'},",
+                        f"    show_on_map={'True' if getattr(zone, 'show_on_map', True) else 'False'},",
+                        f"    enable_priority={'True' if zone.enable_priority else 'False'},",
+                        f"    enable_restrictions={'True' if zone.enable_restrictions else 'False'},",
                         f"    priority_vehicle_types={priority},",
                         f"    restricted_vehicle_types={restricted},",
                         f"    discount_priority_vehicle={float(zone.discount_priority_vehicle)},",
@@ -4294,19 +8188,16 @@ POST {solve_path} - клиенти + настройки в една заявка
         else:
             new_block = "field(default_factory=lambda: [])"
 
-        multiline_pattern = (
-            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
-            r'field\(default_factory=lambda:\s*\[.*?\n    \]\)'
+        pattern = (
+            r'(?ms)^(    center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
+            r'field\(default_factory=lambda:\s*(?:\[\]|\[\n.*?^    \])\)'
+            r'(?:[^\n]*)?'
         )
-        content, count = re.subn(multiline_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        content, count = re.subn(pattern, rf'\g<1>{new_block}', content)
         if count:
             return content
 
-        empty_pattern = (
-            r'(center_zones\s*:\s*List\[CenterZoneConfig\]\s*=\s*)'
-            r'field\(default_factory=lambda:\s*\[\]\)'
-        )
-        return re.sub(empty_pattern, rf'\g<1>{new_block}', content, flags=re.S)
+        return content
 
     def _replace_list_field_value(self, content, field_name, raw_val):
         """Замества List[str] поле с field(default_factory=lambda: [...]) в config.py"""
@@ -4386,19 +8277,27 @@ POST {solve_path} - клиенти + настройки в една заявка
 
         start_location = self._depot_coords_from_choice(values.get(f"{prefix}.start_depot_name", ""), values)
         end_location = self._parse_coords_text(values.get(f"{prefix}.end_location", ""))
+        reload_location = self._depot_coords_from_choice(
+            values.get(f"{prefix}.reload_depot_name", ""),
+            values,
+        )
         return config.VehicleConfig(
             vehicle_type=vehicle_type,
             capacity=self._parse_int_value(values.get(f"{prefix}.capacity", 320), 320),
             count=max(0, self._parse_int_value(values.get(f"{prefix}.count", 1), 1)),
             name=str(values.get(f"{prefix}.name", "") or "").strip(),
+            config_id=str(values.get(f"{prefix}.config_id", "") or "").strip(),
             fixed_cost=self._parse_int_value(values.get(f"{prefix}.fixed_cost", 0), 0),
             max_distance_km=self._parse_optional_int_value(values.get(f"{prefix}.max_distance_km", "")),
             max_time_hours=self._parse_int_value(values.get(f"{prefix}.max_time_hours", 8), 8),
             service_time_minutes=self._parse_int_value(values.get(f"{prefix}.service_time_minutes", 8), 8),
             enabled=self._parse_bool_value(values.get(f"{prefix}.enabled", True)),
-            max_customers_per_route=self._parse_optional_int_value(values.get(f"{prefix}.max_customers_per_route", "")),
+            max_customers_per_route=None,
+            max_customers_per_day=self._parse_optional_int_value(values.get(f"{prefix}.max_customers_per_day", "")),
             start_location=start_location,
             end_location=end_location,
+            reload_location=reload_location,
+            reload_time_minutes=max(0, self._parse_int_value(values.get(f"{prefix}.reload_time_minutes", 30), 30)),
             start_time_minutes=self._parse_int_value(values.get(f"{prefix}.start_time_minutes", 480), 480),
             tsp_depot_location=start_location,
         )
@@ -4467,14 +8366,18 @@ POST {solve_path} - клиенти + настройки в една заявка
             f"                capacity={int(vehicle.capacity)},",
             f"                count={int(vehicle.count)},",
             f"                name={self._string_literal(getattr(vehicle, 'name', ''))},",
+            f"                config_id={self._string_literal(getattr(vehicle, 'config_id', ''))},",
             f"                fixed_cost={int(getattr(vehicle, 'fixed_cost', 0) or 0)},",
             f"                max_distance_km={self._optional_int_literal(vehicle.max_distance_km)},",
             f"                max_time_hours={int(vehicle.max_time_hours)},",
             f"                service_time_minutes={int(vehicle.service_time_minutes)},",
             f"                enabled={'True' if vehicle.enabled else 'False'},",
             f"                max_customers_per_route={self._optional_int_literal(vehicle.max_customers_per_route)},",
+            f"                max_customers_per_day={self._optional_int_literal(getattr(vehicle, 'max_customers_per_day', None))},",
             f"                start_location={self._tuple_literal(vehicle.start_location)},",
             f"                end_location={self._tuple_literal(getattr(vehicle, 'end_location', None))},",
+            f"                reload_location={self._tuple_literal(getattr(vehicle, 'reload_location', None) or vehicle.start_location)},",
+            f"                reload_time_minutes={int(getattr(vehicle, 'reload_time_minutes', 30) or 0)},",
             f"                start_time_minutes={int(vehicle.start_time_minutes)},",
             f"                tsp_depot_location={self._tuple_literal(vehicle.tsp_depot_location or vehicle.start_location)}",
             "            ),",
@@ -4500,7 +8403,7 @@ POST {solve_path} - клиенти + настройки в една заявка
             return re.sub(pattern, rf'\g<1>{new_val}', block)
 
         insert_pattern = r'(\n\s*start_time_minutes\s*=)'
-        if field in ("start_location", "end_location"):
+        if field in ("start_location", "end_location", "reload_location", "tsp_depot_location"):
             return re.sub(insert_pattern, f"\n                {field}={new_val},\\1", block, count=1)
 
         insert_pattern = r'(\n\s*\)\s*,?)'
@@ -4513,15 +8416,20 @@ POST {solve_path} - клиенти + настройки в една заявка
         # Намираме блока на VehicleConfig за този тип
         vehicle_fields = {
             "name": "str",
+            "config_id": "str",
             "enabled": "bool",
             "count": "int",
             "fixed_cost": "int",
             "capacity": "int",
+            "max_distance_km": "optional_int",
             "max_time_hours": "int",
             "service_time_minutes": "int",
             "max_customers_per_route": "optional_int",
+            "max_customers_per_day": "optional_int",
             "start_depot_name": "depot_choice",
+            "reload_depot_name": "reload_depot_choice",
             "end_location": "optional_tuple",
+            "reload_time_minutes": "int",
             "start_time_minutes": "int",
         }
 
@@ -4561,17 +8469,17 @@ POST {solve_path} - клиенти + настройки в една заявка
             elif ftype == "int":
                 try:
                     val = int(raw)
-                    block = re.sub(rf'({field}\s*=\s*)\d+', rf'\g<1>{val}', block)
+                    block = re.sub(rf'({field}\s*=\s*)-?\d[\d_]*', rf'\g<1>{val}', block)
                 except (ValueError, TypeError):
                     pass
             elif ftype == "optional_int":
                 raw_str = str(raw).strip()
                 if raw_str == "" or raw_str.lower() == "none":
-                    block = re.sub(rf'({field}\s*=\s*)(?:None|\d+)', rf'\g<1>None', block)
+                    block = re.sub(rf'({field}\s*=\s*)(?:None|-?\d[\d_]*)', rf'\g<1>None', block)
                 else:
                     try:
                         val = int(raw_str)
-                        block = re.sub(rf'({field}\s*=\s*)(?:None|\d+)', rf'\g<1>{val}', block)
+                        block = re.sub(rf'({field}\s*=\s*)(?:None|-?\d[\d_]*)', rf'\g<1>{val}', block)
                     except ValueError:
                         pass
             elif ftype == "optional_tuple":
@@ -4587,48 +8495,70 @@ POST {solve_path} - клиенти + настройки в една заявка
                     continue
                 block = self._replace_vehicle_tuple_assignment(block, "start_location", new_val)
                 block = self._replace_vehicle_tuple_assignment(block, "tsp_depot_location", new_val)
+            elif ftype == "reload_depot_choice":
+                new_val = self._format_depot_choice_value(raw, values)
+                if new_val is None:
+                    continue
+                block = self._replace_vehicle_tuple_assignment(block, "reload_location", new_val)
 
         content = content[:block_start] + block + content[block_end:]
         return content
 
     # ── Actions ──────────────────────────────────────────────
 
-    def _save(self):
+    def _save_config(self, show_success=True):
         try:
             self.status_var.set("Записвам настройките...")
             self.root.update_idletasks()
             values = self._collect_values()
+            errors, warnings = self._validate_values(values)
+            if errors:
+                self.validation_var.set(f"{len(errors)} грешки")
+                self.status_var.set("Записът е спрян: има невалидни настройки")
+                self._focus_validation_error(errors[0][0])
+                details = "\n".join(f"• {message}" for _key, message in errors[:12])
+                if len(errors) > 12:
+                    details += f"\n• … и още {len(errors) - 12}"
+                messagebox.showerror("Настройките не са записани", details)
+                return False
+
             changed = self._apply_to_config_file(values)
             if changed:
-                self.status_var.set("Запазено в config.py")
-                messagebox.showinfo("Запазено", "Настройките са записани в config.py")
+                self.status_var.set("Настройките са записани безопасно в config.py")
             else:
-                self.status_var.set("Няма промени за запис")
-                messagebox.showinfo("Без промени", "Няма промени за записване.")
+                if values != self._saved_snapshot:
+                    raise RuntimeError(
+                        "Има променени полета, но не беше намерено съответстващо място в config.py. "
+                        "Файлът не е променен."
+                    )
+                self.status_var.set("Няма нови промени за запис")
+
+            self._saved_snapshot = copy.deepcopy(values)
+            self.validation_var.set(
+                f"Запазено с {len(warnings)} предупреждения" if warnings else "Проверено и запазено"
+            )
+            self._set_dirty(False)
+            if show_success and warnings:
+                messagebox.showwarning(
+                    "Запазено с предупреждения",
+                    "Настройките са записани.\n\n" + "\n".join(f"• {item}" for item in warnings),
+                )
+            return True
         except Exception as e:
             self.status_var.set("Грешка при запис")
             messagebox.showerror("Грешка", f"Грешка при запис: {e}")
+            return False
+
+    def _save(self):
+        return self._save_config(show_success=True)
 
     def _save_and_close(self):
-        try:
-            self.status_var.set("Записвам настройките...")
-            self.root.update_idletasks()
-            values = self._collect_values()
-            self._apply_to_config_file(values)
+        if self._save_config(show_success=False):
             self.root.destroy()
-        except Exception as e:
-            self.status_var.set("Грешка при запис")
-            messagebox.showerror("Грешка", f"Грешка при запис: {e}")
 
     def _save_and_run(self):
-        try:
-            self.status_var.set("Записвам и стартирам...")
-            self.root.update_idletasks()
-            values = self._collect_values()
-            self._apply_to_config_file(values)
-        except Exception as e:
-            self.status_var.set("Грешка при запис")
-            messagebox.showerror("Грешка", f"Грешка при запис: {e}")
+        self.status_var.set("Проверявам и записвам преди стартиране...")
+        if not self._save_config(show_success=False):
             return
         
         # Стартираме програмата ПРЕДИ да затворим GUI

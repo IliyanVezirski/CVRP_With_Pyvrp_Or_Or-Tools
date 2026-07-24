@@ -15,7 +15,7 @@ from config import (
     describe_center_zone,
     is_location_in_center_zone,
 )
-from input_handler import Customer, InputData
+from input_handler import Customer, InputData, MandatoryCustomerError, is_mandatory_customer
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +58,27 @@ class WarehouseAllocation:
 class WarehouseManager:
     """Мениджър за складова логика"""
     
-    def __init__(self, config: Optional[WarehouseConfig] = None):
-        self.config = config or get_config().warehouse
-        self.vehicle_configs = get_config().vehicles
-        self.location_config = get_config().locations
+    def __init__(
+        self,
+        config: Optional[WarehouseConfig] = None,
+        *,
+        main_config=None,
+        vehicle_configs: Optional[List[VehicleConfig]] = None,
+        cvrp_config=None,
+        location_config=None,
+    ):
+        main_config = main_config or get_config()
+        self.config = config or main_config.warehouse
+        self.vehicle_configs = vehicle_configs if vehicle_configs is not None else main_config.vehicles
+        self.location_config = location_config or main_config.locations
+        self.cvrp_config = cvrp_config or main_config.cvrp
     
     def allocate_customers(self, input_data: InputData) -> WarehouseAllocation:
         """Разпределя клиентите между превозни средства и склад по новата логика"""
         logger.info("Започвам разпределение на клиенти по новата логика")
         
         # Изчисляване на общия капацитет
-        total_capacity = self._calculate_total_vehicle_capacity()
+        total_capacity = self._calculate_total_vehicle_capacity(len(input_data.customers))
         
         # Сортиране на клиентите по обем (от най-малък към най-голям)
         # и за клиенти с еднакъв обем - по разстояние (от най-далечен към най-близък)
@@ -80,14 +90,50 @@ class WarehouseManager:
         # Прилагаме новата логика за разпределение
         return self._allocate_with_warehouse(sorted_customers, total_capacity)
     
-    def _calculate_total_vehicle_capacity(self) -> int:
-        """Изчислява общия капацитет на всички включени превозни средства"""
+    def _vehicle_trip_upper_bound(
+        self,
+        vehicle: VehicleConfig,
+        customer_count: Optional[int] = None,
+    ) -> int:
+        """Returns a safe, finite upper bound on useful trips in one shift.
+
+        Every useful trip contains at least one customer.  Every trip after the
+        first also pays reload time.  Travel is deliberately ignored here: this
+        is a warehouse pre-allocation bound, not a promise that the solver can
+        physically use all of the theoretical capacity.
+        """
+        if not bool(getattr(self.cvrp_config, "enable_multiple_trips", False)):
+            return 1
+
+        shift_minutes = max(0, int(round(float(getattr(vehicle, "max_time_hours", 0) or 0) * 60)))
+        service_minutes = max(0, int(getattr(vehicle, "service_time_minutes", 0) or 0))
+        reload_minutes = max(0, int(getattr(vehicle, "reload_time_minutes", 0) or 0))
+
+        if shift_minutes > 0 and service_minutes + reload_minutes > 0:
+            # k * service + (k - 1) * reload <= shift
+            shift_bound = max(1, (shift_minutes + reload_minutes) // (service_minutes + reload_minutes))
+        else:
+            shift_bound = None
+
+        candidates = [bound for bound in (shift_bound, customer_count) if bound is not None and bound > 0]
+        daily_customer_limit = getattr(vehicle, "max_customers_per_day", None)
+        if daily_customer_limit is None:
+            daily_customer_limit = getattr(vehicle, "max_customers_per_route", None)
+        if daily_customer_limit is not None and int(daily_customer_limit) > 0:
+            candidates.append(int(daily_customer_limit))
+
+        # Direct callers without a customer count still get a finite bound.
+        return max(1, min(candidates)) if candidates else 1
+
+    def _calculate_total_vehicle_capacity(self, customer_count: Optional[int] = None) -> int:
+        """Calculates theoretical daily volume capacity of enabled vehicles."""
         total_capacity = 0
         
         if self.vehicle_configs:
             for vehicle in self.vehicle_configs:
                 if vehicle.enabled:
-                    total_capacity += vehicle.capacity * vehicle.count
+                    trip_bound = self._vehicle_trip_upper_bound(vehicle, customer_count)
+                    total_capacity += vehicle.capacity * vehicle.count * trip_bound
         
         return total_capacity
         
@@ -153,6 +199,11 @@ class WarehouseManager:
         # Намираме капацитета на най-големия бус
         max_single_bus_capacity = self._get_max_single_bus_capacity()
         if max_single_bus_capacity <= 0:
+            mandatory = [customer for customer in customers if is_mandatory_customer(customer)]
+            if mandatory:
+                raise MandatoryCustomerError(
+                    "Има задължителни клиенти, но няма активно превозно средство с положителен капацитет."
+                )
             logger.warning("⚠️ Няма налични бусове с положителен капацитет!")
             return WarehouseAllocation(
                 vehicle_customers=[],
@@ -169,10 +220,24 @@ class WarehouseManager:
         warehouse_customers = []
         current_volume = 0.0
         
+        # Mandatory visits reserve capacity before optional visits. They are
+        # never moved to the warehouse merely to make the optimisation easier.
+        ordered_customers = [customer for customer in customers if is_mandatory_customer(customer)]
+        ordered_customers.extend(
+            customer for customer in customers if not is_mandatory_customer(customer)
+        )
+
         # Пълнене на бусовете до достигане на 100% капацитет с проверка за размер на клиентите
-        for customer in customers:
+        for customer in ordered_customers:
+            mandatory = is_mandatory_customer(customer)
             # ПРОВЕРКА 1: Дали клиентът е твърде голям за който и да е бус
             if customer.volume > max_single_bus_capacity:
+                if mandatory:
+                    raise MandatoryCustomerError(
+                        f"Задължителният клиент '{customer.name}' ({customer.id}) е с обем "
+                        f"{customer.volume:.2f}, над капацитета на най-големия бус "
+                        f"({max_single_bus_capacity}). Няма валидно решение."
+                    )
                 logger.warning(f"⚠️ Клиент '{customer.name}' (обем: {customer.volume:.2f} ст.) е твърде голям "
                               f"за най-големия бус (капацитет: {max_single_bus_capacity} ст.) и отива директно в склада")
                 warehouse_customers.append(customer)
@@ -180,7 +245,7 @@ class WarehouseManager:
                 
             # ПРОВЕРКА 2: Дали клиентът е с обем по-голям от максималния за обслужване от бусове
             max_volume = self.config.max_bus_customer_volume
-            if customer.volume > max_volume:
+            if customer.volume > max_volume and not mandatory:
                 logger.info(f"🔍 Клиент '{customer.name}' (обем: {customer.volume:.2f} ст.) е над максималния обем "
                            f"за бусове ({max_volume:.2f} ст.) и отива директно в склада")
                 warehouse_customers.append(customer)
@@ -190,6 +255,11 @@ class WarehouseManager:
             if current_volume + customer.volume <= total_capacity * self.config.capacity_toleranse:
                 vehicle_customers.append(customer)
                 current_volume += customer.volume
+            elif mandatory:
+                raise MandatoryCustomerError(
+                    f"Недостатъчен общ дневен капацитет за задължителния клиент "
+                    f"'{customer.name}' ({customer.id}). Няма валидно решение."
+                )
             else:
                 warehouse_customers.append(customer)
         
@@ -393,7 +463,7 @@ class WarehouseManager:
     def can_fit_in_vehicles(self, customers: List[Customer]) -> bool:
         """Проверява дали клиентите могат да се поберат в превозните средства"""
         total_volume = sum(c.volume for c in customers)
-        total_capacity = self._calculate_total_vehicle_capacity()
+        total_capacity = self._calculate_total_vehicle_capacity(len(customers))
         
         return total_volume <= total_capacity
 

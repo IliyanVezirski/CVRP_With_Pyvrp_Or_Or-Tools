@@ -16,12 +16,12 @@ VSVersionInfo(
         u'040904B0',
         [
           StringStruct(u'CompanyName', u'OptioRoute'),
-          StringStruct(u'FileDescription', u'CVRP Optimizer'),
+          StringStruct(u'FileDescription', u'Bizant'),
           StringStruct(u'FileVersion', u'1.2.0'),
-          StringStruct(u'InternalName', u'CVRP_Optimizer'),
+          StringStruct(u'InternalName', u'Bizant'),
           StringStruct(u'LegalCopyright', u'(c) 2026 OptioRoute'),
-          StringStruct(u'OriginalFilename', u'CVRP_Optimizer.exe'),
-          StringStruct(u'ProductName', u'CVRP Optimizer'),
+          StringStruct(u'OriginalFilename', u'Bizant.exe'),
+          StringStruct(u'ProductName', u'Bizant'),
           StringStruct(u'ProductVersion', u'1.2.0')
         ]
       )

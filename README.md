@@ -1,619 +1,306 @@
-# CVRP OR-Tools Optimizer
+# CVRP Optimizer / Bizant 2.0
 
-Софтуер за дневно планиране на маршрути на бусове с капацитет, работно време, различни депа, зона център, реални пътни разстояния и подробни изходни файлове.
+Windows приложение за ежедневно разпределяне и подреждане на доставки с реални пътни матрици, различни бусове и депа, работни прозорци, зони, втори курсове, карти, Excel отчети и Bizant интеграция.
 
-Проектът решава CVRP задача: дадени са клиенти с GPS координати и обем в стекове, налични бусове с различен капацитет и време за обслужване, и целта е да се получат изпълними маршрути с минимално време/разстояние и удобни файлове за диспечиране.
+Поддържани backend-и:
 
-## Какво може програмата
+- стабилен PyVRP 0.13.x, минимум 0.13.4 (`pyvrp`);
+- изолиран PyVRP 0.14 worker (`pyvrp_experimental`);
+- OR-Tools (`or_tools`);
+- official VROOM 1.15 worker (`vroom`);
+- експериментален VRP-Rust 1.24 worker (`vrp`).
 
-- Чете входни данни от Excel или HTTP JSON.
-- Валидира GPS координати, обеми, клиентски номера и документи.
-- Разделя заявките между бусове и складова обработка.
-- Изчислява матрица с разстояния и времена през OSRM или Valhalla.
-- Поддържа два решителя: OR-Tools и PyVRP.
-- Позволява solver-ът да оптимизира по километри или по време чрез `objective_metric`.
-- Поддържа индивидуално време за обслужване по тип бус.
-- Поддържа различни начални депа по тип бус.
-- Поддържа различна крайна точка на бус; ако няма крайна точка, маршрутът завършва в стартовото депо.
-- Поддържа основна център зона и допълнителни независими център зони. Всяка допълнителна зона може да има собствени правила за кои типове бусове важат приоритетите и глобите.
-- Позволява при нужда solver-ът да пропуска заявки, като приоритетно по-лесни за пропускане са големи и близки до депото заявки.
-- Генерира обща HTML карта, отделни HTML карти за всеки маршрут, Excel отчет, CSV файл и графики.
-- В отделните route карти има сгъваем списък с клиенти: бутон `Клиенти`, избор на клиент, ETA пристигане, popup с обем и бутон за навигация.
-- В общата карта има GPS търсачка за временни пинове по координати, с име и обем, ако са подадени.
-- Показва посока на движение по маршрутите с разредени стрелки.
-- Добавя дата на стартиране към имената на общата карта, Excel файловете и отделните route карти. CSV файлът остава без дата.
-- Има GUI за настройки и Windows Task Scheduler интеграция.
-- Може да работи като Python проект или да се build-не до `CVRP_Optimizer.exe`.
+## Документация
 
-## Основни файлове
-
-| Файл | Роля |
+| Ръководство | Съдържание |
 |---|---|
-| `main.py` | Главен workflow за Python режим. |
-| `main_exe.py` | Entry point за PyInstaller/EXE режим. |
-| `config.py` | Основна конфигурация: вход, бусове, депа, solver, output, routing. |
-| `config_gui.py` | Графичен интерфейс за настройките. |
-| `input_handler.py` | Четене на Excel/HTTP JSON и парсване на GPS координати. |
-| `warehouse_manager.py` | Предварително разпределение към бусове или склад. |
-| `cvrp_solver.py` | OR-Tools solver. |
-| `pyvrp_solver.py` | PyVRP solver. |
-| `osrm_client.py` | OSRM матрици, кеш и route geometry. |
-| `valhalla_client.py` | Valhalla интеграция. |
-| `output_handler.py` | HTML карти, Excel, CSV и графики. |
-| `build_exe.py` | Автоматизиран build с PyInstaller. |
-| `start_cvrp.bat` | Стартира EXE, ако има; иначе стартира през `.venv`. |
-| `Settings.bat` | Отваря настройките през EXE или `.venv`. |
+| [Индекс на документацията](docs/README.md) | Навигация и термини. |
+| [Ръководство за работа](docs/USER_GUIDE.md) | Desktop GUI, Web GUI и ежедневен workflow. |
+| [HTTP API и Web интерфейс](docs/API_AND_WEB.md) | Endpoint-и, JSON тела, scopes, auth и грешки. |
+| [Решители и ограничения](docs/SOLVERS_AND_CONSTRAINTS.md) | Backend матрица, objectives, зони, прозорци и втори курсове. |
+| [Конфигурационен справочник](docs/CONFIGURATION_REFERENCE.md) | Всички секции и полета в `config.py`. |
+| [Инсталация, build и outputs](docs/INSTALLATION_BUILD_OUTPUTS.md) | Source среда, worker-и, EXE, карти, Excel, upload и `setData`. |
+| [Работни процеси](WORKFLOWS_DOCUMENTATION.md) | Вътрешен поток на данните и алгоритмите. |
+| [Обяснение без технически жаргон](ОБЯСНЕНИЕ_НА_ПРОГРАМАТА.md) | Какво прави програмата от гледна точка на диспечер. |
+| [PyVRP 0.14 backend](PYVRP_EXPERIMENTAL.md) | Изолирана среда, worker и диагностика. |
 
-## Бърз старт с Python
+`GET /health` на стартирания build е runtime справочникът за активните endpoint-и, solver-и и допустими API настройки.
 
-PowerShell:
+## Основни възможности
+
+- Excel или HTTP JSON вход с конфигурируеми имена на полетата.
+- Групиране на документи със същия `IdCust + GPS` в едно посещение.
+- Клиентски работни прозорци, включително няколко интервала на отделни редове.
+- Клиентско време за обслужване с fallback към времето от конкретния бус.
+- Различен капацитет, брой, fixed cost, дневно време, километри и брой клиенти по конфигурация на бус.
+- Именувани начални депа, отделна крайна точка и reload депо.
+- Динамични втори/следващи курсове в рамките на общите дневни лимити.
+- Основна center зона и неограничен брой допълнителни `circle/polygon` зони.
+- Приоритетни типове бусове, zone discounts, outside penalties и penalties за ограничени типове.
+- Независим switch дали всяка center/traffic зона да се вижда на картата.
+- OSRM или Valhalla distance/duration матрица, curbside и Valhalla truck/time-dependent настройки.
+- Objective по разстояние или време.
+- Разрешено/забранено пропускане, индивидуална защита чрез penalty/prize и абсолютно задължителни клиенти чрез `Mandatory`.
+- Паралелни solver рънове с различни seed/strategy конфигурации, когато backend-ът го позволява.
+- Обща карта, една индивидуална карта на физически бус с филтър по курсове, Excel, CSV и графики.
+- Upload на индивидуални HTML карти.
+- `setData` за обслужени/необслужени клиенти и последващ `makeGroup`.
+- HTTP API, защитен Web GUI, TSP endpoint и дневен TSP Excel отчет.
+- Специален `/run_saturday` с динамична съботна дата, отделен bus prefix и `_събота` в output имената. При включено специално center номериране `center_bus_numbering_start_id` има предимство за CENTER_BUS.
+- Windows Settings GUI, Task Scheduler и EXE build с companion worker-и.
+
+## Бърз старт от source
+
+Изисква се съвместим Windows Python за основната `.venv`:
 
 ```powershell
-cd "C:\Programming\Bizant 2.0\cvrp-ortools-optimizer"
+cd "D:\Iliyan\bizant_source"
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Проверка, че OR-Tools е инсталиран в правилната среда:
-
-```powershell
-.\.venv\Scripts\python.exe -c "import ortools; print(ortools.__version__)"
-```
-
-Стартиране на оптимизатора:
-
-```powershell
-.\.venv\Scripts\python.exe main.py
-```
-
-Стартиране с конкретен Excel файл:
-
-```powershell
-.\.venv\Scripts\python.exe main.py "input\input.xlsx"
-```
-
-Стартиране през batch:
-
-```powershell
-.\start_cvrp.bat
-```
-
-## GUI настройки
+Старт:
 
 ```powershell
 .\Settings.bat
+.\start_cvrp.bat
+.\start_api_server.bat
 ```
 
-или:
+Директни Python entry points:
 
 ```powershell
 .\.venv\Scripts\python.exe config_gui.py
+.\.venv\Scripts\python.exe main.py
+.\.venv\Scripts\python.exe cvrp_api_server.py
 ```
 
-GUI-то има табове за:
+Допълнителните solver-и изискват изолирани среди/worker-и. Виж [build ръководството](docs/INSTALLATION_BUILD_OUTPUTS.md).
 
-- Входни данни.
-- Превозни средства.
-- Предварителна оптимизация/склад.
-- Solver настройки.
-- Локации и депа.
-- Изходни файлове.
-- Автоматично стартиране през Windows Task Scheduler.
+## Вход
 
-В таб `Автоматично стартиране` може да се създават повече от една Windows Task Scheduler задача. Въведи различно име за всяка задача, например:
+### HTTP JSON
 
-```text
-CVRP_Optimizer_Auto_1
-CVRP_Optimizer_Auto_2
-CVRP_Optimizer_Auto_Morning
+Типичен клиент:
+
+```json
+{
+  "IdCust": "1000001",
+  "CustName": "Клиент 1",
+  "GPS": "42.6977,23.3219",
+  "Volume": 10.5,
+  "IdDoc": "DOC001",
+  "IdPlasDoc": "PLAS001",
+  "IdSkld": "106",
+  "WorkTime": "08:00-13:00\n16:00-18:00",
+  "DeliveryComment": "Обади се 10 минути предварително.",
+  "ServiceTimeMinutes": 6,
+  "Mandatory": true
+}
 ```
 
-Ако използваш същото име, Windows ще обнови тази задача. Ако използваш ново име, ще се създаде отделен schedule с отделни дни и час.
+`WorkTime` с два реда е валиден, когато новият ред е JSON escape `\n`. Всички solver адаптери получават нормализираните прозорци според собствените си възможности.
 
-В таб `Локации` могат да се добавят допълнителни депа във формат:
+`ServiceTimeMinutes` е optional. При липса се използва `service_time_minutes` от буса, който обслужва клиента.
 
-```text
-Име на депо: 42.123456, 23.123456
-```
+`Mandatory=true` прави клиента абсолютно задължителен. Той не получава skip penalty и никое валидно решение не може да го остави необслужен. При невъзможни GPS, обем или общ капацитет run-ът спира с ясна грешка вместо да го премести към склада.
 
-След запис/презареждане тези депа могат да се избират по име за начално депо на видовете бусове.
+### Excel
 
-## Входни данни
+Имената на колоните се настройват от Desktop GUI. Минимално са нужни валиден ID, GPS и положителен обем. Работното време, коментарът и колоната `Задължителен` са optional.
 
-Настройките са в `config.py`, клас `InputConfig`.
+## Бусове и втори курсове
 
-Поддържани режими:
+Един `VehicleConfig` задава правила и `count`. При `enable_multiple_trips=true` solver-ът може да върне физическия бус в reload депото и да създаде следващ курс.
 
-- `input_source = "excel"`
-- `input_source = "http_json"`
+- `capacity` важи за един курс;
+- `max_time_hours`, `max_distance_km` и `max_customers_per_day` са общи за деня;
+- `reload_time_minutes` се начислява между курсовете;
+- броят курсове се определя от изпълнимостта, не от предварително число;
+- всеки курс има отделен output bus number;
+- една индивидуална карта групира курсовете на физическия бус и ги филтрира;
+- Основният Excel отчет добавя само бизнес колоната **Курс** при multi-trip. CSV е технически export и в multi-trip режим включва още `ID бус`, `ID курс` и `Ключ бус` за машинна корелация.
 
-По подразбиране Excel файлът е:
+VROOM изисква вторите курсове да са изключени. Провери [solver ограниченията](docs/SOLVERS_AND_CONSTRAINTS.md) преди смяна на backend-а.
 
-```text
-input/input.xlsx
-```
+## Зони
 
-Основни колони:
+Center зоните могат да са кръг или полигон. Всяка допълнителна зона определя:
 
-| Поле | Примерна колона |
-|---|---|
-| Клиентски номер | `IdCust` |
-| Име на клиент | `Клиент` |
-| GPS | `GPS` |
-| Обем | `Брой стекове` |
-| Документ | `Документ` |
+- `enabled`;
+- `show_on_map`;
+- приоритетни и ограничени vehicle types;
+- отстъпка за приоритетния бус;
+- outside penalty;
+- penalty по тип бус.
 
-GPS стойностите се очакват като latitude/longitude, например:
+`show_on_map=false` скрива само геометрията. Solver правилото остава активно, докато `enabled=true`.
 
-```text
-42.697357, 23.323810
-```
+Traffic зоните умножават duration стойностите. Те също имат независима видимост.
 
-HTTP JSON режимът поддържа URL с дата, декодиране на `utf-8`, `windows-1251`, `latin-1` и mapping на полетата в `InputConfig`.
+## Solver и routing
 
-Ако един и същ клиентски номер (`IdCust`) идва повече от веднъж със същите GPS координати, програмата по подразбиране групира тези редове като едно посещение. Обемът се събира, solver-ът вижда един стоп, а оригиналните документи се пазят за отчетите и `setData`. Това може да се изключи от GUI: `Входни данни -> Групирай документи`, или през API/settings с `input.enable_customer_document_grouping=false`.
+OSRM/Valhalla строят матриците. Solver-ът после използва избрания `objective_metric`:
 
-## Бусове, депа и сервизно време
+- `distance` — основната пътна цена идва от distance матрицата;
+- `time` — основната пътна цена идва от duration матрицата и backend-specific time objective логиката.
 
-Всеки `VehicleConfig` има:
+Капацитет, работно време, time windows, max distance, max customers, крайни точки и reload остават ограничения независимо от objective-а, доколкото избраният backend ги поддържа.
 
-- `vehicle_type`
-- `enabled`
-- `count`
-- `capacity`
-- `max_time_hours`
-- `service_time_minutes`
-- `max_customers_per_route`
-- `name`
-- `start_location`
-- `end_location`
-- `tsp_depot_location`
-- `start_time_minutes`
+Не приемай, че една и съща числова fitness стойност е сравнима между различни solver-и. Сравнявай обслужени клиенти, валидност, реални километри/време и еднакъв input/config.
 
-Важна текуща логика:
+## HTTP API
 
-- OR-Tools използва vehicle-specific transit callbacks за време.
-- PyVRP използва споделени профили за еднакви vehicle правила и добавя service time в edge duration.
-- Времето за обслужване вече не е средна стойност за всички бусове.
-- При избор на депо през GUI се записва както `start_location`, така и `tsp_depot_location`.
-- Ако `end_location` е празна, крайната точка автоматично е стартовото депо.
+Default портът идва от `api.api_port`; използвай URL-а от `GET /health`.
 
-## Център зона
+| Endpoint | Метод | Действие |
+|---|---|---|
+| `/health` | GET | Runtime статус, URLs, schema и команди. |
+| `/run` | GET/POST | Run с текущия configured input; допуска request-local settings. |
+| `/run_saturday` | GET/POST | Run за съботата от текущата седмица със съботното номериране. |
+| `/solve` | POST | Клиенти и настройки директно в JSON. |
+| `/tsp` | POST | Подреждане на текущ маршрут на един шофьор. |
+| `/tsp-report` | GET/POST | Дневен TSP Excel отчет. |
+| `/shutdown` | GET/POST | Контролирано спиране; защити го с API key. |
+| `/hell` | браузър | Web GUI, ако е включен; endpoint-ът е конфигурируем. |
 
-Център зоната може да работи в два режима:
-
-```python
-center_zone_mode = "circle"
-center_zone_mode = "polygon"
-```
-
-При `circle` се използват:
-
-- `center_location`
-- `center_zone_radius_km`
-
-При `polygon` се използва:
-
-- `center_zone_polygon`
-
-GUI бутонът `Чертай на карта` отваря локален Leaflet редактор, в който зоната може да се начертае и запише като полигон.
-
-Допълнителните център зони се настройват през `locations.center_zones`. Те са независими от старата основна зона:
-
-```python
-center_zones = [
-    CenterZoneConfig(
-        name="Център 2",
-        mode="circle",
-        center_coords=(42.7093, 23.3137),
-        radius_km=1.2,
-        priority_vehicle_types=["center_bus"],
-        restricted_vehicle_types=["internal_bus", "external_bus", "vratza_bus"],
-        discount_priority_vehicle=0.9,
-        priority_vehicle_outside_penalty=0,
-        vehicle_penalties={"internal_bus": 40000, "external_bus": 40000, "vratza_bus": 40000},
-    )
-]
-```
-
-При клиент в няколко зони отстъпката за приоритетен бус взема най-добрата приложима отстъпка, а глобите за ограничени бусове се събират. Ако приоритетен бус е извън всички зони, които го таргетират, се прилага най-голямата `priority_vehicle_outside_penalty`.
-
-Зоната влияе върху:
-
-- приоритети на center bus;
-- ограничения и penalties за други бусове;
-- визуализацията върху картите.
-
-## Solver-и
-
-### OR-Tools
-
-Избира се с:
-
-```python
-cvrp.solver_type = "or_tools"
-```
-
-OR-Tools режимът поддържа:
-
-- capacity dimension;
-- time dimension с vehicle-specific service time;
-- оптимизация по `distance` или `time`;
-- предварително сметнати vehicle cost матрици, така че solver-ът да чете готова цена вместо да пресмята всяка дъга многократно през Python callback;
-- индивидуални депа;
-- пропускане на клиенти чрез `AddDisjunction`;
-- индивидуални penalties при priority dropping;
-- паралелни стратегии, ако `enable_parallel_solving = True`.
-
-### PyVRP
-
-Избира се с:
-
-```python
-cvrp.solver_type = "pyvrp"
-```
-
-В `requirements.txt` PyVRP е pin-нат към:
-
-```text
-pyvrp>=0.13.3
-```
-
-PyVRP използва същата входна матрица, същите клиенти и същата output структура. Поддържа vehicle-specific service time, различни начални/крайни депа, objective по време или километри и priority dropping чрез prize/penalty логика.
-
-PyVRP профилите се компресират: ако няколко типа бусове имат еднакви правила за цена/център зона/service time, те споделят един edge profile. Началното и крайното депо остават настройка на vehicle type, така че различни депа не се губят при компресията.
-
-Забележка: нито OR-Tools, нито PyVRP в този проект използват видеокарта. По-добрият резултат идва от настройки, време за търсене, матрица с по-точни времена и коректни ограничения, не от GPU.
-
-## Цел на оптимизацията
-
-Настройката е:
-
-```python
-cvrp.objective_metric = "distance"
-cvrp.objective_metric = "time"
-```
-
-`distance` означава, че solver-ът търси по-малко километри. `time` означава, че solver-ът търси по-кратко време по duration матрицата от OSRM/Valhalla. При `time` глобите и fixed cost стойностите се преобразуват към същия мащаб, за да може solver-ът да сравнява пътно време, пропуснати клиенти и center zone penalties в една обща цена.
-
-## Приоритетно пропускане на заявки
-
-Когато `allow_customer_skipping = True`, solver-ът може да остави част от заявките необслужени, ако всички ограничения не могат да се изпълнят.
-
-Когато `enable_priority_dropping = True`, penalty/prize се изчислява индивидуално:
-
-- по-голям обем означава по-лесно пропускане;
-- по-близо до депо означава по-лесно пропускане;
-- малки и далечни заявки получават по-висока защита.
-
-Основни настройки:
-
-```python
-enable_priority_dropping = True
-drop_volume_weight = 0.70
-drop_closeness_weight = 0.30
-min_customer_drop_penalty = 20000
-max_customer_drop_penalty = 120000
-```
-
-Това не е строго двуфазно правило "само ако няма решение"; това е objective bias. Ако solver-ът пропуска твърде лесно, увеличи `min_customer_drop_penalty` и `max_customer_drop_penalty`.
-
-## Routing engine
-
-Изборът е в `config.routing.engine`:
-
-- `osrm`
-- `valhalla`
-
-OSRM е основният режим. Използва:
-
-- централен кеш;
-- batch Table API;
-- route geometry за визуализация;
-- fallback логика при липсващи данни.
-
-Важно: междублоковите връзки вече не се приемат за симетрични. A->B и B->A се попълват отделно, защото еднопосочни улици, забрани и завои могат да правят двете посоки различни.
-
-При Valhalla липсващи клетки в матрицата вече не спират целия run. Програмата ги попълва с приблизителна fallback стойност по права линия с road factor и записва предупреждение в лога.
-
-## Изходни файлове
-
-Основни output директории:
-
-```text
-output/
-output/routes/
-output/excel/
-output/charts/
-logs/
-```
-
-Генерирани файлове:
-
-- обща HTML карта;
-- отделна HTML карта за всеки маршрут;
-- Excel отчет `cvrp_report_YYYY-MM-DD.xlsx`;
-- Excel файлове за склад и маршрути, ако са активни;
-- CSV `routes.csv`;
-- PNG графики;
-- log файл.
-
-Дата се добавя към:
-
-- общата карта;
-- отделните route карти;
-- Excel файловете.
-
-CSV файлът не се променя по име, за да остане стабилен за външни процеси.
-
-## Карти
-
-Поддържат се два режима:
-
-- Folium/OpenStreetMap/Esri tiles (`map_provider = "osm"`);
-- Google Maps (`map_provider = "google"`, изисква API key).
-
-В картите има:
-
-- депа;
-- център зона като кръг или полигон;
-- цветни маршрути;
-- разредени стрелки за посока на движение;
-- popup-и с информация за клиенти;
-- Google Maps navigation link.
-- очакван час на пристигане при клиентите, изчислен от същата матрица и service time, които ползва solver-ът.
-- GPS търсачка в общата карта за ръчно поставяне на един или много пинове.
-
-В отделните route карти има сгъваем списък:
-
-- бутон `Клиенти`;
-- списък с ред на посещение;
-- обем в стекове;
-- бутон `Навигация`;
-- клик върху клиент центрира картата и отваря popup.
-
-## Build до EXE
-
-Подробно е описано в [BUILD_EXE_README.md](BUILD_EXE_README.md).
-
-Кратко:
+Пример за нормален background run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pip install pyinstaller
-.\.venv\Scripts\python.exe build_exe.py
+curl.exe -X POST "http://SERVER:PORT/run" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"settings":{"solver_type":"pyvrp_experimental","objective_metric":"distance"}}'
 ```
 
-Build-ът създава `CVRP_Optimizer.exe` в `..\dist`.
-
-## Чести проблеми
-
-### "OR-Tools не е инсталиран"
-
-Провери, че стартираш правилния Python:
+Пример за събота без JSON body:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import ortools; print(ortools.__version__)"
+curl.exe -X POST "http://SERVER:PORT/run_saturday"
 ```
 
-Ако това работи, но програмата казва, че OR-Tools липсва, стартираш с друг Python или стар стартиращ файл. Използвай:
-
-```powershell
-.\start_cvrp.bat
-```
-
-### Няма `CVRP_Optimizer.exe`
-
-`start_cvrp.bat` и `Settings.bat` вече имат fallback към `.venv`. Можеш да работиш без EXE.
-
-### Няма route карти или Excel
-
-Провери:
-
-- `output.enable_interactive_map`;
-- output директориите;
-- правата за запис;
-- `logs/cvrp.log`.
-
-### Няма видима посока на картата
-
-Генерирай картите наново. Старите HTML файлове не се обновяват автоматично.
-
-### Списъкът с клиенти не се вижда в отделните карти
-
-Генерирай route картите наново. Новият списък е зад бутон `Клиенти`, за да не закрива картата.
-
-## Последни промени по проекта
-
-### PyVRP, бусове и глоби
-
-- PyVRP е основният solver, когато е инсталиран. OR-Tools остава fallback, ако PyVRP липсва.
-- В GUI има глоба за `CENTER BUS`, когато излезе извън център зоната.
-- Всеки тип бус има собствена цена за използване. Тази цена се подава към solver-а като fixed cost, за да не избира евтин/неподходящ бус само заради капацитет.
-- Поддържат се отделни настройки за бусове, капацитети, депа, работно време, глоба за пропускане и глоба за център зона.
-
-### OSRM/Valhalla и посоки
-
-- Добавена е опция за curbside/side-of-street routing, за да се отчита от коя страна на улицата е клиентът.
-- При OSRM се използва `approaches=curb`, когато опцията е включена.
-- При Valhalla се подава предпочитана страна чрез `preferred_side`.
-- Ако бус не трябва да минава по дадени улици, правилният професионален подход е това да се решава от routing engine-а чрез ограничения/профил/изключени сегменти, а не само със solver глоба.
-
-### Входни данни от Bizant
-
-Новият GET адрес се настройва от GUI и използва:
-
-```text
-http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&DoneFlag=1973
-```
-
-Датата остава автоматична, ако не е зададена ръчно. Полетата, които се четат от отговора, са:
-
-- `GPS`
-- `IdCust`
-- `CustName`
-- `Volume`
-- `IdDoc`
-- `IdPlasDoc`
-- `IdSkld`
-- `WorkTime` във формат `08:00-13:00` или `08:00 - 16:00`
-- `DeliveryComment` за коментар/инструкция към доставката
-- `DoneFlag`
-
-`IdPlasDoc` се пази за връщане към `setData`, а `IdSkld` се пази като оригинален склад на клиента и се използва при необслужени клиенти.
-Ако `WorkTime` е подадено на два реда, например `08:00-13:00` и `16:00-18:00`, програмата използва първия прозорец, защото solver-ите работят с един прозорец на клиент. Работното време и коментарът се виждат в индивидуалните route карти; клиентите с работно време са оцветени леко в червено в списъка.
-При няколко документа за един и същ `IdCust` и същ GPS, настройката `enable_customer_document_grouping` определя поведението. Включена стойност означава едно посещение със сборен обем и отделни `setData` заявки за всеки `IdPlasDoc`. Изключена стойност означава всеки документ да остане отделен стоп.
-
-### API сървър
-
-Добавен е локален/отдалечен API сървър с POST endpoint:
-
-```text
-POST http://IP:8088/solve
-GET  http://IP:8088/run
-POST http://IP:8088/run
-```
-
-`/solve` приема JSON клиенти и връща резултата след решаване. `/run` не очаква входни данни: само стартира оптимизацията с текущата конфигурация и връща веднага `202 started`. Ако вече има активен run, връща `409 already_running`.
-
-Trigger може да се извика и през `/solve` с query или JSON команда:
-
-```text
-cmd=run
-cmd=start
-cmd=trigger
-cmd=solve_config
-cmd=start_program
-```
-
-Адресът, портът и endpoint-ите се настройват в GUI. Сървърът може да слуша само локално или от мрежата според зададения host. За отдалечен достъп host трябва да е например `0.0.0.0`, а firewall/port forwarding трябва да позволяват връзката.
-
-Пример:
-
-```cmd
-curl -X POST "http://10.10.100.134:8088/solve" -H "Content-Type: application/json" -d "{\"customers\":[{\"GPS\":\"42.6977, 23.3219\",\"IdCust\":\"C001\",\"CustName\":\"Client 001\",\"Volume\":3,\"IdDoc\":\"D001\",\"IdPlasDoc\":\"P001\",\"IdSkld\":\"106\",\"WorkTime\":\"08:00-13:00\",\"DeliveryComment\":\"Обади се 10 мин преди доставка\"}]}"
-curl "http://10.10.100.134:8088/run"
-```
-
-След една заявка API сървърът не спира. Той връща резултат и остава да чака следваща заявка.
-
-### setData и makeGroup
-
-След успешно решение програмата може автоматично да върне резултата към същия Bizant URL чрез:
-
-```text
-cmd=setData
-```
-
-Параметрите са:
-
-- `IdPlasDoc`
-- `DoneFlag`
-- `IdSkld`
-- `Bukva`
-- `IdGrafik`
-
-За обслужени клиенти:
-
-- `IdPlasDoc` идва от GET полето `IdPlasDoc`.
-- `IdSkld` се определя от депото/буса. В GUI могат да се сменят складовете за основно депо и Враца.
-- `Bukva` по подразбиране е `БХ{route_number}-{stop_number}`, например `БХ1-1`.
-- `IdGrafik` по подразбиране е Excel номерът на буса, например `1004501001`.
-
-За необслужени клиенти:
-
-- могат да се изпращат към `setData` чрез отделна отметка в GUI;
-- `IdSkld` се взема от оригиналните GET данни на клиента;
-- `Bukva` по подразбиране е `HOF-{id_plas_doc}`, тоест `HOF-` + номерът на заявката от `IdPlasDoc`;
-- `IdGrafik` има отделно GUI поле/шаблон;
-- ако клиентът няма `IdSkld` в GET отговора, програмата използва fallback стойността от настройките.
-
-След всички успешни `setData` заявки може да се изпрати:
-
-```text
-cmd=makeGroup
-par: IdSkld
-```
-
-Изпраща се по веднъж за всеки използван склад, последователно. Има отметка в GUI за включване/изключване.
-
-### Отчети и файлове
-
-- В CVRP Excel отчета времето е в часове.
-- Текстът е променен от “автобуси” на “бусове”.
-- Excel отчетът показва ID на буса като `1004501001`, `1004501002`, `1004501003` и т.н.
-- Добавена е отделна колона за номер на маршрут `1`, `2`, `3`, `4`.
-- CSV файлът не е променян по тази логика.
-- В GUI има опции да се изключват Excel, CSV, карти и chart-ове поотделно.
-
-### Build/EXE
-
-Build-ът включва основната програма, Settings GUI, API сървъра и стартовите batch файлове. Има и скрит старт на API сървъра чрез `start_api_server_hidden.bat`, когато трябва сървърът да работи без отворен CMD прозорец.
-
-## Последни възможности
-
-Текущата версия може да се управлява много по-пълно от GUI и API:
-
-- Бусовете могат да имат име. Ако е зададено, то се показва в Excel, CSV и route картите.
-- Всеки бус може да има отделна начална и крайна GPS точка. Ако крайна точка не е зададена, маршрутът завършва в стартовото депо.
-- Могат да се добавят допълнителни депа и трафик зони през опростени GUI полета.
-- Работно време на клиентите може да се чете от Excel/JSON и да се включва или изключва от GUI.
-- Клиенти с няколко документа могат да се групират по `IdCust + GPS` в един стоп; настройката може да се изключи от GUI или API.
-- API режимът поддържа `/run`, `/solve`, callback URL, JSON резултат и временни настройки само за конкретната заявка.
-- През API могат да се подават бусове, депа, трафик зони, независими център зони с правила по тип бус, OSRM настройки, solver настройки, output пътища и `setData` настройки.
-- `setData` има отделна настройка за необслужени клиенти: `set_data_unserved_done_flag`. Ако е празна, се използва общият `set_data_done_flag`.
-- Output генераторът продължава работа, ако отделен файл не може да се създаде, и логва грешката без да спира останалите файлове.
-- `objective_metric` може да се подаде през GUI, `/run` или `/solve` като `distance` или `time`.
-- Индивидуалните route HTML карти по подразбиране се качват към `https://effect.bg/dragon/hellbizante/upload-files.php` чрез `output.route_maps_upload_mode = "effect_upload"`. Режим `disabled` не качва, а `legacy` запазва старото поведение.
-- OR-Tools използва предварително сметнати vehicle cost матрици за по-малко Python callback overhead.
-- PyVRP компресира еднаквите профили, без да губи различните депа на бусовете.
-- При Excel вход Враца бусовете не се изключват автоматично само защото липсва `IdSkld`; тази автоматична филтрация важи само за HTTP JSON вход.
-
-### Пример `/run` с настройки
-
-```powershell
-curl -X POST "http://127.0.0.1:8088/run" -H "Content-Type: application/json" -d "{\"return_result\":true,\"settings\":{\"solver_type\":\"pyvrp\",\"objective_metric\":\"time\",\"time_limit_seconds\":180,\"set_data\":{\"enable_set_data_upload\":false,\"set_data_unserved_done_flag\":\"1975\"},\"output\":{\"enable_excel_output\":true,\"excel_output_dir\":\"H:\\\\Hell_Bizant_files\\\\Run1\",\"route_maps_upload_mode\":\"effect_upload\",\"route_maps_upload_url\":\"https://effect.bg/dragon/hellbizante/upload-files.php\",\"route_maps_upload_token\":\"Effect-Bizante-Token\"}}}"
-```
-
-### Пример API center_zones
+Пример за синхронен `/solve`:
 
 ```json
 {
   "settings": {
-    "center_zones": [
-      {
-        "name": "Център 2",
-        "mode": "circle",
-        "center": [42.7093, 23.3137],
-        "radius_km": 1.2,
-        "priority_vehicle_types": ["center_bus"],
-        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
-        "discount_priority_vehicle": 0.9,
-        "priority_vehicle_outside_penalty": 0,
-        "vehicle_penalties": {
-          "internal_bus": 40000,
-          "external_bus": 40000,
-          "vratza_bus": 40000
-        },
-        "enabled": true
-      }
-    ]
-  }
+    "solver_type": "pyvrp",
+    "objective_metric": "time",
+    "set_data": {
+      "enable_set_data_upload": false
+    }
+  },
+  "customers": [
+    {
+      "IdCust": "1",
+      "GPS": "42.6977,23.3219",
+      "Volume": 10,
+      "WorkTime": "08:00-13:00\n16:00-18:00"
+    }
+  ]
 }
 ```
 
-### Пример vehicle с крайна точка
+Настройките в публичните `/run` и `/solve` са временни и не записват `config.py`.
 
-```json
-{
-  "vehicle_type": "internal_bus",
-  "name": "HELL 1",
-  "count": 1,
-  "capacity": 385,
-  "start_location": [42.695785, 23.231659],
-  "end_location": [42.700000, 23.400000]
-}
+## Web GUI и scopes
+
+Web потребителите се създават от Desktop Settings. Credentials се пазят в `data/web_gui_auth.json` като salted PBKDF2 записи; Web интерфейсът използва session cookie, CSRF защита и login throttling.
+
+Web GUI разделя:
+
+- **текущ рън без записване**;
+- **глобални настройки** в `config.py`, без бусовете;
+- **бусове**, записвани отделно от всички останали секции.
+
+Текущият Web рън изпраща временните solver/output/`setData` стойности, но използва последно записаните вход, routing, депа, зони и бусове. Незаписаните редакции по бусове не участват. Legacy `web_gui_run_defaults_json`/`run-defaults` още съществува в кода, но текущата страница не го предлага и стартът не го прилага.
+
+## Изход
+
+Рънът може да създаде:
+
+- обща HTML карта;
+- индивидуални HTML карти по физически бус;
+- един Excel workbook с отделни sheets за маршрути, необслужени, обобщение и статистика;
+- CSV;
+- PNG графики;
+- JSON резултат през API;
+- TSP HTML/JSON и дневен TSP Excel отчет.
+
+При втори курсове индивидуалната карта е обща за физическия бус. Курсовете имат различни номера и филтър с отделен списък клиенти.
+
+При `/run_saturday` output директориите не е необходимо да се сменят. Към date stamp-а се добавя `_събота`, а Excel/карта файловете остават различими от нормалния рън. Съботният prefix важи за нормалното номериране; при `center_bus_numbering_enabled=true` CENTER_BUS запазва отделната серия от `center_bus_numbering_start_id`.
+
+## `setData` и upload
+
+След валидно решение по желание се изпращат:
+
+- обслужени документи чрез `cmd=setData`;
+- необслужени документи с отделен DoneFlag/Bukva/IdGrafik;
+- `cmd=makeGroup` по използван склад, след успешните `setData` заявки.
+
+Индивидуалните карти могат независимо да бъдат качени като multipart файлове със съответните bus IDs. За първи тест остави интеграционните switches изключени.
+
+## Build
+
+Основна команда:
+
+```powershell
+.\.venv\Scripts\python.exe build_exe.py
 ```
 
-Ако `end_location` липсва или е празно, solver-ът използва стартовото депо като край.
+По желание друга директория:
+
+```powershell
+$env:CVRP_DIST_DIR = "D:\Iliyan\dist_candidate"
+.\.venv\Scripts\python.exe build_exe.py
+```
+
+Пълният build изисква и трите подготвени изолирани worker среди. Той се счита за успешен само ако включи и провери главния EXE и worker-ите в `pyvrp-next`, `vroom` и `vrp-rust`; при липсващ/неуспешен worker build процесът прекратява release-а като непълен. Не променяй production `config.py`, освен ако изрично не искаш да разпространиш нови defaults.
+
+## Сигурност и диагностика
+
+- При `api_host=0.0.0.0` настрой `api_key`.
+- За Web GUI извън защитена LAN използвай HTTPS reverse proxy.
+- Не публикувай API keys, upload token-и и `data/web_gui_auth.json`.
+- `409 already_running` означава, че вече има основен CVRP рън.
+- Липсващ companion worker означава грешна/непълна `dist` папка или неподготвена source среда.
+- PyVRP 0.14 може да използва много памет при голям `num_workers`; настрой конкретен безопасен брой.
+- Проверявай `logs/cvrp.log`, `logs/cvrp_api_server.log`, run-specific API логовете и `logs/api_run_status.json`.
+- Общият hard-constraint audit може да отхвърли кандидат от PyVRP/VROOM/VRP-Rust, който нарушава ограничения. Директният OR-Tools използва native dimensions и проверки при извличане на решението. Отделният mandatory invariant е fail-closed за всички backend-и и се повтаря преди output/`setData`.
+
+## Основни модули
+
+| Файл | Роля |
+|---|---|
+| `main.py`, `main_exe.py` | Оркестрация и entry points. |
+| `config.py`, `config_gui.py` | Модел и Desktop Settings. |
+| `input_handler.py`, `warehouse_manager.py` | Вход, нормализация и склад. |
+| `osrm_client.py`, `valhalla_client.py` | Матрици и route geometry. |
+| `cvrp_solver.py` | OR-Tools и общите route модели. |
+| `pyvrp_solver.py`, `pyvrp_next_runtime.py` | PyVRP 0.13/0.14. |
+| `vroom_solver.py`, `vroom_runtime.py` | VROOM adapter/worker bridge. |
+| `vrp_solver.py`, `vrp_runtime.py`, `vrp_rust_prototype.py` | VRP-Rust adapter/worker bridge. |
+| `current_tsp.py`, `tsp_daily_report.py` | TSP и дневни отчети. |
+| `output_handler.py`, `vehicle_numbering.py` | Карти, Excel/CSV и numbering. |
+| `setdata_client.py` | Bizant `setData`/`makeGroup`. |
+| `cvrp_api_server.py`, `web_gui_auth.py` | HTTP API, Web GUI и auth. |
+| `build_exe.py`, `build_*_worker.py` | Главен build и companion worker-и. |
+
+## Проверка след промяна
+
+Тестовете са в `tests`:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+След промяна на API или документацията провери още:
+
+1. `GET /health` и всички URL-и;
+2. входен JSON с два работни прозореца;
+3. run с и без втори курсове;
+4. скрита, но активна зона;
+5. normal и `/run_saturday` output имена;
+6. Web run без записване, global save и vehicles-only save;
+7. build worker self-checks.

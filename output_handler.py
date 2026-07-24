@@ -10,16 +10,39 @@ import requests
 import json
 import html
 import math
+import re
 from typing import List, Dict, Tuple, Optional
 import os
 import logging
 from datetime import datetime
 from urllib.parse import urlencode
-from config import get_config, OutputConfig, RoutingEngine, is_location_in_center_zone, get_center_zones
+from config import (
+    get_config,
+    OutputConfig,
+    RoutingEngine,
+    is_location_in_center_zone,
+    get_center_zones,
+    get_traffic_zones,
+)
 from cvrp_solver import CVRPSolution, Route
 from warehouse_manager import WarehouseAllocation
-from input_handler import Customer
+from input_handler import (
+    Customer,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
+    time_windows_to_seconds,
+)
 from osrm_client import get_distance_matrix_from_central_cache
+from vehicle_numbering import (
+    count_physical_vehicles,
+    format_route_bus_number,
+    is_multi_trip_route,
+    order_routes_for_output,
+    route_identifier,
+    route_trip_number,
+    route_vehicle_key,
+)
 
 try:
     from folium.plugins import PolyLineTextPath
@@ -72,6 +95,78 @@ def _safe_filename_stem(value: str, fallback: str) -> str:
     cleaned = " ".join(cleaned.split()).strip(" .")
     return cleaned or fallback
 
+
+def _html_comment_safe(value: object) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = " ".join(text.split())
+    return text.replace("--", "- -")
+
+
+def _optional_finite_float(value: object) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _visible_center_zones(locations) -> List[object]:
+    """Return center zones that are allowed to be rendered on output maps.
+
+    Visibility is deliberately an output-only concern.  ``get_center_zones``
+    remains unchanged so hidden zones continue to participate in solver costs
+    and restrictions.  Older config files do not have either visibility flag;
+    ``getattr(..., True)`` keeps those zones visible.
+    """
+    if locations is None:
+        return []
+
+    all_zones = list(get_center_zones(locations) or [])
+    configured_zones = list(
+        get_center_zones(locations, include_legacy=False) or []
+    )
+    legacy_count = max(0, len(all_zones) - len(configured_zones))
+
+    visible = []
+    if getattr(locations, "show_center_zone_on_map", True):
+        visible.extend(all_zones[:legacy_count])
+    visible.extend(
+        zone
+        for zone in all_zones[legacy_count:]
+        if getattr(zone, "show_on_map", True)
+    )
+    return visible
+
+
+def _visible_traffic_zones(locations) -> List[object]:
+    """Return active traffic zones explicitly enabled for map rendering.
+
+    Traffic zones were historically not drawn on generated maps, so missing
+    visibility settings intentionally default to hidden.  This is independent
+    from ``enabled`` and the traffic multiplier used by the solvers.
+    """
+    if locations is None:
+        return []
+
+    zones = list(get_traffic_zones(locations) or [])
+    legacy_is_active = bool(
+        getattr(locations, "enable_city_traffic_adjustment", False)
+        and getattr(locations, "city_center_coords", None)
+        and float(getattr(locations, "city_traffic_radius_km", 0) or 0) > 0
+        and float(getattr(locations, "city_traffic_duration_multiplier", 1.0) or 1.0) > 1.0
+    )
+    legacy_count = 1 if legacy_is_active and zones else 0
+
+    visible = []
+    if getattr(locations, "show_city_traffic_zone_on_map", False):
+        visible.extend(zones[:legacy_count])
+    visible.extend(
+        zone
+        for zone in zones[legacy_count:]
+        if getattr(zone, "show_on_map", False)
+    )
+    return visible
+
 # Настройки за различните типове превозни средства
 VEHICLE_SETTINGS = {
     'internal_bus': {
@@ -118,6 +213,108 @@ def _route_vehicle_name(route: Route, default: str = "Неизвестен") -> 
     return _fallback_vehicle_name(route.vehicle_type, default)
 
 
+def _normalise_vehicle_name(value: object) -> str:
+    return " ".join(str(value or "").strip().split()).casefold()
+
+
+def _vehicle_count(vehicle_config) -> int:
+    try:
+        return max(0, int(getattr(vehicle_config, "count", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _vehicle_display_name_candidates(vehicle_config) -> List[str]:
+    name = str(getattr(vehicle_config, "name", "") or "").strip()
+    if not name:
+        return []
+
+    names = [name]
+    count = _vehicle_count(vehicle_config)
+    if count > 1:
+        names.extend(f"{name} {idx}" for idx in range(1, count + 1))
+    return names
+
+
+def _vehicle_config_for_route(route: Optional[Route]):
+    """Return the exact configured vehicle used by a route when possible."""
+    if route is None:
+        return None
+
+    vehicle_configs = get_config().vehicles or []
+    route_type_value = _vehicle_type_value(getattr(route, "vehicle_type", ""))
+
+    try:
+        route_vehicle_id = int(getattr(route, "vehicle_id"))
+    except (TypeError, ValueError):
+        route_vehicle_id = None
+
+    id_candidate = None
+    if route_vehicle_id is not None:
+        current_id = 0
+        for vehicle_config in vehicle_configs:
+            if not getattr(vehicle_config, "enabled", True):
+                continue
+            count = _vehicle_count(vehicle_config)
+            if current_id <= route_vehicle_id < current_id + count:
+                id_candidate = vehicle_config
+                if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) == route_type_value:
+                    return vehicle_config
+                break
+            current_id += count
+
+    route_name = _normalise_vehicle_name(getattr(route, "vehicle_name", ""))
+    if route_name:
+        for vehicle_config in vehicle_configs:
+            if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) != route_type_value:
+                continue
+            names = {_normalise_vehicle_name(name) for name in _vehicle_display_name_candidates(vehicle_config)}
+            if route_name in names:
+                return vehicle_config
+
+    if id_candidate is not None:
+        return id_candidate
+
+    for vehicle_config in vehicle_configs:
+        if _vehicle_type_value(getattr(vehicle_config, "vehicle_type", "")) == route_type_value:
+            return vehicle_config
+    return None
+
+
+def _route_planned_time_minutes(route: Route, attribute: str) -> Optional[int]:
+    """Normalise solver-provided planned times (minutes or HH:MM) for reports."""
+    minute_attribute = attribute if attribute.endswith("_minutes") else f"{attribute}_minutes"
+    value = getattr(route, minute_attribute, None)
+    if value in (None, ""):
+        # Compatibility with early route producers which used planned_start/end.
+        value = getattr(route, attribute.removesuffix("_minutes"), None)
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(round(float(value)))
+    if hasattr(value, "hour") and hasattr(value, "minute"):
+        return int(value.hour) * 60 + int(value.minute)
+    text = str(value).strip()
+    try:
+        return int(round(float(text)))
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"(?:^|T|\s)(\d{1,2}):(\d{2})(?::\d{2})?(?:$|[+Z\s])", text)
+    if match:
+        return int(match.group(1)) * 60 + int(match.group(2))
+    return None
+
+
+def _route_start_time_minutes(route: Route) -> int:
+    planned_start = _route_planned_time_minutes(route, "planned_start")
+    if planned_start is not None:
+        return planned_start
+    vehicle_config = _vehicle_config_for_route(route)
+    if vehicle_config and hasattr(vehicle_config, "start_time_minutes"):
+        return int(getattr(vehicle_config, "start_time_minutes", 0) or 0)
+    return int(getattr(get_config().cvrp, "global_start_time_minutes", 480) or 480)
+
+
 def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
     schedule_entries = getattr(route, "schedule_entries", None) or []
     if not schedule_entries:
@@ -152,25 +349,48 @@ def _stored_route_schedule_entries(route: Route) -> List[Dict[str, object]]:
         if customer is not None:
             if not item.get("delivery_comment"):
                 item["delivery_comment"] = getattr(customer, "delivery_comment", "")
-            raw_start = getattr(customer, "time_window_start_minutes", None)
-            raw_end = getattr(customer, "time_window_end_minutes", None)
-            if not item.get("time_window_text") and (raw_start is not None or raw_end is not None):
-                start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-                end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-                if end_minutes < start_minutes:
-                    end_minutes += 24 * 60
-                item["time_window_text"] = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}-{end_minutes // 60:02d}:{end_minutes % 60:02d}"
+            if not item.get("time_window_text"):
+                item["time_window_text"] = format_time_windows_minutes(customer_time_windows_minutes(customer))
         else:
             item.setdefault("delivery_comment", "")
 
         normalised.append(item)
 
+    planned_start = _route_planned_time_minutes(route, "planned_start")
+    if planned_start is not None and normalised:
+        try:
+            stored_start = float(normalised[0].get("start_time_minutes", planned_start))
+        except (TypeError, ValueError):
+            stored_start = float(planned_start)
+        shift = float(planned_start) - stored_start
+        for item in normalised:
+            item["start_time_minutes"] = planned_start
+            if shift:
+                for key in ("arrival_time_minutes", "total_time_with_start"):
+                    try:
+                        item[key] = float(item.get(key, 0) or 0) + shift
+                    except (TypeError, ValueError):
+                        pass
+
     return normalised
 
 
-def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_file_names) -> str:
+def _route_map_file_name(
+    route: Route,
+    route_number: int,
+    date_stamp: str,
+    used_file_names,
+    routes: Optional[List[Route]] = None,
+) -> str:
     vehicle_name = _route_vehicle_name(route, f"route_{route_number}")
     base_name = _safe_filename_stem(vehicle_name, f"route_{route_number}")
+    if is_multi_trip_route(route, routes):
+        base_name = f"{base_name}_kurs_{route_trip_number(route)}"
+        explicit_route_id = getattr(route, "route_id", None)
+        if explicit_route_id not in (None, ""):
+            safe_route_id = _safe_filename_stem(str(explicit_route_id), "")
+            if safe_route_id:
+                base_name = f"{base_name}_{safe_route_id}"
     safe_date = _safe_filename_stem(date_stamp, datetime.now().strftime("%Y-%m-%d"))
     stem = f"{base_name}_{safe_date}"
     file_name = f"{stem}.html"
@@ -188,6 +408,129 @@ def _route_map_file_name(route: Route, route_number: int, date_stamp: str, used_
             used_file_names.add(lookup_name)
             return file_name
         suffix += 1
+
+
+def _vehicle_route_map_file_name(
+    route: Route,
+    route_number: int,
+    date_stamp: str,
+    used_file_names,
+) -> str:
+    """Return one stable file name for all courses of a physical vehicle."""
+    vehicle_name = _route_vehicle_name(route, f"route_{route_number}")
+    base_name = _safe_filename_stem(vehicle_name, f"route_{route_number}")
+    safe_date = _safe_filename_stem(date_stamp, datetime.now().strftime("%Y-%m-%d"))
+    stem = f"{base_name}_all_courses_{safe_date}"
+    file_name = f"{stem}.html"
+    lookup_name = file_name.lower()
+    if lookup_name not in used_file_names:
+        used_file_names.add(lookup_name)
+        return file_name
+
+    suffix = 2
+    while True:
+        file_name = f"{stem}_{suffix}.html"
+        lookup_name = file_name.lower()
+        if lookup_name not in used_file_names:
+            used_file_names.add(lookup_name)
+            return file_name
+        suffix += 1
+
+
+def _vehicle_route_map_output_key(vehicle_map_index: int) -> str:
+    """Return the sequential output key for one physical-vehicle HTML map."""
+    return f"route_map_vehicle_{max(1, int(vehicle_map_index))}"
+
+
+def _group_routes_for_vehicle_maps(routes: Optional[List[Route]]) -> List[List[Tuple[int, Route]]]:
+    """Group ordered routes by physical vehicle while retaining global indexes."""
+    groups: Dict[str, List[Tuple[int, Route]]] = {}
+    for route_index, route in enumerate(routes or []):
+        groups.setdefault(route_vehicle_key(route, route_index), []).append((route_index, route))
+    return list(groups.values())
+
+
+def _map_route_identifier(
+    route: Route,
+    route_number: int,
+    routes: Optional[List[Route]] = None,
+) -> str:
+    """Return a stable, map-local route ID that is unique for every course."""
+    candidate = route_identifier(route, route_number)
+    if not routes:
+        return candidate
+    matching = sum(
+        1
+        for index, other in enumerate(routes)
+        if route_identifier(other, index + 1) == candidate
+    )
+    return f"{candidate}-{route_number}" if matching > 1 else candidate
+
+
+def _format_output_bus_number(
+    output_config: OutputConfig,
+    route_index: int,
+    route: Optional[Route] = None,
+    routes: Optional[List[Route]] = None,
+) -> str:
+    return format_route_bus_number(output_config, route_index, route=route, routes=routes)
+
+
+def _route_course_suffix(route: Route, routes: Optional[List[Route]] = None) -> str:
+    if not is_multi_trip_route(route, routes):
+        return ""
+    return f" - Курс {route_trip_number(route)}"
+
+
+def _has_multiple_courses(routes: Optional[List[Route]]) -> bool:
+    return bool(routes) and count_physical_vehicles(routes) < len(routes)
+
+
+def _total_elapsed_route_minutes(routes: Optional[List[Route]]) -> float:
+    """Sum physical-vehicle work spans, including gaps used for reloads.
+
+    A flat multi-trip result stores reload time between the preceding course's
+    planned end and the next course's planned start.  Summing course durations
+    alone therefore under-reports the daily time shown on overview maps.
+    """
+    groups: Dict[str, List[Route]] = {}
+    for index, route in enumerate(routes or []):
+        groups.setdefault(route_vehicle_key(route, index), []).append(route)
+
+    total = 0.0
+    for group_routes in groups.values():
+        starts = [
+            _route_planned_time_minutes(route, "planned_start")
+            for route in group_routes
+        ]
+        ends = [
+            _route_planned_time_minutes(route, "planned_end")
+            for route in group_routes
+        ]
+        if (
+            len(group_routes) > 1
+            and all(value is not None for value in starts)
+            and all(value is not None for value in ends)
+        ):
+            span = max(float(value) for value in ends) - min(float(value) for value in starts)
+            if span >= 0:
+                total += span
+                continue
+        total += sum(float(route.total_time_minutes or 0) for route in group_routes)
+    return total
+
+
+def _duplicate_route_map_bus_ids(items: List[Dict[str, object]]) -> List[str]:
+    """Return repeated physical bus IDs in stable order."""
+    seen = set()
+    duplicates = []
+    for item in items:
+        bus_id = str(item.get("bus_id") or "").strip()
+        lookup = bus_id.casefold()
+        if bus_id and lookup in seen and bus_id not in duplicates:
+            duplicates.append(bus_id)
+        seen.add(lookup)
+    return duplicates
 
 
 # Цветове за всеки отделен автобус
@@ -302,6 +645,135 @@ class SingleRouteCustomerPanel(MacroElement):
         self._name = "SingleRouteCustomerPanel"
         self.panel_html = json.dumps(panel_html, ensure_ascii=False)
         self.clients = json.dumps(clients, ensure_ascii=False)
+        self.css = json.dumps(css, ensure_ascii=False)
+
+
+class MultiCourseCustomerPanel(MacroElement):
+    """Leaflet control that switches one active course and its customer panel."""
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            const map = {{ this._parent.get_name() }};
+            const courses = {{ this.courses|safe }};
+            const css = {{ this.css|safe }};
+
+            if (!document.getElementById("multi-course-client-style")) {
+                const style = document.createElement("style");
+                style.id = "multi-course-client-style";
+                style.textContent = css;
+                document.head.appendChild(style);
+            }
+
+            const control = L.control({ position: "topright" });
+            let container;
+            control.onAdd = function() {
+                container = L.DomUtil.create("div", "multi-course-client-control");
+                const selectorRows = courses.map(function(course, index) {
+                    return `
+                        <label class="multi-course-selector-row">
+                            <input type="radio" name="leaflet-active-course" value="${index}" ${index === 0 ? "checked" : ""}>
+                            <span class="multi-course-swatch" style="background:${course.color}"></span>
+                            <span>${course.label}</span>
+                        </label>
+                    `;
+                }).join("");
+                container.innerHTML = `
+                    <button type="button" class="multi-course-toggle multi-course-hidden">Курсове / Клиенти</button>
+                    <div class="multi-course-panel">
+                        <div class="multi-course-header">
+                            <b>Курсове и клиенти</b>
+                            <button type="button" class="multi-course-close" title="Затвори">×</button>
+                        </div>
+                        <div class="multi-course-selector">${selectorRows}</div>
+                        <div class="multi-course-detail"></div>
+                    </div>
+                `;
+                L.DomEvent.disableClickPropagation(container);
+                L.DomEvent.disableScrollPropagation(container);
+                return container;
+            };
+            control.addTo(map);
+
+            const detail = container.querySelector(".multi-course-detail");
+            const panel = container.querySelector(".multi-course-panel");
+            const toggle = container.querySelector(".multi-course-toggle");
+            const close = container.querySelector(".multi-course-close");
+
+            function courseLayer(course) {
+                return window[course.layerName];
+            }
+
+            function setOpen(isOpen) {
+                panel.classList.toggle("multi-course-hidden", !isOpen);
+                toggle.classList.toggle("multi-course-hidden", isOpen);
+            }
+
+            function openClient(course, index) {
+                const item = course.clients[index];
+                if (!item) return;
+                const marker = window[item.markerName];
+                if (!marker) return;
+                map.setView([item.lat, item.lng], Math.max(map.getZoom(), 15), { animate: true });
+                marker.openPopup();
+            }
+
+            function bindClientRows(course) {
+                detail.querySelectorAll(".multi-course-client-card").forEach(function(row) {
+                    function activate(event) {
+                        if (event.target.closest("a")) return;
+                        if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+                        if (event.type === "keydown") event.preventDefault();
+                        openClient(course, Number(row.dataset.clientIndex));
+                    }
+                    row.addEventListener("click", activate);
+                    row.addEventListener("keydown", activate);
+                });
+            }
+
+            function activateCourse(index, fitCourse) {
+                const active = courses[index];
+                if (!active) return;
+                courses.forEach(function(course, courseIndex) {
+                    const layer = courseLayer(course);
+                    if (!layer) return;
+                    if (courseIndex === index) {
+                        if (!map.hasLayer(layer)) layer.addTo(map);
+                    } else if (map.hasLayer(layer)) {
+                        map.removeLayer(layer);
+                    }
+                });
+                const radio = container.querySelector(`input[name="leaflet-active-course"][value="${index}"]`);
+                if (radio) radio.checked = true;
+                detail.innerHTML = active.panelHtml;
+                bindClientRows(active);
+                if (fitCourse && active.clients.length) {
+                    const bounds = L.latLngBounds(active.clients.map(function(item) { return [item.lat, item.lng]; }));
+                    if (bounds.isValid()) map.fitBounds(bounds.pad(0.15));
+                }
+            }
+
+            container.querySelectorAll('input[name="leaflet-active-course"]').forEach(function(radio) {
+                radio.addEventListener("change", function() {
+                    activateCourse(Number(radio.value), true);
+                });
+            });
+            toggle.addEventListener("click", function() { setOpen(true); });
+            close.addEventListener("click", function(event) {
+                event.preventDefault();
+                setOpen(false);
+            });
+            if (courses.length) activateCourse(0, true);
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, courses: List[Dict[str, object]], css: str):
+        super().__init__()
+        self._name = "MultiCourseCustomerPanel"
+        self.courses = json.dumps(courses, ensure_ascii=False)
         self.css = json.dumps(css, ensure_ascii=False)
 
 
@@ -515,10 +987,10 @@ class CoordinatePinSearch(MacroElement):
                 const points = [];
                 const invalidLines = [];
                 const lines = String(text || "").split(/\\r?\\n/);
-                const coordinatePattern = /(-?\d+(?:[.,]\d+)?)\s*,\s*(-?\d+(?:[.,]\d+)?)/;
+                const coordinatePattern = /(-?\\d+(?:[.,]\\d+)?)\\s*,\\s*(-?\\d+(?:[.,]\\d+)?)/;
 
                 function cleanSideText(value) {
-                    return String(value || "").replace(/^[\s,;|]+|[\s,;|]+$/g, "").trim();
+                    return String(value || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "").trim();
                 }
 
                 lines.forEach(function(line, index) {
@@ -668,7 +1140,10 @@ class InteractiveMapGenerator:
     
     def __init__(self, config: OutputConfig):
         self.config = config
-        self.run_date = datetime.now().strftime("%Y-%m-%d")
+        self.run_date = str(
+            getattr(config, "_api_run_date_stamp", "")
+            or datetime.now().strftime("%Y-%m-%d")
+        )
         # Зареждаме централната матрица
         self.central_matrix = get_distance_matrix_from_central_cache([])
         self.use_routing = False
@@ -840,7 +1315,7 @@ class InteractiveMapGenerator:
 
     def _center_zone_map_data(self, locations) -> Optional[Dict]:
         zones = []
-        for zone in get_center_zones(locations):
+        for zone in _visible_center_zones(locations):
             polygon = getattr(zone, "polygon", []) or []
             mode = str(getattr(zone, "mode", "circle") or "circle").lower()
             zone_data = {
@@ -868,6 +1343,27 @@ class InteractiveMapGenerator:
             return None
         return {"zones": zones}
 
+    def _traffic_zone_map_data(self, locations) -> List[Dict]:
+        zones = []
+        for zone in _visible_traffic_zones(locations):
+            center = getattr(zone, "center_coords", None)
+            if not center:
+                continue
+            name = str(getattr(zone, "name", "Traffic zone") or "Traffic zone")
+            multiplier = float(getattr(zone, "duration_multiplier", 1.0) or 1.0)
+            zones.append({
+                "name": name,
+                "center": self._json_coords(center),
+                "radiusMeters": float(getattr(zone, "radius_km", 0) or 0) * 1000,
+                "durationMultiplier": multiplier,
+                "popup": self._html_popup(
+                    name,
+                    [f"<b>Traffic multiplier:</b> {multiplier:g}×"],
+                    "#1d4ed8",
+                ),
+            })
+        return zones
+
     def _html_popup(self, title: str, lines: List[str], color: str = "#222") -> str:
         body = "<br>".join(lines)
         return (
@@ -883,41 +1379,73 @@ class InteractiveMapGenerator:
     def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
         if not self._customer_time_windows_enabled():
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes, end_minutes
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return None
+        return windows[0]
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        raw_start = getattr(customer, "time_window_start_minutes", None)
-        raw_end = getattr(customer, "time_window_end_minutes", None)
-        if raw_start is None and raw_end is None:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
             if self._customer_time_windows_enabled():
                 return "Постоянно"
             return ""
+        return format_time_windows_minutes(windows)
 
-        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
+    def _customer_document_text(self, customer: Customer) -> str:
+        documents = []
+        for item in getattr(customer, "grouped_documents", None) or []:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("document") or item.get("order") or item.get("order_no") or "").strip()
+            if value and value not in documents:
+                documents.append(value)
+
+        for attr_name in ("document", "order_no", "order"):
+            value = str(getattr(customer, attr_name, "") or "").strip()
+            if value and value not in documents:
+                documents.append(value)
+
+        return ", ".join(documents)
+
+    def _route_delivery_order_html_comment(
+        self,
+        route: Route,
+        route_number: int,
+        all_routes: Optional[List[Route]] = None,
+    ) -> str:
+        bus_number = _format_output_bus_number(
+            self.config, route_number - 1, route, all_routes
+        )
+        lines = [
+            "CVRP_ROUTE_DELIVERY_ORDER",
+            f"route_number={_html_comment_safe(route_number)}",
+            f"bus_id={_html_comment_safe(bus_number)}",
+            f"vehicle={_html_comment_safe(_route_vehicle_name(route))}",
+            "delivery_order | customer_id | customer_name | document | delivery_comment",
+        ]
+        if is_multi_trip_route(route, all_routes):
+            lines[2:2] = [
+                f"route_id={_html_comment_safe(_map_route_identifier(route, route_number, all_routes))}",
+                f"vehicle_key={_html_comment_safe(route_vehicle_key(route, route_number - 1))}",
+                f"trip_number={_html_comment_safe(route_trip_number(route))}",
+            ]
+
+        for delivery_order, customer in enumerate(route.customers, start=1):
+            lines.append(
+                " | ".join([
+                    _html_comment_safe(delivery_order),
+                    _html_comment_safe(getattr(customer, "id", "")),
+                    _html_comment_safe(getattr(customer, "name", "")),
+                    _html_comment_safe(self._customer_document_text(customer)),
+                    _html_comment_safe(getattr(customer, "delivery_comment", "")),
+                ])
+            )
+
+        return "<!--\n" + "\n".join(lines) + "\n-->\n"
 
     def _customer_has_declared_time_window(self, customer: Customer) -> bool:
-        return (
-            getattr(customer, "time_window_start_minutes", None) is not None
-            or getattr(customer, "time_window_end_minutes", None) is not None
-        )
+        return bool(customer_time_windows_minutes(customer))
 
     def _calculate_distance_between_points(
         self,
@@ -974,8 +1502,8 @@ class InteractiveMapGenerator:
         if stored_entries:
             return stored_entries
 
-        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        start_time_minutes = _route_start_time_minutes(route)
+        vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
         service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
@@ -998,22 +1526,12 @@ class InteractiveMapGenerator:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            wait_minutes = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_minutes(customer)
-
-            if window:
-                window_start, window_end = window
-                if raw_arrival < window_start:
-                    wait_minutes = window_start - raw_arrival
-                    time_window_status = "Изчакване"
-                arrival_after_wait = raw_arrival + wait_minutes
-                if arrival_after_wait > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait = raw_arrival
+            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
+            wait_minutes = wait_seconds / 60
+            if time_window_status and len(windows) > 1 and window_index >= 0:
+                time_window_status = f"{time_window_status} (прозорец {window_index + 1})"
+            arrival_after_wait = raw_arrival + wait_minutes
 
             total_time_for_step = travel_time + wait_minutes + service_time_minutes
             cumulative_time += total_time_for_step
@@ -1053,21 +1571,27 @@ class InteractiveMapGenerator:
 
     def _route_start_time_text(self, route: Route) -> str:
         try:
+            planned_start = _route_planned_time_minutes(route, "planned_start")
+            if planned_start is not None:
+                return self._format_time_hh_mm(planned_start)
             stored_entries = _stored_route_schedule_entries(route)
             if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
                 return self._format_time_hh_mm(int(round(float(stored_entries[0]["start_time_minutes"]))))
-            return self._format_time_hh_mm(self._get_start_time_for_vehicle(route.vehicle_type))
+            return self._format_time_hh_mm(_route_start_time_minutes(route))
         except Exception:
             return ""
 
     def _route_end_time_text(self, route: Route) -> str:
         """Return route end time including the final leg back to the route end/depot."""
         try:
+            planned_end = _route_planned_time_minutes(route, "planned_end")
+            if planned_end is not None:
+                return self._format_time_hh_mm(planned_end)
             stored_entries = _stored_route_schedule_entries(route)
             if stored_entries and stored_entries[0].get("start_time_minutes") not in (None, ""):
                 start_minutes = float(stored_entries[0]["start_time_minutes"])
             else:
-                start_minutes = float(self._get_start_time_for_vehicle(route.vehicle_type))
+                start_minutes = float(_route_start_time_minutes(route))
 
             total_route_minutes = float(getattr(route, "total_time_minutes", 0) or 0)
             if total_route_minutes > 0:
@@ -1129,10 +1653,7 @@ class InteractiveMapGenerator:
         customer = entry.get("customer")
         has_declared_window = bool(
             customer is not None
-            and (
-                getattr(customer, "time_window_start_minutes", None) is not None
-                or getattr(customer, "time_window_end_minutes", None) is not None
-            )
+            and customer_time_windows_minutes(customer)
         )
         if time_window_text and (has_declared_window or time_window_text != "Постоянно"):
             lines.append(f"<b>Работно време:</b> {html.escape(time_window_text)}")
@@ -1175,6 +1696,7 @@ class InteractiveMapGenerator:
         self,
         route: Route,
     ) -> Tuple[List[Tuple[float, float]], bool, str]:
+        route_valhalla_config = self._route_valhalla_config(route)
         route_depot = self._route_start_location(route)
         route_end = self._route_end_location(route)
         waypoints = [route_depot]
@@ -1186,16 +1708,18 @@ class InteractiveMapGenerator:
         if not route.customers:
             return waypoints, False, "Няма клиенти"
 
-        if not self.use_routing:
+        if not self.use_routing and route_valhalla_config is None:
             return waypoints, True, "Прави линии"
 
         engine_name = (
-            "Valhalla"
+            "Valhalla truck"
+            if route_valhalla_config is not None
+            else "Valhalla"
             if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value
             else "OSRM"
         )
         try:
-            route_geometry = self._get_full_route_geometry(waypoints)
+            route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
             if len(route_geometry) > 2:
                 return route_geometry, False, f"{engine_name} маршрут"
         except Exception as e:
@@ -1229,10 +1753,19 @@ class InteractiveMapGenerator:
         routes: List[Route],
         start_number: int = 1,
         include_start_in_customer_popups: bool = True,
+        all_routes: Optional[List[Route]] = None,
+        show_bus_ids: bool = True,
+        route_numbers: Optional[List[int]] = None,
     ) -> List[Dict[str, object]]:
         google_routes = []
+        numbering_routes = all_routes or routes
+        bus_colors = {}
         for route_idx, route in enumerate(routes):
-            route_number = start_number + route_idx
+            route_number = (
+                route_numbers[route_idx]
+                if route_numbers and route_idx < len(route_numbers)
+                else start_number + route_idx
+            )
             vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
                 "color": "gray",
                 "icon": "circle",
@@ -1240,7 +1773,30 @@ class InteractiveMapGenerator:
                 "name": "Неизвестен",
             })
             vehicle_name = _route_vehicle_name(route)
-            bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
+            course_suffix = _route_course_suffix(route, numbering_routes)
+            display_vehicle_name = f"{vehicle_name}{course_suffix}"
+            # ``show_bus_ids`` is enabled only for individual vehicle/course
+            # maps.  Keep their route number for course navigation, but do not
+            # expose the solver/order route number in overview-map popups.
+            customer_popup_title = (
+                f"Маршрут {route_number} - {display_vehicle_name}"
+                if show_bus_ids
+                else display_vehicle_name
+            )
+            route_popup_title = (
+                f"Автобус {route_number} - {display_vehicle_name}"
+                if show_bus_ids
+                else display_vehicle_name
+            )
+            bus_number = _format_output_bus_number(
+                self.config, route_number - 1, route, numbering_routes
+            )
+            # Colours still group courses of one physical vehicle, while the
+            # public output number remains unique per course.
+            physical_color_key = route_vehicle_key(route, route_number - 1)
+            if physical_color_key not in bus_colors:
+                bus_colors[physical_color_key] = BUS_COLORS[len(bus_colors) % len(BUS_COLORS)]
+            bus_color = bus_colors[physical_color_key]
             geometry, dashed, geometry_label = self._get_route_visual_geometry(route)
             schedule_by_index = self._route_schedule_by_index(route)
             route_start_time_text = self._route_start_time_text(route)
@@ -1255,20 +1811,29 @@ class InteractiveMapGenerator:
                 schedule_entry = schedule_by_index.get(client_number)
                 arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
                 departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
+                time_window_text = str(
+                    schedule_entry.get("time_window_text", "") if schedule_entry else ""
+                ).strip()
+                delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
+                has_time_window = self._customer_has_declared_time_window(customer)
+                has_comment = bool(delivery_comment)
+                popup_lines = [
+                    f"<b>Клиент:</b> {html.escape(str(customer.name))}",
+                    f"<b>ID:</b> {html.escape(str(customer.id))}",
+                    f"<b>Ред в маршрута:</b> #{client_number}",
+                    f"<b>Обем:</b> {customer.volume:.2f} ст.",
+                    f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
+                    *self._schedule_popup_lines(
+                        schedule_entry,
+                        include_start=include_start_in_customer_popups,
+                    ),
+                    self._popup_action_buttons(navigation_url, street_view_url),
+                ]
+                if show_bus_ids:
+                    popup_lines.insert(0, f"<b>ID бус:</b> {html.escape(str(bus_number))}")
                 popup_html = self._html_popup(
-                    f"Автобус {route_number} - {vehicle_name}",
-                    [
-                        f"<b>Клиент:</b> {html.escape(str(customer.name))}",
-                        f"<b>ID:</b> {html.escape(str(customer.id))}",
-                        f"<b>Ред в маршрута:</b> #{client_number}",
-                        f"<b>Обем:</b> {customer.volume:.2f} ст.",
-                        f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
-                        *self._schedule_popup_lines(
-                            schedule_entry,
-                            include_start=include_start_in_customer_popups,
-                        ),
-                        self._popup_action_buttons(navigation_url, street_view_url),
-                    ],
+                    customer_popup_title,
+                    popup_lines,
                     bus_color,
                 )
                 markers.append({
@@ -1284,25 +1849,65 @@ class InteractiveMapGenerator:
                     "routeStartTime": route_start_time_text,
                     "arrivalTime": arrival_time_text,
                     "departureTime": departure_time_text,
+                    "timeWindowText": time_window_text,
+                    "deliveryComment": delivery_comment,
+                    "quantity": _optional_finite_float(getattr(customer, "quantity", None)),
+                    "turnover": _optional_finite_float(getattr(customer, "turnover", None)),
+                    "hasTimeWindow": has_time_window,
+                    "hasComment": has_comment,
                 })
 
+            route_popup_lines = [
+                f"<b>{geometry_label}:</b> {'прави линии' if dashed else 'реална геометрия'}",
+                f"<b>Клиенти:</b> {len(route.customers)}",
+                f"<b>Разстояние:</b> {route.total_distance_km:.1f} км",
+                f"<b>Време:</b> {route.total_time_minutes:.0f} мин",
+                f"<b>Обем:</b> {route.total_volume:.1f} ст.",
+                f"<b>Геометрия:</b> {len(geometry)} точки",
+            ]
+            if course_suffix:
+                route_popup_lines.insert(0, f"<b>Курс:</b> {route_trip_number(route)}")
+            if show_bus_ids:
+                route_popup_lines.insert(0, f"<b>ID бус:</b> {html.escape(str(bus_number))}")
             popup_html = self._html_popup(
-                f"Автобус {route_number} - {vehicle_name}",
-                [
-                    f"<b>{geometry_label}:</b> {'прави линии' if dashed else 'реална геометрия'}",
-                    f"<b>Клиенти:</b> {len(route.customers)}",
-                    f"<b>Разстояние:</b> {route.total_distance_km:.1f} км",
-                    f"<b>Време:</b> {route.total_time_minutes:.0f} мин",
-                    f"<b>Обем:</b> {route.total_volume:.1f} ст.",
-                    f"<b>Геометрия:</b> {len(geometry)} точки",
-                ],
+                route_popup_title,
+                route_popup_lines,
                 bus_color,
             )
-            google_routes.append({
-                "id": f"route-{route_number}",
-                "name": f"{vehicle_name} ({len(route.customers)} клиента)",
+            # The common/overview map must not contain the solver route ID at
+            # all.  Individual maps keep it as internal metadata for course
+            # filters and Effect upload correlation.
+            stable_route_id = (
+                _map_route_identifier(route, route_number, numbering_routes)
+                if show_bus_ids
+                else ""
+            )
+            dom_route_id = (
+                re.sub(r"[^A-Za-z0-9_-]+", "-", stable_route_id).strip("-")
+                if stable_route_id
+                else ""
+            )
+            if show_bus_ids and course_suffix:
+                visible_route_name = (
+                    f"Курс {route_trip_number(route)} · № {bus_number} · "
+                    f"{vehicle_name} ({len(route.customers)} клиента)"
+                )
+            else:
+                visible_route_name = f"{display_vehicle_name} ({len(route.customers)} клиента)"
+            route_payload = {
+                "id": (
+                    f"route-{route_number}-{dom_route_id}"
+                    if dom_route_id
+                    else f"route-{route_number}"
+                ),
+                "name": visible_route_name,
                 "color": bus_color,
                 "vehicleName": vehicle_name,
+                "outputNumber": bus_number,
+                "tripNumber": route_trip_number(route),
+                "routeNumber": route_number,
+                "customerCount": len(route.customers),
+                "startPoint": self._google_route_start_point(route),
                 "routeStartTime": route_start_time_text,
                 "routeEndTime": self._route_end_time_text(route),
                 "markers": markers,
@@ -1314,8 +1919,31 @@ class InteractiveMapGenerator:
                 "volume": route.total_volume,
                 "googleSegments": self._build_google_route_segments(route),
                 "googleMissingCoords": len(route.customers) - len(markers),
-            })
+            }
+            if stable_route_id:
+                route_payload["vehicleKey"] = route_vehicle_key(route, route_number - 1)
+                route_payload["routeId"] = stable_route_id
+            google_routes.append(route_payload)
         return google_routes
+
+    def _should_show_route_start_marker(self, route: Route) -> bool:
+        return bool(getattr(route, "open_route", False) or getattr(route, "driver_id", ""))
+
+    def _google_route_start_point(self, route: Route) -> Optional[Dict[str, object]]:
+        if not self._should_show_route_start_marker(route):
+            return None
+        start = self._route_start_location(route)
+        if not start:
+            return None
+        driver_label = str(getattr(route, "driver_id", "") or _route_vehicle_name(route))
+        return {
+            "position": self._json_coords(start),
+            "title": "Начало",
+            "popup": self._html_popup("Начало", [
+                f"<b>Координати:</b> {start[0]:.6f}, {start[1]:.6f}",
+                f"<b>Шофьор:</b> {html.escape(driver_label)}",
+            ], "#188038"),
+        }
 
     def _depot_name(self, depot: Tuple[float, float]) -> str:
         locations = get_config().locations
@@ -1337,6 +1965,9 @@ class InteractiveMapGenerator:
         routes: List[Route],
         depot_locations: List[Tuple[float, float]],
         single_route_number: Optional[int] = None,
+        all_routes: Optional[List[Route]] = None,
+        route_numbers: Optional[List[int]] = None,
+        course_filter: bool = False,
     ) -> GoogleMapDocument:
         api_key = self._get_google_maps_api_key()
         if not api_key:
@@ -1365,21 +1996,28 @@ class InteractiveMapGenerator:
                 for depot in depot_locations
             ],
             "centerZone": None,
+            "trafficZones": self._traffic_zone_map_data(cfg.locations),
             "routes": self._build_google_routes(
                 routes,
                 route_start,
                 include_start_in_customer_popups=single_route_number is None,
+                all_routes=all_routes,
+                show_bus_ids=single_route_number is not None or course_filter,
+                route_numbers=route_numbers,
             ),
             "singleRouteNumber": single_route_number,
+            "courseFilter": course_filter,
             "totals": {
                 "distanceKm": sum(route.total_distance_km for route in routes),
-                "timeMin": sum(route.total_time_minutes for route in routes),
+                "timeMin": _total_elapsed_route_minutes(routes),
                 "volume": sum(route.total_volume for route in routes),
                 "routeCount": len(routes),
+                "vehicleCount": count_physical_vehicles(routes),
+                "courseCount": len(routes),
             },
         }
 
-        if get_center_zones(cfg.locations):
+        if _visible_center_zones(cfg.locations):
             map_data["centerZone"] = self._center_zone_map_data(cfg.locations)
 
         data_json = json.dumps(map_data, ensure_ascii=False)
@@ -1474,6 +2112,24 @@ class InteractiveMapGenerator:
     }}
     .route-row {{ display: flex; align-items: center; gap: 6px; margin: 4px 0; }}
     .swatch {{ width: 14px; height: 14px; display: inline-block; border-radius: 2px; }}
+    #route-filter.course-filter-control {{ width: 390px; max-width: calc(100vw - 42px); }}
+    .course-filter-title {{ font-size: 15px; font-weight: 700; margin-bottom: 7px; }}
+    .course-selector {{ padding-bottom: 7px; border-bottom: 1px solid #e1e6ee; }}
+    .course-selector-row {{ cursor: pointer; padding: 4px 2px; }}
+    .course-selector-label {{ font-weight: 700; font-size: 12px; overflow-wrap: anywhere; }}
+    .course-client-detail {{ padding-top: 8px; }}
+    .course-client-header {{ margin-bottom: 3px; }}
+    .course-output-number {{ color: #44546a; font-size: 12px; margin-bottom: 6px; }}
+    .course-client-row {{ align-items: start; border-top: 1px solid #ececec; padding: 7px 0; cursor: pointer; }}
+    .course-client-row:hover, .course-client-row:focus {{ background: #f4f7fb; outline: none; }}
+    .course-client-row-window {{ background: #ffe4e4; border: 1px solid #eaa6a6; border-radius: 6px; padding: 7px 5px; }}
+    .course-client-number {{ flex: 0 0 24px; width: 24px; height: 24px; border-radius: 50%; color: #fff; text-align: center; line-height: 24px; font-size: 11px; font-weight: 700; }}
+    .course-client-main {{ flex: 1; min-width: 0; }}
+    .course-client-name, .course-client-secondary, .course-client-arrival, .course-client-attention {{ display: block; overflow-wrap: anywhere; }}
+    .course-client-name {{ font-size: 12px; font-weight: 700; }}
+    .course-client-secondary {{ color: #666; font-size: 11px; margin-top: 2px; }}
+    .course-client-arrival {{ color: #188038; font-size: 11px; margin-top: 2px; }}
+    .course-client-attention {{ color: #9f2020; font-size: 11px; font-weight: 700; margin-top: 3px; }}
     .client-actions {{ display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }}
     .client-action {{
       display: inline-flex; align-items: center; justify-content: center; gap: 4px;
@@ -1607,6 +2263,26 @@ class InteractiveMapGenerator:
         }}
       }});
 
+      const trafficZones = MAP_DATA.trafficZones || [];
+      trafficZones.forEach((zone) => {{
+        const circle = new google.maps.Circle({{
+          map,
+          center: zone.center,
+          radius: zone.radiusMeters,
+          strokeColor: "#2563eb",
+          strokeOpacity: 0.85,
+          strokeWeight: 2,
+          fillColor: "#3b82f6",
+          fillOpacity: 0.07
+        }});
+        circle.addListener("click", (event) => {{
+          infoWindow.setContent(zone.popup);
+          infoWindow.setPosition(event.latLng || zone.center);
+          infoWindow.open(map);
+        }});
+        bounds.extend(zone.center);
+      }});
+
       MAP_DATA.routes.forEach((route) => {{
         const directionArrow = {{
           path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
@@ -1644,7 +2320,32 @@ class InteractiveMapGenerator:
           infoWindow.open(map);
         }});
 
+        let startMarker = null;
+        if (route.startPoint) {{
+          startMarker = new google.maps.Marker({{
+            position: route.startPoint.position,
+            map,
+            title: route.startPoint.title || "Начало",
+            label: {{ text: "S", color: "white", fontWeight: "bold" }},
+            zIndex: 10000,
+            icon: {{
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 14,
+              fillColor: "#188038",
+              fillOpacity: 1,
+              strokeColor: "#ffffff",
+              strokeWeight: 3
+            }}
+          }});
+          startMarker.addListener("click", () => infoWindow.setContent(route.startPoint.popup) || infoWindow.open(map, startMarker));
+          bounds.extend(route.startPoint.position);
+        }}
+
         const markerObjects = route.markers.map((point) => {{
+          const hasRouteAttention = Boolean((MAP_DATA.singleRouteNumber || MAP_DATA.courseFilter) && (point.hasTimeWindow || point.hasComment));
+          const markerStrokeColor = hasRouteAttention
+            ? (point.hasTimeWindow ? "#dc2626" : "#f59e0b")
+            : "#ffffff";
           const marker = new google.maps.Marker({{
             position: point.position,
             map,
@@ -1652,11 +2353,11 @@ class InteractiveMapGenerator:
             label: {{ text: String(point.number), color: "white", fontWeight: "bold" }},
             icon: {{
               path: google.maps.SymbolPath.CIRCLE,
-              scale: 13,
+              scale: hasRouteAttention ? 14 : 13,
               fillColor: route.color,
               fillOpacity: 1,
-              strokeColor: "#ffffff",
-              strokeWeight: 3
+              strokeColor: markerStrokeColor,
+              strokeWeight: hasRouteAttention ? 4 : 3
             }}
           }});
           marker.addListener("click", () => infoWindow.setContent(point.popup) || infoWindow.open(map, marker));
@@ -1668,7 +2369,8 @@ class InteractiveMapGenerator:
         routeObjects[route.id] = {{
           line,
           markers: markerObjects.map((item) => item.marker),
-          markerObjects
+          markerObjects,
+          startMarker
         }};
       }});
 
@@ -1693,6 +2395,9 @@ class InteractiveMapGenerator:
         <div>Общо време: ${{totals.timeMin.toFixed(0)}} мин</div>
         <div>Общ обем: ${{totals.volume.toFixed(1)}} ст.</div>
         <div>Маршрути: ${{totals.routeCount}}</div>
+        ${{totals.vehicleCount < totals.courseCount
+          ? `<div>Физически бусове: ${{totals.vehicleCount}}</div><div>Курсове: ${{totals.courseCount}}</div>`
+          : ""}}
       `;
     }}
 
@@ -1702,7 +2407,13 @@ class InteractiveMapGenerator:
         renderCustomerPanel(container, routeObjects, map);
         return;
       }}
-      container.innerHTML = "<b>Филтър на автобуси</b>";
+      if (MAP_DATA.courseFilter) {{
+        renderCourseCustomerPanel(container, routeObjects, map);
+        return;
+      }}
+      container.innerHTML = MAP_DATA.courseFilter
+        ? "<b>Филтър на курсове</b>"
+        : "<b>Филтър на автобуси</b>";
       MAP_DATA.routes.forEach((route) => {{
         const row = document.createElement("label");
         row.className = "route-row";
@@ -1723,8 +2434,139 @@ class InteractiveMapGenerator:
           const map = checkbox.checked ? objects.line.get("mapRef") : null;
           objects.line.setMap(map);
           objects.markers.forEach((marker) => marker.setMap(map));
+          if (objects.startMarker) objects.startMarker.setMap(map);
         }});
       }});
+    }}
+
+    function renderCourseCustomerPanel(container, routeObjects, map) {{
+      container.classList.add("course-filter-control");
+      container.innerHTML = `
+        <div class="course-filter-title">Курсове и клиенти</div>
+        <div class="course-selector"></div>
+        <div class="course-client-detail"></div>
+      `;
+      const selector = container.querySelector(".course-selector");
+      const detail = container.querySelector(".course-client-detail");
+
+      function setObjectsVisible(objects, visible) {{
+        objects.line.setMap(visible ? map : null);
+        objects.markers.forEach((marker) => marker.setMap(visible ? map : null));
+        if (objects.startMarker) objects.startMarker.setMap(visible ? map : null);
+      }}
+
+      function renderCourseClients(route) {{
+        const objects = routeObjects[route.id];
+        const routeTimeText = formatRouteDuration(route.timeMin);
+        const routeStartText = route.routeStartTime || (route.markers[0] && route.markers[0].routeStartTime) || "";
+        const routeEndText = route.routeEndTime || "";
+        const missingCoordinates = Number(route.googleMissingCoords || 0);
+        const missingCoordinatesHtml = missingCoordinates > 0
+          ? `<div class="google-segments-warning">${{missingCoordinates}} клиент(а) без GPS не могат да се покажат като пин.</div>`
+          : "";
+        detail.innerHTML = `
+          <div class="client-panel-header course-client-header">
+            <b>Курс ${{route.tripNumber}} · № ${{escapeHtml(route.outputNumber)}}</b>
+          </div>
+          <div class="course-output-number">ID бус/курс: <b>${{escapeHtml(route.outputNumber)}}</b></div>
+          <div class="client-route-stats">
+            <div class="client-route-stat"><span>Общо:</span><b>${{route.customerCount}} клиента</b></div>
+            <div class="client-route-stat"><span>Стекове:</span><b>${{formatStackNumber(route.volume)}}</b></div>
+            <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
+            <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
+            ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
+            ${{routeEndText ? '<div class="client-route-stat"><span>Край:</span><b>' + escapeHtml(routeEndText) + '</b></div>' : ''}}
+          </div>
+          ${{missingCoordinatesHtml}}
+          ${{renderGoogleSegments(route)}}
+          <div class="course-client-list"></div>
+        `;
+        const list = detail.querySelector(".course-client-list");
+        route.markers.forEach((point, index) => {{
+          const row = document.createElement("div");
+          row.className = "route-row course-client-row" + (point.hasTimeWindow ? " course-client-row-window" : "");
+          row.tabIndex = 0;
+          const quantityLine = point.quantity !== null && point.quantity !== undefined && point.quantity !== ""
+            ? `<span class="course-client-secondary">Количество: ${{Number(point.quantity).toFixed(2)}}</span>`
+            : "";
+          const turnoverLine = point.turnover !== null && point.turnover !== undefined && Number(point.turnover) !== 0
+            ? `<span class="course-client-secondary">Оборот: ${{Number(point.turnover).toFixed(2)}}</span>`
+            : "";
+          const arrivalLine = point.arrivalTime
+            ? `<span class="course-client-arrival">Пристигане: ${{escapeHtml(point.arrivalTime)}}</span>`
+            : "";
+          const departureLine = point.departureTime
+            ? `<span class="course-client-secondary">Тръгване: ${{escapeHtml(point.departureTime)}}</span>`
+            : "";
+          const windowLine = point.hasTimeWindow && point.timeWindowText
+            ? `<span class="course-client-attention">Работно време: ${{escapeHtml(point.timeWindowText)}}</span>`
+            : "";
+          const commentLine = point.deliveryComment
+            ? `<span class="course-client-attention">Коментар: ${{escapeHtml(point.deliveryComment)}}</span>`
+            : "";
+          row.innerHTML = `
+            <span class="swatch course-client-number" style="background:${{route.color}}">${{point.number}}</span>
+            <span class="course-client-main">
+              <span class="course-client-name">${{escapeHtml(point.customerName)}}</span>
+              <span class="course-client-secondary">ID: ${{escapeHtml(point.customerId)}} · ${{Number(point.volume).toFixed(2)}} ст.</span>
+              ${{quantityLine}}${{turnoverLine}}${{arrivalLine}}${{departureLine}}${{windowLine}}${{commentLine}}
+            </span>
+            <span class="client-actions">
+              <a class="client-action client-nav" href="${{escapeHtml(point.navigationUrl)}}" target="_blank" rel="noopener">Навигация</a>
+              <a class="client-action client-street" href="${{escapeHtml(point.streetViewUrl)}}" target="_blank" rel="noopener">
+                <span class="pegman-icon" aria-hidden="true"></span><span>Street View</span>
+              </a>
+            </span>
+          `;
+          function openPoint(event) {{
+            if (event && event.target.closest("a")) return;
+            if (event && event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+            if (event && event.type === "keydown") event.preventDefault();
+            const marker = objects.markerObjects[index].marker;
+            map.panTo(marker.getPosition());
+            map.setZoom(Math.max(map.getZoom(), 15));
+            infoWindow.setContent(point.popup);
+            infoWindow.open(map, marker);
+          }}
+          row.addEventListener("click", openPoint);
+          row.addEventListener("keydown", openPoint);
+          list.appendChild(row);
+        }});
+      }}
+
+      function activateCourse(routeId, fitRoute) {{
+        const route = MAP_DATA.routes.find((item) => item.id === routeId);
+        if (!route) return;
+        MAP_DATA.routes.forEach((candidate) => {{
+          setObjectsVisible(routeObjects[candidate.id], candidate.id === routeId);
+        }});
+        const radio = selector.querySelector(`input[data-route="${{routeId}}"]`);
+        if (radio) radio.checked = true;
+        infoWindow.close();
+        renderCourseClients(route);
+        if (fitRoute) {{
+          const courseBounds = new google.maps.LatLngBounds();
+          route.path.forEach((point) => courseBounds.extend(point));
+          route.markers.forEach((point) => courseBounds.extend(point.position));
+          if (route.startPoint) courseBounds.extend(route.startPoint.position);
+          if (!courseBounds.isEmpty()) map.fitBounds(courseBounds, 40);
+        }}
+      }}
+
+      MAP_DATA.routes.forEach((route, index) => {{
+        const row = document.createElement("label");
+        row.className = "route-row course-selector-row";
+        row.innerHTML = `
+          <input type="radio" name="active-course" data-route="${{route.id}}" ${{index === 0 ? "checked" : ""}}>
+          <span class="swatch" style="background:${{route.color}}"></span>
+          <span class="course-selector-label">Курс ${{route.tripNumber}} · № ${{escapeHtml(route.outputNumber)}} · Маршрут ${{route.routeNumber}}</span>
+        `;
+        selector.appendChild(row);
+      }});
+      selector.querySelectorAll('input[name="active-course"]').forEach((radio) => {{
+        radio.addEventListener("change", () => activateCourse(radio.dataset.route, true));
+      }});
+      if (MAP_DATA.routes.length) activateCourse(MAP_DATA.routes[0].id, true);
     }}
 
     function renderCoordinateSearch(map) {{
@@ -1779,10 +2621,10 @@ class InteractiveMapGenerator:
         const points = [];
         const invalidLines = [];
         const lines = String(text || "").split(/\\r?\\n/);
-        const coordinatePattern = /(-?\d+(?:[.,]\d+)?)\s*,\s*(-?\d+(?:[.,]\d+)?)/;
+        const coordinatePattern = /(-?\\d+(?:[.,]\\d+)?)\\s*,\\s*(-?\\d+(?:[.,]\\d+)?)/;
 
         function cleanSideText(value) {{
-          return String(value || "").replace(/^[\s,;|]+|[\s,;|]+$/g, "").trim();
+          return String(value || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "").trim();
         }}
 
         lines.forEach((line, index) => {{
@@ -1894,6 +2736,13 @@ class InteractiveMapGenerator:
         : number.toFixed(1);
     }}
 
+    function formatStackNumber(value) {{
+      const number = Number(value) || 0;
+      const fixed = number.toFixed(2);
+      if (fixed.endsWith(".00")) return number.toFixed(1);
+      return fixed.replace(/0$/, "");
+    }}
+
     function escapeHtml(value) {{
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
         "&": "&amp;",
@@ -1953,7 +2802,7 @@ class InteractiveMapGenerator:
           </div>
           <div class="client-route-stats">
             <div class="client-route-stat"><span>Общо:</span><b>${{route.markers.length}} клиента</b></div>
-            <div class="client-route-stat"><span>Стекове:</span><b>${{formatRouteNumber(route.volume)}}</b></div>
+            <div class="client-route-stat"><span>Стекове:</span><b>${{formatStackNumber(route.volume)}}</b></div>
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
             ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
@@ -2031,10 +2880,11 @@ class InteractiveMapGenerator:
             logger.warning("📐 Използвам прави линии (Routing engine недостъпен)")
             
         # Взимаме всички уникални депа от маршрутите
+        display_routes = order_routes_for_output(solution.routes)
         unique_depots = {depot_location}  # Добавяме основното депо
         
         # Добавяме депата от маршрутите
-        for route in solution.routes:
+        for route in display_routes:
             if hasattr(route, 'depot_location') and route.depot_location:
                 unique_depots.add(route.depot_location)
             route_end = getattr(route, "end_location", None)
@@ -2045,7 +2895,7 @@ class InteractiveMapGenerator:
             return self._build_google_html(
                 "Интерактивна карта",
                 depot_location,
-                solution.routes,
+                display_routes,
                 list(unique_depots),
             )
         
@@ -2058,18 +2908,20 @@ class InteractiveMapGenerator:
         # Добавяне на център зоната
         from config import get_config
         locations = get_config().locations
-        if get_center_zones(locations):
+        if _visible_center_zones(locations):
             self._add_center_zone_shape(route_map, locations)
+        if _visible_traffic_zones(locations):
+            self._add_traffic_zone_shapes(route_map, locations)
 
         # Добавяне на маршрутите с OSRM геометрия
         if self.config.show_route_colors:
-            self._add_routes_to_map(route_map, solution.routes)
+            self._add_routes_to_map(route_map, display_routes)
 
         # GPS търсачка за временни пинове в общата карта
         self._add_coordinate_pin_search(route_map)
 
         # Добавяне на легенда
-        self._add_legend(route_map, solution.routes)
+        self._add_legend(route_map, display_routes)
 
         return route_map
     
@@ -2090,6 +2942,30 @@ class InteractiveMapGenerator:
         """Добавя маркер за едно депо (поддържа се за обратна съвместимост)"""
         self._add_depot_markers(route_map, [depot_location])
     
+    def _add_route_start_marker(self, route_map: folium.Map, route: Route, start_location: Optional[Tuple[float, float]] = None):
+        if not self._should_show_route_start_marker(route):
+            return
+        start = start_location or self._route_start_location(route)
+        if not start:
+            return
+        driver_label = html.escape(str(getattr(route, "driver_id", "") or _route_vehicle_name(route)))
+        popup_html = (
+            "<b>Начало</b><br>"
+            f"Координати: {start[0]:.6f}, {start[1]:.6f}<br>"
+            f"Шофьор: {driver_label}"
+        )
+        folium.CircleMarker(
+            location=start,
+            radius=10,
+            color="#ffffff",
+            weight=3,
+            fill=True,
+            fill_color="#188038",
+            fill_opacity=1,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip="Начало",
+        ).add_to(route_map)
+
     def _add_center_zone_circle(self, route_map: folium.Map, center_location: Tuple[float, float], radius_km: float):
         """Добавя кръг за център зоната"""
         folium.Circle(
@@ -2113,7 +2989,7 @@ class InteractiveMapGenerator:
 
     def _add_center_zone_shape(self, route_map: folium.Map, locations):
         colors = ["red", "darkred", "purple", "green", "orange"]
-        for index, zone in enumerate(get_center_zones(locations)):
+        for index, zone in enumerate(_visible_center_zones(locations)):
             color = colors[index % len(colors)]
             name = str(getattr(zone, "name", "Център зона") or "Център зона")
             polygon = getattr(zone, "polygon", []) or []
@@ -2155,6 +3031,30 @@ class InteractiveMapGenerator:
                     icon=folium.Icon(color=color, icon="star"),
                     tooltip=name,
                 ).add_to(route_map)
+
+    def _add_traffic_zone_shapes(self, route_map: folium.Map, locations):
+        for zone in _visible_traffic_zones(locations):
+            center = getattr(zone, "center_coords", None)
+            if not center:
+                continue
+            name = str(getattr(zone, "name", "Traffic zone") or "Traffic zone")
+            radius_km = float(getattr(zone, "radius_km", 0) or 0)
+            multiplier = float(getattr(zone, "duration_multiplier", 1.0) or 1.0)
+            folium.Circle(
+                location=center,
+                radius=radius_km * 1000,
+                color="#2563eb",
+                weight=2,
+                dash_array="8 6",
+                fill=True,
+                fill_color="#3b82f6",
+                fill_opacity=0.07,
+                popup=(
+                    f"<b>{html.escape(name)}</b><br>"
+                    f"Traffic multiplier: {multiplier:g}×"
+                ),
+                tooltip=name,
+            ).add_to(route_map)
     
     def _get_osrm_route_geometry(self, start_coords: Tuple[float, float],
                                 end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
@@ -2196,15 +3096,26 @@ class InteractiveMapGenerator:
             # Fallback към права линия
             return [start_coords, end_coords]
     
+    def _route_valhalla_config(self, route: Optional[Route]):
+        return getattr(route, "tsp_valhalla_config", None) if route is not None else None
+
+    def _valhalla_costing_options(self, valhalla_config) -> dict:
+        try:
+            from valhalla_client import build_valhalla_costing_options
+            return build_valhalla_costing_options(valhalla_config)
+        except Exception:
+            return {}
+
     def _get_valhalla_route_geometry(self, start_coords: Tuple[float, float],
-                                     end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
+                                     end_coords: Tuple[float, float],
+                                     valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава реална геометрия на маршрута от Valhalla Route API"""
         try:
             import requests
             import json
             from config import get_config
             
-            valhalla_config = get_config().valhalla
+            valhalla_config = valhalla_config or get_config().valhalla
             base_url = valhalla_config.base_url.rstrip('/')
             
             # Valhalla Route API заявка
@@ -2218,6 +3129,7 @@ class InteractiveMapGenerator:
                     "units": "kilometers"
                 }
             }
+            route_request.update(self._valhalla_costing_options(valhalla_config))
             
             route_url = f"{base_url}/route"
             response = requests.post(route_url, json=route_request, timeout=10)
@@ -2271,14 +3183,15 @@ class InteractiveMapGenerator:
         return decoded
     
     def _get_route_geometry(self, start_coords: Tuple[float, float],
-                           end_coords: Tuple[float, float]) -> List[Tuple[float, float]]:
+                           end_coords: Tuple[float, float],
+                           valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава геометрия на маршрута от избрания routing engine"""
-        if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value:
-            return self._get_valhalla_route_geometry(start_coords, end_coords)
+        if valhalla_config is not None or (self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value):
+            return self._get_valhalla_route_geometry(start_coords, end_coords, valhalla_config=valhalla_config)
         else:
             return self._get_osrm_route_geometry(start_coords, end_coords)
     
-    def _get_full_route_geometry(self, waypoints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _get_full_route_geometry(self, waypoints: List[Tuple[float, float]], valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава пълната геометрия за маршрут с множество точки.
         Ако има твърде много точки, използваме fallback за по-бърза работа.
         """
@@ -2294,7 +3207,7 @@ class InteractiveMapGenerator:
             full_geometry = []
             for i in range(len(waypoints) - 1):
                 # За всеки сегмент взимаме геометрията (или права линия при грешка)
-                segment_geometry = self._get_route_geometry(waypoints[i], waypoints[i+1])
+                segment_geometry = self._get_route_geometry(waypoints[i], waypoints[i+1], valhalla_config=valhalla_config)
                 if i > 0:
                     # Премахваме първата точка, за да няма дублиране
                     segment_geometry = segment_geometry[1:]
@@ -2302,19 +3215,19 @@ class InteractiveMapGenerator:
             return full_geometry
 
         # Използваме подходящия routing engine
-        if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value:
-            return self._get_full_route_geometry_valhalla(waypoints)
+        if valhalla_config is not None or (self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value):
+            return self._get_full_route_geometry_valhalla(waypoints, valhalla_config=valhalla_config)
         else:
             return self._get_full_route_geometry_osrm(waypoints)
     
-    def _get_full_route_geometry_valhalla(self, waypoints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _get_full_route_geometry_valhalla(self, waypoints: List[Tuple[float, float]], valhalla_config=None) -> List[Tuple[float, float]]:
         """Получава пълната геометрия за маршрут с множество точки от Valhalla."""
         try:
             import requests
             import json
             from config import get_config
             
-            valhalla_config = get_config().valhalla
+            valhalla_config = valhalla_config or get_config().valhalla
             base_url = valhalla_config.base_url.rstrip('/')
             
             # Форматираме locations за Valhalla
@@ -2327,6 +3240,7 @@ class InteractiveMapGenerator:
                     "units": "kilometers"
                 }
             }
+            route_request.update(self._valhalla_costing_options(valhalla_config))
             
             route_url = f"{base_url}/route"
             response = requests.post(route_url, json=route_request, timeout=30)
@@ -2356,7 +3270,7 @@ class InteractiveMapGenerator:
             # Fallback към последователност от сегменти
             full_geometry = []
             for i in range(len(waypoints) - 1):
-                segment = self._get_valhalla_route_geometry(waypoints[i], waypoints[i + 1])
+                segment = self._get_valhalla_route_geometry(waypoints[i], waypoints[i + 1], valhalla_config=valhalla_config)
                 if i == 0:
                     full_geometry.extend(segment)
                 else:
@@ -2410,12 +3324,27 @@ class InteractiveMapGenerator:
             
             return full_geometry if full_geometry else waypoints
     
-    def _add_routes_to_map(self, route_map: folium.Map, routes: List[Route]):
+    def _add_routes_to_map(
+        self,
+        route_map: folium.Map,
+        routes: List[Route],
+        route_numbers: Optional[List[int]] = None,
+        all_routes: Optional[List[Route]] = None,
+        add_layer_control: bool = True,
+    ):
         """Добавя маршрутите на картата с OSRM геометрия и филтър за бусовете"""
         # Създаваме FeatureGroup за всеки автобус
         bus_layers = {}
+        course_panel_routes = []
+        physical_colors = {}
+        numbering_routes = all_routes or routes
         
         for route_idx, route in enumerate(routes):
+            route_number = (
+                route_numbers[route_idx]
+                if route_numbers and route_idx < len(route_numbers)
+                else route_idx + 1
+            )
             vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
                 'color': 'gray', 
                 'icon': 'circle',
@@ -2423,23 +3352,59 @@ class InteractiveMapGenerator:
                 'name': 'Неизвестен'
             })
             vehicle_name = _route_vehicle_name(route)
+            course_suffix = _route_course_suffix(route, numbering_routes)
+            display_vehicle_name = f"{vehicle_name}{course_suffix}"
+            # ``route_numbers`` is passed only by individual vehicle maps.
+            # Overview-map popups deliberately omit the route ordinal while
+            # individual maps retain it for course identification.
+            popup_route_title = (
+                f"Маршрут {route_number} - {display_vehicle_name}"
+                if route_numbers
+                else display_vehicle_name
+            )
+            popup_route_title_with_icon = f"🚌 {popup_route_title}"
+            bus_number = _format_output_bus_number(
+                self.config, route_number - 1, route, numbering_routes
+            )
+            stable_route_id = (
+                _map_route_identifier(route, route_number, numbering_routes)
+                if route_numbers
+                else ""
+            )
             
             # Всеки автобус получава уникален цвят
-            bus_color = BUS_COLORS[route_idx % len(BUS_COLORS)]
-            bus_id = f"bus_{route_idx + 1}"
+            physical_color_key = route_vehicle_key(route, route_number - 1)
+            if physical_color_key not in physical_colors:
+                physical_colors[physical_color_key] = BUS_COLORS[len(physical_colors) % len(BUS_COLORS)]
+            bus_color = physical_colors[physical_color_key]
+            bus_id = (
+                f"route_{route_number}_{stable_route_id}"
+                if stable_route_id
+                else f"route_{route_number}"
+            )
             
             # Създаваме FeatureGroup за този автобус.
             # LayerControl приема HTML, затова оцветяваме името със същия цвят като линията.
-            safe_vehicle_name = html.escape(str(vehicle_name))
+            safe_vehicle_name = html.escape(str(display_vehicle_name))
             safe_bus_color = html.escape(str(bus_color), quote=True)
+            if route_numbers:
+                layer_label = (
+                    f'🚌 Курс {route_trip_number(route)} · № {html.escape(str(bus_number))} · '
+                    f'{html.escape(str(vehicle_name))} ({len(route.customers)} клиента)'
+                )
+            else:
+                layer_label = (
+                    f'🚌 {safe_vehicle_name} - {html.escape(str(bus_number))} '
+                    f'({len(route.customers)} клиента)'
+                )
             bus_layer_name = (
                 f'<span style="color:{safe_bus_color};font-weight:700;">'
-                f'🚌 {safe_vehicle_name} ({len(route.customers)} клиента)'
-                '</span>'
+                f'{layer_label}</span>'
             )
             bus_layer = folium.FeatureGroup(name=bus_layer_name)
             bus_layers[bus_id] = bus_layer
             schedule_by_index = self._route_schedule_by_index(route)
+            marker_entries = []
             
             # Добавяне на клиентските маркери с номерация
             for client_idx, customer in enumerate(route.customers):
@@ -2472,7 +3437,7 @@ class InteractiveMapGenerator:
                     popup_text = f"""
                     <div style="font-family: Arial, sans-serif;">
                         <h4 style="margin: 0; color: {bus_color};">
-                            Автобус {route_idx + 1} - {vehicle_name}
+                            {popup_route_title}
                         </h4>
                         <hr style="margin: 5px 0;">
                         <b>Клиент:</b> {customer.name}<br>
@@ -2498,11 +3463,32 @@ class InteractiveMapGenerator:
                         )
                     )
                     marker.add_to(bus_layer)
+                    marker_entries.append({
+                        "marker_name": marker.get_name(),
+                        "number": client_number,
+                        "name": customer.name,
+                        "id": customer.id,
+                        "volume": customer.volume,
+                        "lat": customer.coordinates[0],
+                        "lng": customer.coordinates[1],
+                        "navigation_url": navigation_url,
+                        "street_view_url": street_view_url,
+                        "arrival_time": self._schedule_entry_text(schedule_entry, "arrival"),
+                        "departure_time": self._schedule_entry_text(schedule_entry, "departure"),
+                        "time_window_text": str(
+                            schedule_entry.get("time_window_text", "") if schedule_entry else ""
+                        ).strip(),
+                        "has_time_window": self._customer_has_declared_time_window(customer),
+                        "delivery_comment": str(getattr(customer, "delivery_comment", "") or "").strip(),
+                        "quantity": _optional_finite_float(getattr(customer, "quantity", None)),
+                        "turnover": _optional_finite_float(getattr(customer, "turnover", None)),
+                    })
             
             # Създаваме пълния маршрут: депо -> клиенти -> депо
-            if route.customers and self.use_routing:
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
-                logger.info(f"🛣️ Получавам {engine_name} маршрут за Автобус {route_idx + 1} с {len(route.customers)} клиента")
+            route_valhalla_config = self._route_valhalla_config(route)
+            if route.customers and (self.use_routing or route_valhalla_config is not None):
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+                logger.info(f"🛣️ Получавам {engine_name} маршрут {route_number} с {len(route.customers)} клиента")
                 
                 # Използваме старт/край от самия маршрут.
                 route_depot = self._route_start_location(route)
@@ -2516,18 +3502,18 @@ class InteractiveMapGenerator:
                 waypoints.append(route_end)
                 
                 # Определяме името на routing engine
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 
                 # Получаваме реалната геометрия
                 try:
-                    route_geometry = self._get_full_route_geometry(waypoints)
+                    route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
                     
                     if len(route_geometry) > 2:
                         # Създаваме popup с информация за маршрута
                         popup_text = f"""
                         <div style="font-family: Arial, sans-serif;">
                             <h4 style="margin: 0; color: {bus_color};">
-                                🚌 Автобус {route_idx + 1} - {vehicle_name}
+                                {popup_route_title_with_icon}
                             </h4>
                             <hr style="margin: 5px 0;">
                             <b>{engine_name} маршрут:</b> ✅<br>
@@ -2549,13 +3535,13 @@ class InteractiveMapGenerator:
                         )
                         polyline.add_to(bus_layer)
                         self._add_direction_arrows(polyline, bus_layer, bus_color)
-                        logger.info(f"✅ {engine_name} маршрут добавен за Автобус {route_idx + 1}: {len(route_geometry)} точки")
+                        logger.info(f"✅ {engine_name} маршрут {route_number} е добавен: {len(route_geometry)} точки")
                     else:
                         # Fallback към прави линии
                         popup_text = f"""
                         <div style="font-family: Arial, sans-serif;">
                             <h4 style="margin: 0; color: {bus_color};">
-                                🚌 Автобус {route_idx + 1} - {vehicle_name}
+                                {popup_route_title_with_icon}
                             </h4>
                             <hr style="margin: 5px 0;">
                             <b>{engine_name} маршрут:</b> ⚠️ (прави линии)<br>
@@ -2576,10 +3562,10 @@ class InteractiveMapGenerator:
                         )
                         polyline.add_to(bus_layer)
                         self._add_direction_arrows(polyline, bus_layer, bus_color)
-                        logger.warning(f"⚠️ Използвам прави линии за Автобус {route_idx + 1}")
+                        logger.warning(f"⚠️ Използвам прави линии за маршрут {route_number}")
                         
                 except Exception as e:
-                    logger.error(f"❌ Грешка при {engine_name} маршрут за Автобус {route_idx + 1}: {e}")
+                    logger.error(f"❌ Грешка при {engine_name} маршрут {route_number}: {e}")
                     # Fallback към прави линии
                     route_depot = self._route_start_location(route)
                     route_end = self._route_end_location(route, route_depot)
@@ -2592,7 +3578,7 @@ class InteractiveMapGenerator:
                     popup_text = f"""
                     <div style="font-family: Arial, sans-serif;">
                         <h4 style="margin: 0; color: {bus_color};">
-                            🚌 Автобус {route_idx + 1} - {vehicle_name}
+                            {popup_route_title_with_icon}
                         </h4>
                         <hr style="margin: 5px 0;">
                         <b>{engine_name} маршрут:</b> ❌ (fallback)<br>
@@ -2629,29 +3615,55 @@ class InteractiveMapGenerator:
                     color=bus_color,
                     weight=3,
                     opacity=0.8,
-                    popup=f"🚌 Автобус {route_idx + 1} - {vehicle_name}"
+                    popup=popup_route_title_with_icon
                 )
                 polyline.add_to(bus_layer)
                 self._add_direction_arrows(polyline, bus_layer, bus_color)
+
+            course_panel_routes.append({
+                "route": route,
+                "route_number": route_number,
+                "route_id": stable_route_id,
+                "trip_number": route_trip_number(route),
+                "output_number": bus_number,
+                "color": bus_color,
+                "layer_name": bus_layer.get_name(),
+                "marker_entries": marker_entries,
+                "missing_coordinates": len(route.customers) - len(marker_entries),
+            })
         
         # Добавяме всички слоеве на автобусите към картата
         for bus_layer in bus_layers.values():
             bus_layer.add_to(route_map)
         
         # Добавяме LayerControl за филтър
-        folium.LayerControl(
-            position='topright',
-            collapsed=True,
-            overlay=True,
-            control=True
-                ).add_to(route_map)
+        if add_layer_control:
+            folium.LayerControl(
+                position='topright',
+                collapsed=True,
+                overlay=True,
+                control=True
+            ).add_to(route_map)
+        return course_panel_routes
     
-    def _add_legend(self, route_map: folium.Map, routes: List[Route]):
+    def _add_legend(
+        self,
+        route_map: folium.Map,
+        routes: List[Route],
+        course_filter: bool = False,
+    ):
         """Добавя легенда на картата с информация за маршрутите"""
         # Изчисляваме статистики
         total_distance = sum(route.total_distance_km for route in routes)
-        total_time = sum(route.total_time_minutes for route in routes)
+        total_time = _total_elapsed_route_minutes(routes)
         total_volume = sum(route.total_volume for route in routes)
+        physical_vehicle_count = count_physical_vehicles(routes)
+        course_totals_html = ""
+        if physical_vehicle_count < len(routes):
+            course_totals_html = (
+                f"• Физически бусове: {physical_vehicle_count}<br>"
+                f"• Курсове: {len(routes)}<br>"
+            )
         routed_count = sum(1 for route in routes if self.use_routing)
         
         legend_html = f'''
@@ -2672,11 +3684,17 @@ class InteractiveMapGenerator:
         '''
         
         # Добавяме информация за филтъра
-        legend_html += '''
+        filter_title = "Филтър на курсове" if course_filter else "Филтър на автобуси"
+        filter_instruction = (
+            "Използвай контрола в горния десен ъгъл за показване/скриване на отделен курс"
+            if course_filter
+            else "Използвай контрола в горния десен ъгъл за показване/скриване на отделни автобуси"
+        )
+        legend_html += f'''
         <hr style="margin: 10px 0;">
-        <p style="margin: 5px 0; font-weight: bold;">🚌 Филтър на автобуси:</p>
+        <p style="margin: 5px 0; font-weight: bold;">🚌 {filter_title}:</p>
         <p style="margin: 5px 0; font-size: 12px; color: #666;">
-            Използвай контрола в горния десен ъгъл за показване/скриване на отделни автобуси
+            {filter_instruction}
             </p>
             '''
         
@@ -2705,6 +3723,7 @@ class InteractiveMapGenerator:
             • Общо разстояние: {total_distance:.1f} км<br>
             • Общо време: {total_time:.0f} мин<br>
             • Общ обем: {total_volume:.1f} ст.<br>
+            {course_totals_html}
             • Маршрути с геометрия: {routed_count}/{len(routes)}
         </p>
         </div>
@@ -2965,6 +3984,12 @@ class InteractiveMapGenerator:
             return str(int(round(number)))
         return f"{number:.1f}"
 
+    def _format_stack_number(self, value: float) -> str:
+        text = f"{float(value or 0):.2f}"
+        if text.endswith(".00"):
+            return f"{text[:-3]}.0"
+        return text.rstrip("0")
+
     def _route_stats_html(self, route: Route) -> str:
         start_time = self._route_start_time_text(route)
         end_time = self._route_end_time_text(route)
@@ -2978,12 +4003,23 @@ class InteractiveMapGenerator:
             if end_time
             else ""
         )
+        total_turnover = getattr(route, "total_turnover", None)
+        turnover_html = ""
+        try:
+            if total_turnover not in (None, "") and float(total_turnover or 0) != 0:
+                turnover_html = (
+                    f'<div class="route-client-stat"><span>Оборот:</span>'
+                    f'<b>{self._format_route_number(float(total_turnover))}</b></div>'
+                )
+        except (TypeError, ValueError):
+            turnover_html = ""
         return f'''
             <div class="route-client-stats">
                 <div class="route-client-stat"><span>Общо:</span><b>{len(route.customers)} клиента</b></div>
-                <div class="route-client-stat"><span>Стекове:</span><b>{self._format_route_number(route.total_volume)}</b></div>
+                <div class="route-client-stat"><span>Стекове:</span><b>{self._format_stack_number(route.total_volume)}</b></div>
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
+                {turnover_html}
                 {start_html}
                 {end_html}
             </div>
@@ -3307,6 +4343,20 @@ class InteractiveMapGenerator:
             arrival_time = html.escape(str(entry.get("arrival_time", "") or ""))
             time_window_text = html.escape(str(entry.get("time_window_text", "") or ""))
             delivery_comment = html.escape(str(entry.get("delivery_comment", "") or ""))
+            quantity_text = ""
+            turnover_text = ""
+            try:
+                quantity_raw = entry.get("quantity")
+                if quantity_raw not in (None, ""):
+                    quantity_text = f" &middot; Количество: {float(quantity_raw):.2f}"
+            except (TypeError, ValueError):
+                quantity_text = ""
+            try:
+                turnover_raw = entry.get("turnover")
+                if turnover_raw not in (None, "") and float(turnover_raw or 0) != 0:
+                    turnover_text = f'<div class="route-client-turnover">Оборот: {float(turnover_raw):.2f}</div>'
+            except (TypeError, ValueError):
+                turnover_text = ""
             has_time_window = bool(entry.get("has_time_window"))
             card_extra_class = " route-client-card-time-window" if has_time_window else ""
             time_html = ""
@@ -3328,8 +4378,9 @@ class InteractiveMapGenerator:
                     <div class="route-client-number" style="background:{safe_color}">{number}</div>
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
-                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.</div>
+                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.{quantity_text}</div>
                         {time_html}
+                        {turnover_text}
                         {time_window_html}
                         {comment_html}
                     </div>
@@ -3495,6 +4546,12 @@ class InteractiveMapGenerator:
                 margin-top: 2px;
                 line-height: 1.25;
             }
+            .route-client-turnover {
+                font-size: 11px;
+                color: #44546a;
+                margin-top: 2px;
+                line-height: 1.25;
+            }
             .route-client-window {
                 font-size: 11px;
                 color: #9f2020;
@@ -3565,6 +4622,154 @@ class InteractiveMapGenerator:
             }
         '''
         route_map.add_child(SingleRouteCustomerPanel(panel_html, panel_data, panel_css))
+
+    def _add_multi_course_customer_control(
+        self,
+        route_map: folium.Map,
+        course_routes: List[Dict[str, object]],
+    ) -> None:
+        """Add one selector/customer control for a grouped physical-vehicle map."""
+        courses = []
+        for course in course_routes:
+            route = course["route"]
+            route_number = int(course["route_number"])
+            trip_number = int(course["trip_number"])
+            output_number = str(course["output_number"])
+            color = str(course["color"])
+            safe_color = html.escape(color, quote=True)
+            rows = []
+            clients = []
+            for client_index, entry in enumerate(course["marker_entries"]):
+                name = html.escape(str(entry["name"]))
+                customer_id = html.escape(str(entry["id"]))
+                nav_url = html.escape(str(entry["navigation_url"]), quote=True)
+                street_url = html.escape(str(entry["street_view_url"]), quote=True)
+                arrival = html.escape(str(entry.get("arrival_time", "") or ""))
+                departure = html.escape(str(entry.get("departure_time", "") or ""))
+                time_window = html.escape(str(entry.get("time_window_text", "") or ""))
+                comment = html.escape(str(entry.get("delivery_comment", "") or ""))
+                quantity = _optional_finite_float(entry.get("quantity"))
+                turnover = _optional_finite_float(entry.get("turnover"))
+                secondary = [f'ID: {customer_id} · {float(entry["volume"]):.2f} ст.']
+                if quantity is not None:
+                    secondary.append(f"Количество: {quantity:.2f}")
+                detail_lines = []
+                if turnover not in (None, 0):
+                    detail_lines.append(f'<span class="multi-course-client-secondary">Оборот: {turnover:.2f}</span>')
+                if arrival:
+                    detail_lines.append(f'<span class="multi-course-client-arrival">Пристигане: {arrival}</span>')
+                if departure:
+                    detail_lines.append(f'<span class="multi-course-client-secondary">Тръгване: {departure}</span>')
+                if entry.get("has_time_window") and time_window:
+                    detail_lines.append(f'<span class="multi-course-client-attention">Работно време: {time_window}</span>')
+                if comment:
+                    detail_lines.append(f'<span class="multi-course-client-attention">Коментар: {comment}</span>')
+                attention_class = " multi-course-client-card-window" if entry.get("has_time_window") else ""
+                rows.append(f'''
+                    <div class="multi-course-client-card{attention_class}" role="button" tabindex="0" data-client-index="{client_index}">
+                        <span class="multi-course-client-number" style="background:{safe_color}">{int(entry["number"])}</span>
+                        <span class="multi-course-client-main">
+                            <span class="multi-course-client-name">{name}</span>
+                            <span class="multi-course-client-secondary">{' · '.join(secondary)}</span>
+                            {''.join(detail_lines)}
+                        </span>
+                        <span class="multi-course-client-actions">
+                            <a class="multi-course-client-nav" href="{nav_url}" target="_blank" rel="noopener">Навигация</a>
+                            <a class="multi-course-client-street" href="{street_url}" target="_blank" rel="noopener">
+                                <span class="multi-course-client-street-icon" aria-hidden="true"></span>Street View
+                            </a>
+                        </span>
+                    </div>
+                ''')
+                clients.append({
+                    "markerName": entry["marker_name"],
+                    "lat": float(entry["lat"]),
+                    "lng": float(entry["lng"]),
+                })
+
+            segment_rows = []
+            for segment in self._build_google_route_segments(route):
+                segment_rows.append(
+                    '<div class="multi-course-google-row">'
+                    f'<span><b>{html.escape(str(segment["label"]))}</b><br>'
+                    f'<small>{html.escape(str(segment.get("description", "")))}</small></span>'
+                    f'<a href="{html.escape(str(segment["url"]), quote=True)}" target="_blank" rel="noopener">Отвори</a>'
+                    '</div>'
+                )
+            google_html = (
+                '<div class="multi-course-google"><b>Google Maps</b>'
+                + ''.join(segment_rows)
+                + '</div>'
+                if segment_rows
+                else ""
+            )
+            missing = int(course.get("missing_coordinates", 0) or 0)
+            missing_html = (
+                f'<div class="multi-course-missing">{missing} клиент(а) без GPS не могат да се покажат като пин.</div>'
+                if missing
+                else ""
+            )
+            empty_html = '<div class="multi-course-empty">Няма клиенти с валидни GPS координати.</div>' if not rows else ""
+            panel_html = f'''
+                <div class="multi-course-detail-header">
+                    <b>Курс {trip_number} · № {html.escape(output_number)}</b>
+                    <span>Маршрут {route_number}</span>
+                </div>
+                {self._route_stats_html(route)}
+                {missing_html}
+                {google_html}
+                {''.join(rows)}
+                {empty_html}
+            '''
+            courses.append({
+                "routeId": str(course["route_id"]),
+                "routeNumber": route_number,
+                "tripNumber": trip_number,
+                "outputNumber": output_number,
+                "color": color,
+                "layerName": str(course["layer_name"]),
+                "label": f"Курс {trip_number} · № {html.escape(output_number)} · Маршрут {route_number}",
+                "panelHtml": panel_html,
+                "clients": clients,
+            })
+
+        panel_css = """
+            .multi-course-client-control { font-family: Arial, sans-serif; }
+            .multi-course-hidden { display: none !important; }
+            .multi-course-toggle { border:1px solid rgba(35,35,35,.35);border-radius:6px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.22);font-weight:700;padding:8px 11px;cursor:pointer; }
+            .multi-course-panel { width:390px;max-width:calc(100vw - 42px);max-height:calc(100vh - 45px);overflow:auto;background:#fff;border:1px solid rgba(35,35,35,.35);border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.22);padding:10px;color:#222; }
+            .multi-course-header { display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;font-size:15px; }
+            .multi-course-close { width:26px;height:26px;border:0;border-radius:4px;background:#f1f3f4;font-size:18px;font-weight:700;cursor:pointer; }
+            .multi-course-selector { padding-bottom:7px;border-bottom:1px solid #e1e6ee; }
+            .multi-course-selector-row { display:flex;align-items:center;gap:6px;padding:4px 2px;cursor:pointer;font-size:12px;font-weight:700; }
+            .multi-course-swatch { width:14px;height:14px;border-radius:2px;display:inline-block; }
+            .multi-course-detail { padding-top:8px; }
+            .multi-course-detail-header { display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px;font-size:13px; }
+            .route-client-stats { display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0 10px;padding:8px;background:#f8fafc;border:1px solid #e1e6ee;border-radius:6px; }
+            .route-client-stat { display:flex;justify-content:space-between;gap:8px;font-size:12px; }
+            .multi-course-client-card { display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:start;padding:7px 5px;border-top:1px solid #ececec;cursor:pointer; }
+            .multi-course-client-card:hover,.multi-course-client-card:focus { background:#f4f7fb;outline:none; }
+            .multi-course-client-card-window { background:#ffe4e4;border:1px solid #eaa6a6;border-radius:6px;margin-top:5px; }
+            .multi-course-client-number { width:24px;height:24px;border-radius:50%;color:#fff;text-align:center;line-height:24px;font-size:11px;font-weight:700; }
+            .multi-course-client-main { min-width:0; }
+            .multi-course-client-name,.multi-course-client-secondary,.multi-course-client-arrival,.multi-course-client-attention { display:block;overflow-wrap:anywhere; }
+            .multi-course-client-name { font-size:12px;font-weight:700; }
+            .multi-course-client-secondary { color:#666;font-size:11px;margin-top:2px; }
+            .multi-course-client-arrival { color:#188038;font-size:11px;margin-top:2px; }
+            .multi-course-client-attention { color:#9f2020;font-size:11px;font-weight:700;margin-top:3px; }
+            .multi-course-client-actions { display:flex;flex-direction:column;gap:5px; }
+            .multi-course-client-nav,.multi-course-client-street { display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:5px 7px;border-radius:4px;text-decoration:none;font-size:11px;font-weight:700;white-space:nowrap; }
+            .multi-course-client-nav { background:#1a73e8;color:#fff !important; }
+            .multi-course-client-street { background:#fbbc04;color:#1f1f1f !important;box-shadow:0 0 0 1px #9a6f00 inset; }
+            .multi-course-client-street-icon { width:9px;height:13px;border-radius:5px 5px 3px 3px;background:#1f1f1f;display:inline-block; }
+            .multi-course-google { margin:8px 0;padding:8px;background:#f8fafc;border:1px solid #e1e6ee;border-radius:6px;font-size:12px; }
+            .multi-course-google-row { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border-top:1px solid #e8edf3;padding:6px 0; }
+            .multi-course-google-row a { background:#1a73e8;color:#fff;text-decoration:none;border-radius:4px;padding:5px 8px;font-weight:700; }
+            .multi-course-missing { margin:6px 0;padding:6px;background:#fff8e1;border:1px solid #f6d36f;border-radius:5px;color:#654b00;font-size:11px; }
+            .multi-course-empty { color:#666;font-size:12px;padding:8px 0; }
+            @media (max-width:700px) { .multi-course-panel { width:calc(100vw - 36px);max-height:48vh; } }
+        """
+        route_map.add_child(MultiCourseCustomerPanel(courses, panel_css))
 
     def _add_google_route_segments_control(
         self,
@@ -3747,10 +4952,98 @@ class InteractiveMapGenerator:
         '''
         route_map.add_child(SingleRouteGoogleSegmentsPanel(panel_html, panel_css))
     
-    def create_single_route_map(self, route: Route, route_number: int,
-                                depot_location: Tuple[float, float]) -> folium.Map:
+    def create_vehicle_route_map(
+        self,
+        routes: List[Route],
+        route_numbers: List[int],
+        depot_location: Tuple[float, float],
+        all_routes: Optional[List[Route]] = None,
+    ) -> folium.Map:
+        """Create one individual HTML map for all courses of one vehicle."""
+        if not routes:
+            raise ValueError("At least one route is required for a vehicle map")
+        if len(routes) == 1:
+            route_number = route_numbers[0] if route_numbers else 1
+            return self.create_single_route_map(
+                routes[0], route_number, depot_location, all_routes
+            )
+
+        numbering_routes = all_routes or routes
+        effective_numbers = list(route_numbers or range(1, len(routes) + 1))
+        coordinates = [
+            customer.coordinates
+            for route in routes
+            for customer in route.customers
+            if customer.coordinates
+        ]
+        if coordinates:
+            center = (
+                sum(point[0] for point in coordinates) / len(coordinates),
+                sum(point[1] for point in coordinates) / len(coordinates),
+            )
+        else:
+            center = self._route_start_location(routes[0], depot_location)
+
+        depot_locations = []
+        for route in routes:
+            route_start = self._route_start_location(route, depot_location)
+            route_end = self._route_end_location(route, route_start)
+            for location in (route_start, route_end):
+                if location and location not in depot_locations:
+                    depot_locations.append(location)
+
+        vehicle_name = _route_vehicle_name(routes[0])
+        title = f"{vehicle_name} - {len(routes)} курса"
+        top_comment = "".join(
+            self._route_delivery_order_html_comment(route, route_number, numbering_routes)
+            for route, route_number in zip(routes, effective_numbers)
+        )
+
+        if self._use_google_maps():
+            route_document = self._build_google_html(
+                title,
+                center,
+                routes,
+                depot_locations,
+                all_routes=numbering_routes,
+                route_numbers=effective_numbers,
+                course_filter=True,
+            )
+            setattr(route_document, "_cvrp_top_html_comment", top_comment)
+            return route_document
+
+        route_map = self._create_folium_map(center)
+        self._add_depot_markers(route_map, depot_locations)
+
+        cfg = get_config()
+        if _visible_center_zones(cfg.locations):
+            self._add_center_zone_shape(route_map, cfg.locations)
+        if _visible_traffic_zones(cfg.locations):
+            self._add_traffic_zone_shapes(route_map, cfg.locations)
+
+        course_panel_routes = self._add_routes_to_map(
+            route_map,
+            routes,
+            route_numbers=effective_numbers,
+            all_routes=numbering_routes,
+            add_layer_control=False,
+        )
+        self._add_multi_course_customer_control(route_map, course_panel_routes)
+        self._add_coordinate_pin_search(route_map)
+        self._add_legend(route_map, routes, course_filter=True)
+        setattr(route_map, "_cvrp_top_html_comment", top_comment)
+        return route_map
+
+    def create_single_route_map(
+        self,
+        route: Route,
+        route_number: int,
+        depot_location: Tuple[float, float],
+        all_routes: Optional[List[Route]] = None,
+    ) -> folium.Map:
         """Създава интерактивна карта за един отделен маршрут"""
-        logger.info(f"Създавам карта за маршрут {route_number}")
+        course_suffix = _route_course_suffix(route, all_routes)
+        logger.info(f"Създавам карта за маршрут {route_number}{course_suffix}")
 
         # Взимаме депото на маршрута
         route_depot = self._route_start_location(route, depot_location)
@@ -3769,34 +5062,55 @@ class InteractiveMapGenerator:
             center = route_depot
 
         if self._use_google_maps():
-            return self._build_google_html(
-                f"Маршрут {route_number}",
+            route_document = self._build_google_html(
+                f"Маршрут {route_number}{course_suffix}",
                 center,
                 [route],
                 list(dict.fromkeys([route_depot, route_end])),
                 single_route_number=route_number,
+                all_routes=all_routes,
             )
+            setattr(route_document, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number, all_routes))
+            return route_document
 
         route_map = self._create_folium_map(center)
 
         # Добавяме маркер за депото
         self._add_depot_markers(route_map, list(dict.fromkeys([route_depot, route_end])))
+        self._add_route_start_marker(route_map, route, route_depot)
 
         # Добавяме център зоната
         from config import get_config
         cfg = get_config()
-        if get_center_zones(cfg.locations):
+        if _visible_center_zones(cfg.locations):
             self._add_center_zone_shape(route_map, cfg.locations)
+        if _visible_traffic_zones(cfg.locations):
+            self._add_traffic_zone_shapes(route_map, cfg.locations)
 
         # Добавяме маршрута
         vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
             'color': 'gray', 'icon': 'circle', 'prefix': 'fa', 'name': 'Неизвестен'
         })
         vehicle_name = _route_vehicle_name(route)
-        bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
+        display_vehicle_name = f"{vehicle_name}{course_suffix}"
+        bus_number = _format_output_bus_number(
+            self.config, route_number - 1, route, all_routes
+        )
+        if all_routes:
+            physical_vehicle_keys = []
+            for idx, candidate in enumerate(all_routes):
+                candidate_key = route_vehicle_key(candidate, idx)
+                if candidate_key not in physical_vehicle_keys:
+                    physical_vehicle_keys.append(candidate_key)
+            bus_color = BUS_COLORS[
+                physical_vehicle_keys.index(route_vehicle_key(route, route_number - 1))
+                % len(BUS_COLORS)
+            ]
+        else:
+            bus_color = BUS_COLORS[(route_number - 1) % len(BUS_COLORS)]
 
         bus_layer = folium.FeatureGroup(
-            name=f"\U0001f68c {vehicle_name} ({len(route.customers)} клиента)")
+            name=f"\U0001f68c {display_vehicle_name} - {bus_number} ({len(route.customers)} клиента)")
         marker_entries = []
         schedule_by_index = self._route_schedule_by_index(route)
         route_start_time_text = self._route_start_time_text(route)
@@ -3814,32 +5128,71 @@ class InteractiveMapGenerator:
                 time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
                 has_time_window = self._customer_has_declared_time_window(customer)
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
+                has_comment = bool(delivery_comment)
+                quantity_value = getattr(customer, "quantity", None)
+                turnover_value = getattr(customer, "turnover", None)
+                try:
+                    quantity_float = float(quantity_value)
+                except (TypeError, ValueError):
+                    quantity_float = None
+                try:
+                    turnover_float = float(turnover_value)
+                except (TypeError, ValueError):
+                    turnover_float = None
+                quantity_line = f"<b>Количество:</b> {quantity_float:.2f}<br>" if quantity_float is not None else ""
+                turnover_line = (
+                    f"<b>Оборот:</b> {turnover_float:.2f}<br>"
+                    if turnover_float is not None and turnover_float != 0
+                    else ""
+                )
+                marker_has_attention = has_time_window or has_comment
+                marker_border_color = "#dc2626" if has_time_window else "#f59e0b" if has_comment else "#ffffff"
+                marker_shadow = (
+                    "0 0 0 3px rgba(220,38,38,0.16), 0 2px 7px rgba(0,0,0,0.28)"
+                    if has_time_window
+                    else "0 0 0 3px rgba(245,158,11,0.18), 0 2px 7px rgba(0,0,0,0.28)"
+                    if has_comment
+                    else "0 1px 4px rgba(0,0,0,0.24)"
+                )
+                marker_badge_color = "#f59e0b" if has_time_window and has_comment else marker_border_color
+                marker_badge_html = (
+                    f'<span style="position:absolute;top:-4px;right:-4px;width:10px;height:10px;'
+                    f'border-radius:50%;background:{marker_badge_color};border:2px solid #fff;'
+                    f'box-shadow:0 1px 3px rgba(0,0,0,0.25);"></span>'
+                    if marker_has_attention
+                    else ""
+                )
                 icon_html = f'''
                 <div style="
                     background-color: {bus_color};
-                    border: 3px solid white;
+                    border: {'4px' if marker_has_attention else '3px'} solid {marker_border_color};
                     border-radius: 50%;
                     width: 30px;
                     height: 30px;
+                    box-sizing: border-box;
                     display: flex;
                     justify-content: center;
                     align-items: center;
+                    position: relative;
                     font-weight: bold;
                     font-size: 14px;
                     color: white;
                     text-shadow: 1px 1px 1px rgba(0,0,0,0.7);
-                ">{client_number}</div>
+                    box-shadow: {marker_shadow};
+                ">{client_number}{marker_badge_html}</div>
                 '''
                 popup_text = f"""
                 <div style="font-family: Arial, sans-serif;">
                     <h4 style="margin: 0; color: {bus_color};">
-                        Автобус {route_number} - {vehicle_name}
+                        Автобус {route_number} - {display_vehicle_name}
                     </h4>
                     <hr style="margin: 5px 0;">
                     <b>Клиент:</b> {customer.name}<br>
                     <b>ID:</b> {customer.id}<br>
                     <b>Ред в маршрута:</b> #{client_number}<br>
                     <b>Обем:</b> {customer.volume:.2f} ст.<br>
+                    {quantity_line}
+                    {turnover_line}
                     <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
                     {"<br>".join(schedule_lines)}{"<br>" if schedule_lines else ""}
                     {self._popup_action_buttons(navigation_url, street_view_url)}
@@ -3873,6 +5226,8 @@ class InteractiveMapGenerator:
                     "time_window_text": time_window_text,
                     "has_time_window": has_time_window,
                     "delivery_comment": delivery_comment,
+                    "quantity": quantity_value,
+                    "turnover": turnover_value,
                 })
 
         # Линия на маршрута
@@ -3883,10 +5238,11 @@ class InteractiveMapGenerator:
                     waypoints.append(customer.coordinates)
             waypoints.append(route_end)
 
-            if self.use_routing:
-                engine_name = "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
+            route_valhalla_config = self._route_valhalla_config(route)
+            if self.use_routing or route_valhalla_config is not None:
+                engine_name = "Valhalla truck" if route_valhalla_config is not None else "Valhalla" if self.routing_engine and self.routing_engine.value == RoutingEngine.VALHALLA.value else "OSRM"
                 try:
-                    route_geometry = self._get_full_route_geometry(waypoints)
+                    route_geometry = self._get_full_route_geometry(waypoints, valhalla_config=route_valhalla_config)
                     if len(route_geometry) > 2:
                         polyline = folium.PolyLine(
                             route_geometry, color=bus_color, weight=4, opacity=0.8
@@ -3924,9 +5280,10 @@ class InteractiveMapGenerator:
                     font-size:14px; padding: 10px; border-radius: 5px;
                     box-shadow: 0 0 15px rgba(0,0,0,0.2);">
         <h4 style="margin-top:0; margin-bottom:10px; text-align: center;">
-            \U0001f68c Маршрут {route_number} - {vehicle_name}
+            \U0001f68c Маршрут {route_number}{course_suffix} - {vehicle_name}
         </h4>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4ca Клиенти: {len(route.customers)}</p>
+        <p style="margin: 3px 0; font-size: 12px;">ID бус: {html.escape(str(bus_number))}</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4cf Разстояние: {route.total_distance_km:.1f} км</p>
         <p style="margin: 3px 0; font-size: 12px;">\u23f1 Време: {route.total_time_minutes:.0f} мин</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} ст.</p>
@@ -3935,6 +5292,7 @@ class InteractiveMapGenerator:
         </div>
         '''
         route_map.get_root().add_child(folium.Element(legend_html))
+        setattr(route_map, "_cvrp_top_html_comment", self._route_delivery_order_html_comment(route, route_number, all_routes))
 
         return route_map
 
@@ -3948,6 +5306,19 @@ class InteractiveMapGenerator:
         
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         route_map.save(file_path)
+
+        top_comment = str(getattr(route_map, "_cvrp_top_html_comment", "") or "")
+        if top_comment:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    saved_html = f.read()
+                saved_html = saved_html.lstrip("\ufeff")
+                if not saved_html.startswith(top_comment):
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(top_comment)
+                        f.write(saved_html)
+            except Exception as exc:
+                logger.warning(f"Не успях да добавя HTML коментар с реда на доставка: {exc}")
         
         logger.info(f"Интерактивна карта записана в {file_path}")
         return file_path
@@ -3958,7 +5329,10 @@ class ExcelExporter:
     
     def __init__(self, config: OutputConfig):
         self.config = config
-        self.run_date = datetime.now().strftime("%Y-%m-%d")
+        self.run_date = str(
+            getattr(config, "_api_run_date_stamp", "")
+            or datetime.now().strftime("%Y-%m-%d")
+        )
     
     def export_all_to_single_excel(self, solution: CVRPSolution, warehouse_customers: List[Customer]) -> str:
         """Експортира всички данни в един Excel файл с отделни sheets"""
@@ -4017,11 +5391,54 @@ class ExcelExporter:
         if not coords:
             return ""
         return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
+
+    def _apply_decimal_format_by_header(
+        self,
+        ws,
+        headers: List[str],
+        number_format: str = "0.0#",
+        header_row: int = 1,
+    ) -> None:
+        wanted_headers = {str(header).strip() for header in headers}
+        for cell in ws[header_row]:
+            if str(cell.value or "").strip() not in wanted_headers:
+                continue
+            for row_idx in range(header_row + 1, ws.max_row + 1):
+                ws.cell(row=row_idx, column=cell.column).number_format = number_format
+
+    def _apply_decimal_format_by_label(
+        self,
+        ws,
+        labels: List[str],
+        number_format: str = "0.0#",
+        label_col: int = 1,
+        value_col: int = 2,
+    ) -> None:
+        wanted_labels = {str(label).strip() for label in labels}
+        for row_idx in range(1, ws.max_row + 1):
+            label_value = str(ws.cell(row=row_idx, column=label_col).value or "").strip()
+            if label_value in wanted_labels:
+                ws.cell(row=row_idx, column=value_col).number_format = number_format
+
+    def _apply_decimal_format_to_excel_file(
+        self,
+        file_path: str,
+        headers: List[str],
+        number_format: str = "0.0#",
+    ) -> None:
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(file_path)
+            for ws in wb.worksheets:
+                self._apply_decimal_format_by_header(ws, headers, number_format=number_format)
+            wb.save(file_path)
+        except Exception as exc:
+            logger.warning(f"Не успях да форматирам дробните обеми в Excel файла {file_path}: {exc}")
     
     def _create_routes_sheet(self, wb, solution: CVRPSolution):
         """Създава sheet с маршрутите"""
         ws = wb.create_sheet("Маршрути")
-        
         # Заглавни редове
         headers = [
             'ID бус', 'Маршрут', 'Превозно средство', 'Ред в маршрута',
@@ -4032,7 +5449,8 @@ class ExcelExporter:
             'Стартово време (чч:мм)', 'Време с натрупване (ч)', 'Време с натрупване (чч:мм)',
             'Работно време клиент', 'ETA пристигане', 'Чакане (мин)', 'TW статус'
         ]
-        
+        if _has_multiple_courses(solution.routes):
+            headers[2:2] = ['Курс']
         # Стилове за заглавния ред
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
@@ -4060,7 +5478,7 @@ class ExcelExporter:
                 distance_to_center = self._calculate_distance_to_center(customer.coordinates, center_location) if customer.coordinates else 0.0
                 
                 data = [
-                    self._format_report_bus_number(i),  # Маршрут / номер бус
+                    self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
                     i + 1,  # Номер маршрут
                     vehicle_name,  # Превозно средство
                     j,  # Ред в маршрута
@@ -4086,13 +5504,16 @@ class ExcelExporter:
                     round(entry["wait_minutes"], 1),
                     entry["time_window_status"],
                 ]
-                
+                if _has_multiple_courses(solution.routes):
+                    data[2:2] = [route_trip_number(route)]
+
                 for col, value in enumerate(data, 1):
                     ws.cell(row=row, column=col, value=value)
                 
                 row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4149,6 +5570,7 @@ class ExcelExporter:
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4185,12 +5607,22 @@ class ExcelExporter:
             ("Общо време (ч)", self._minutes_to_hours(solution.total_time_minutes)),
             ("Общ обем (ст.)", round(sum(route.total_volume for route in solution.routes), 2))
         ]
+        if _has_multiple_courses(solution.routes):
+            route_count_index = next(
+                (idx for idx, (label, _) in enumerate(stats) if label == "Брой маршрути"),
+                3,
+            )
+            stats[route_count_index + 1:route_count_index + 1] = [
+                ("Брой физически бусове", count_physical_vehicles(solution.routes)),
+                ("Брой курсове", len(solution.routes)),
+            ]
         
         for stat_name, stat_value in stats:
             ws[f'A{row}'] = stat_name
             ws[f'A{row}'].font = header_font
             ws[f'B{row}'] = stat_value
             row += 1
+        self._apply_decimal_format_by_label(ws, ["Общ обем (ст.)"])
         
         # Информация за стартови времена
         row += 2
@@ -4213,7 +5645,7 @@ class ExcelExporter:
             if vehicle_seen_key not in vehicle_types_seen:
                 vehicle_types_seen.add(vehicle_seen_key)
                 vehicle_name = self._get_report_vehicle_name(route, route.vehicle_type.value)
-                start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+                start_time_minutes = _route_start_time_minutes(route)
                 
                 data = [
                     vehicle_name,
@@ -4243,6 +5675,7 @@ class ExcelExporter:
         
         # Заглавни редове за статистики
         headers = ['Бус / тип', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
+        summary_header_row = row
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = header_font
@@ -4263,6 +5696,7 @@ class ExcelExporter:
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"], header_row=summary_header_row)
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4278,13 +5712,13 @@ class ExcelExporter:
     def _create_vehicle_stats_sheet(self, wb, solution: CVRPSolution):
         """Създава sheet със статистики по отделни бусове"""
         ws = wb.create_sheet("Статистики по бусове")
-        
         headers = [
             'ID бус', 'Маршрут', 'Тип бус', 'Брой клиенти', 'Общ обем (ст.)',
             'Разстояние (км)', 'Време (ч)', 'Капацитет използване (%)',
             'Средно разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка', 'Стартово време (чч:мм)'
         ]
-        
+        if _has_multiple_courses(solution.routes):
+            headers[2:2] = ['Курс']
         # Стилове за заглавния ред
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
@@ -4312,16 +5746,16 @@ class ExcelExporter:
             avg_distance_to_center = sum(distances_to_center) / len(distances_to_center) if distances_to_center else 0
             
             # Капацитет използване (трябва да вземем capacity от config)
-            vehicle_config = self._get_vehicle_config(route.vehicle_type)
+            vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
             capacity_usage = 0
             if vehicle_config and vehicle_config.capacity > 0:
                 capacity_usage = (route.total_volume / vehicle_config.capacity * 100)
             
             # Изчисляваме стартово време за този тип превозно средство
-            start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
+            start_time_minutes = _route_start_time_minutes(route)
             
             data = [
-                self._format_report_bus_number(i),  # Маршрут / номер бус
+                self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
                 i + 1,  # Номер маршрут
                 vehicle_name,  # Тип бус
                 len(route.customers),  # Брой клиенти
@@ -4334,13 +5768,16 @@ class ExcelExporter:
                 self._format_coords_for_report(self._route_end_location(route)),  # Край
                 self._format_time_hh_mm(start_time_minutes) # Стартово време (чч:мм)
             ]
-            
+            if _has_multiple_courses(solution.routes):
+                data[2:2] = [route_trip_number(route)]
+
             for col, value in enumerate(data, 1):
                 ws.cell(row=row, column=col, value=value)
             
             row += 1
         
         # Автоматично разширяване на колоните
+        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -4359,43 +5796,26 @@ class ExcelExporter:
     def _customer_time_window_minutes(self, customer: Customer) -> Optional[Tuple[int, int]]:
         if not self._customer_time_windows_enabled():
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes, end_minutes
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return None
+        return windows[0]
 
     def _format_customer_time_window(self, customer: Customer) -> str:
-        raw_start = getattr(customer, "time_window_start_minutes", None)
-        raw_end = getattr(customer, "time_window_end_minutes", None)
-        if raw_start is None and raw_end is None:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
             if self._customer_time_windows_enabled():
                 return "Постоянно"
             return ""
-
-        start_minutes = 0 if raw_start is None else max(0, int(raw_start))
-        end_minutes = 1439 if raw_end is None else max(0, int(raw_end))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-        return f"{self._format_time_hh_mm(start_minutes)}-{self._format_time_hh_mm(end_minutes)}"
+        return format_time_windows_minutes(windows)
 
     def _build_route_schedule_entries(self, route: Route) -> List[Dict[str, object]]:
         stored_entries = _stored_route_schedule_entries(route)
         if stored_entries:
             return stored_entries
 
-        start_time_minutes = self._get_start_time_for_vehicle(route.vehicle_type)
-        vehicle_config = self._get_vehicle_config(route.vehicle_type)
+        start_time_minutes = _route_start_time_minutes(route)
+        vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
         service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
@@ -4418,22 +5838,12 @@ class ExcelExporter:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            wait_minutes = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_minutes(customer)
-
-            if window:
-                window_start, window_end = window
-                if raw_arrival < window_start:
-                    wait_minutes = window_start - raw_arrival
-                    time_window_status = "Изчакване"
-                arrival_after_wait = raw_arrival + wait_minutes
-                if arrival_after_wait > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait = raw_arrival
+            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
+            wait_minutes = wait_seconds / 60
+            if time_window_status and len(windows) > 1 and window_index >= 0:
+                time_window_status = f"{time_window_status} (прозорец {window_index + 1})"
+            arrival_after_wait = raw_arrival + wait_minutes
 
             total_time_for_step = travel_time + wait_minutes + service_time_minutes
             cumulative_time += total_time_for_step
@@ -4544,15 +5954,14 @@ class ExcelExporter:
         """Връща продължителност в часове за CVRP отчета."""
         return round(float(total_minutes or 0) / 60, 2)
 
-    def _format_report_bus_number(self, route_index: int) -> str:
+    def _format_report_bus_number(
+        self,
+        route_index: int,
+        route: Optional[Route] = None,
+        routes: Optional[List[Route]] = None,
+    ) -> str:
         """Форматира номера на буса за Excel отчетите."""
-        prefix = str(getattr(self.config, "excel_bus_number_prefix", "10045010") or "")
-        try:
-            digits = int(getattr(self.config, "excel_bus_number_digits", 2) or 2)
-        except (TypeError, ValueError):
-            digits = 2
-        digits = max(1, digits)
-        return f"{prefix}{route_index + 1:0{digits}d}"
+        return _format_output_bus_number(self.config, route_index, route=route, routes=routes)
 
     def _get_report_vehicle_name(self, vehicle_or_route, default="Неизвестен") -> str:
         """Име на превозното средство за CVRP отчета."""
@@ -4583,6 +5992,7 @@ class ExcelExporter:
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False)
+        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
         
         logger.info(f"Складови заявки експортирани в {file_path}")
         return file_path
@@ -4599,7 +6009,7 @@ class ExcelExporter:
             previous_stop_name = "Депо"
             for j, customer in enumerate(route.customers):
                 data.append({
-                    'ID бус': self._format_report_bus_number(i),
+                    'ID бус': self._format_report_bus_number(i, route, solution.routes),
                     'Маршрут': i + 1,
                     'Превозно средство': vehicle_name,
                     'Ред в маршрута': j + 1,
@@ -4616,6 +6026,7 @@ class ExcelExporter:
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False, engine='openpyxl')
+        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
         
         logger.info(f"Маршрути експортирани в {file_path}")
         return file_path
@@ -4623,6 +6034,7 @@ class ExcelExporter:
     def export_routes_csv(self, solution: CVRPSolution) -> str:
         """Експортира маршрутите като CSV файл (разделен по запетаи)"""
         import csv
+        multi_trip = _has_multiple_courses(solution.routes)
         
         file_path = _normalize_output_file_path(self.config.csv_output_file, "routes.csv")
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -4636,6 +6048,8 @@ class ExcelExporter:
             'Стартово време (мин)', 'Време с натрупване (мин)', 'Време с натрупване (чч:мм)',
             'Работно време клиент', 'ETA пристигане', 'Чакане (мин)', 'TW статус'
         ]
+        if multi_trip:
+            headers[1:1] = ['ID бус', 'Курс', 'ID курс', 'Ключ бус']
         
         center_location = get_config().locations.center_location
         
@@ -4678,6 +6092,13 @@ class ExcelExporter:
                         round(entry["wait_minutes"], 1),
                         entry["time_window_status"],
                     ]
+                    if multi_trip:
+                        row[1:1] = [
+                            self._format_report_bus_number(i, route, solution.routes),
+                            route_trip_number(route),
+                            route_identifier(route, i + 1),
+                            route_vehicle_key(route, i),
+                        ]
                     writer.writerow(row)
         
         logger.info(f"CSV маршрути експортирани в {file_path}")
@@ -4738,7 +6159,7 @@ class ChartGenerator:
         labels = []
         usages = []
         for i, route in enumerate(solution.routes):
-            vc = self._get_vehicle_config(route.vehicle_type)
+            vc = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
             cap = vc.capacity if vc else 1
             usage = (route.total_volume / cap * 100) if cap > 0 else 0
             labels.append(f"М{i+1}")
@@ -4913,7 +6334,7 @@ class OutputHandler:
     def _route_maps_upload_mode(self) -> str:
         return str(getattr(self.config, "route_maps_upload_mode", "disabled") or "disabled").strip().lower()
 
-    def _upload_route_maps(self, route_map_files: List[str]) -> Optional[str]:
+    def _upload_route_maps(self, route_map_items: List[Dict[str, str]]) -> Optional[str]:
         """Upload generated individual route HTML maps when configured."""
         mode = self._route_maps_upload_mode()
         if mode in {"", "0", "false", "off", "none", "disabled"}:
@@ -4932,20 +6353,58 @@ class OutputHandler:
             logger.warning(message)
             return f"failed: {message}"
 
-        existing_files = [path for path in route_map_files if path and os.path.isfile(path)]
-        if not existing_files:
+        existing_items = []
+        for item in route_map_items or []:
+            if isinstance(item, dict):
+                file_path = str(item.get("file_path") or item.get("path") or "")
+                bus_id = str(item.get("bus_id") or "")
+                trip_number = item.get("trip_number")
+                route_id = item.get("route_id")
+            else:
+                file_path = str(item or "")
+                bus_id = ""
+                trip_number = None
+                route_id = None
+            if file_path and os.path.isfile(file_path):
+                existing_items.append({
+                    "file_path": file_path,
+                    "bus_id": bus_id,
+                    "trip_number": trip_number,
+                    "route_id": route_id,
+                })
+        if not existing_items:
             logger.info("Няма индивидуални HTML карти за качване.")
             return "skipped: няма route HTML файлове"
+
+        duplicate_bus_ids = _duplicate_route_map_bus_ids(existing_items)
+        if duplicate_bus_ids:
+            message = (
+                "multi-trip Effect upload е пропуснат: има отделни карти за няколко курса "
+                "на един физически бус, а pData2[] приема само оригиналния bus ID. "
+                "Нужна е една комбинирана дневна карта за бус: "
+                + ", ".join(duplicate_bus_ids)
+            )
+            logger.warning(message)
+            return f"skipped: {message}"
 
         token_field = str(getattr(self.config, "route_maps_upload_token_field", "pData") or "pData").strip()
         token = str(getattr(self.config, "route_maps_upload_token", "") or "").strip()
         file_field = str(getattr(self.config, "route_maps_upload_file_field", "files[]") or "files[]").strip()
+        bus_id_field = str(getattr(self.config, "route_maps_upload_bus_id_field", "pData2[]") or "pData2[]").strip()
         timeout = int(getattr(self.config, "route_maps_upload_timeout_seconds", 60) or 60)
 
         opened_files = []
         files_payload = []
         try:
-            for file_path in existing_files:
+            data_payload = []
+            if token_field:
+                data_payload.append((token_field, token))
+
+            for item in existing_items:
+                file_path = item.get("file_path", "")
+                bus_id = str(item.get("bus_id", "") or "")
+                if bus_id_field:
+                    data_payload.append((bus_id_field, bus_id))
                 file_handle = open(file_path, "rb")
                 opened_files.append(file_handle)
                 files_payload.append(
@@ -4959,11 +6418,15 @@ class OutputHandler:
                     )
                 )
 
-            data = {token_field: token} if token_field else {}
-            logger.info("Качвам %s route HTML карти към %s", len(files_payload), upload_url)
+            logger.info(
+                "Качвам %s route HTML карти към %s с bus ID поле %s",
+                len(files_payload),
+                upload_url,
+                bus_id_field or "-",
+            )
             response = requests.post(
                 upload_url,
-                data=data,
+                data=data_payload,
                 files=files_payload,
                 timeout=timeout,
             )
@@ -4991,6 +6454,7 @@ class OutputHandler:
                            depot_location: Tuple[float, float]) -> Dict[str, str]:
         """Генерира всички изходни файлове и връща речник с пътищата до тях"""
         logger.info("Започвам генериране на изходни файлове")
+        solution.routes = order_routes_for_output(solution.routes)
         output_files = {}
 
         # 1. Интерактивна карта (обща)
@@ -5012,29 +6476,80 @@ class OutputHandler:
                 # 1.1. Отделни HTML карти за всеки маршрут
                 routes_dir = self.config.routes_output_dir
                 generated_route_maps = 0
-                route_map_files: List[str] = []
+                route_map_items: List[Dict[str, str]] = []
                 try:
                     os.makedirs(routes_dir, exist_ok=True)
                     used_route_file_names = set()
-                    for idx, route in enumerate(solution.routes):
-                        route_number = idx + 1
+                    vehicle_route_groups = _group_routes_for_vehicle_maps(solution.routes)
+                    for vehicle_map_index, group in enumerate(vehicle_route_groups, start=1):
+                        group_indexes = [item[0] for item in group]
+                        group_routes = [item[1] for item in group]
+                        group_route_numbers = [index + 1 for index in group_indexes]
+                        first_index = group_indexes[0]
+                        first_route = group_routes[0]
+                        first_route_number = group_route_numbers[0]
                         try:
-                            single_map = map_gen.create_single_route_map(route, route_number, depot_location)
-                            route_filename = _route_map_file_name(
-                                route,
-                                route_number,
-                                map_gen.run_date,
-                                used_route_file_names,
+                            single_map = map_gen.create_vehicle_route_map(
+                                group_routes,
+                                group_route_numbers,
+                                depot_location,
+                                solution.routes,
                             )
+                            if len(group_routes) > 1:
+                                route_filename = _vehicle_route_map_file_name(
+                                    first_route,
+                                    first_route_number,
+                                    map_gen.run_date,
+                                    used_route_file_names,
+                                )
+                            else:
+                                route_filename = _route_map_file_name(
+                                    first_route,
+                                    first_route_number,
+                                    map_gen.run_date,
+                                    used_route_file_names,
+                                    solution.routes,
+                                )
                             route_file = os.path.join(routes_dir, route_filename)
                             saved_route_file = map_gen.save_map(single_map, route_file)
-                            output_files[f'route_map_{route_number}'] = saved_route_file
-                            route_map_files.append(saved_route_file)
+                            output_files[_vehicle_route_map_output_key(vehicle_map_index)] = saved_route_file
+                            for route_index, route, route_number in zip(
+                                group_indexes, group_routes, group_route_numbers
+                            ):
+                                # Keep legacy output keys, but all courses of a
+                                # physical vehicle intentionally point to the
+                                # same combined HTML file.
+                                output_files[f'route_map_{route_number}'] = saved_route_file
+                                course_output_number = _format_output_bus_number(
+                                    self.config,
+                                    route_index,
+                                    route,
+                                    solution.routes,
+                                )
+                                route_map_items.append(
+                                    {
+                                        "file_path": saved_route_file,
+                                        "bus_id": course_output_number,
+                                        "trip_number": route_trip_number(route),
+                                        "route_id": _map_route_identifier(
+                                            route, route_number, solution.routes
+                                        ),
+                                    }
+                                )
                             generated_route_maps += 1
                         except Exception as e:
-                            logger.error(f"Грешка при генериране на HTML карта за маршрут {route_number}: {e}", exc_info=True)
-                    logger.info(f"Генерирани {generated_route_maps}/{len(solution.routes)} отделни HTML карти в {routes_dir}")
-                    upload_summary = self._upload_route_maps(route_map_files)
+                            logger.error(
+                                f"Грешка при генериране на HTML карта за бус/маршрут {first_route_number}: {e}",
+                                exc_info=True,
+                            )
+                    logger.info(
+                        "Генерирани %s/%s отделни HTML карти за физически бусове (%s курса) в %s",
+                        generated_route_maps,
+                        len(vehicle_route_groups),
+                        len(solution.routes),
+                        routes_dir,
+                    )
+                    upload_summary = self._upload_route_maps(route_map_items)
                     if upload_summary:
                         output_files["route_maps_upload"] = upload_summary
                 except Exception as e:

@@ -33,11 +33,23 @@ from config import (
     get_traffic_multiplier,
     get_traffic_zones,
 )
-from input_handler import Customer
+from input_handler import (
+    Customer,
+    choose_time_window_for_arrival,
+    customer_time_windows_minutes,
+    format_time_windows_minutes,
+    is_mandatory_customer,
+    time_windows_to_seconds,
+)
 from osrm_client import DistanceMatrix
 from warehouse_manager import WarehouseAllocation
 
 logger = logging.getLogger(__name__)
+
+# Full-workday time is expressed directly in seconds. Distance remains a hard
+# dimension/reporting value and has no objective cost in ``time`` mode.
+_FULL_WORKDAY_TIME_COST_WEIGHT = 1
+
 
 def calculate_distance_km(coord1: Optional[Tuple[float, float]], coord2: Tuple[float, float]) -> float:
     """Изчислява разстоянието между две GPS координати в километри"""
@@ -86,6 +98,13 @@ class Route:
     total_volume: float = 0.0
     is_feasible: bool = True
     schedule_entries: List[Dict[str, object]] = field(default_factory=list)
+    # Multi-trip identity. Defaults keep existing callers backward compatible.
+    vehicle_key: str = ""
+    trip_number: int = 1
+    trip_count: int = 1
+    route_id: str = ""
+    planned_start_minutes: Optional[float] = None
+    planned_end_minutes: Optional[float] = None
 
 
 @dataclass
@@ -99,7 +118,8 @@ class CVRPSolution:
         total_distance_km: Сумарно изминато разстояние за всички маршрути в километри.
         total_time_minutes: Сумарно време за всички маршрути в минути.
         total_vehicles_used: Брой използвани превозни средства.
-        fitness_score: Стойност на целевата функция (разстояние или друга метрика за ранжиране).
+        fitness_score: Публична стойност за ранжиране. В режим time е само
+            сумарното време в секунди; в режим distance е solver цената.
         is_feasible: Дали решението удовлетворява всички твърди ограничения.
         total_served_volume: Общо обслужен обем (за сравняване на решения).
     """
@@ -108,9 +128,19 @@ class CVRPSolution:
     total_distance_km: float
     total_time_minutes: float
     total_vehicles_used: int
-    fitness_score: float # Основната стойност, която solver-ът минимизира (разстояние)
+    fitness_score: float  # time: секунди; distance: solver цена
     is_feasible: bool
     total_served_volume: float = 0.0 # Обхът обслужен обем, използван за избор на "победител"
+    total_trips: int = 0
+    second_trips_count: int = 0
+    # Runtime identity is carried through API/web results so an experimental
+    # request can never be mistaken for a stable or OR-Tools fallback result.
+    solver_requested: str = ""
+    solver_used: str = ""
+    solver_backend: str = ""
+    solver_version: str = ""
+    solver_fallback_used: bool = False
+    solver_fallback_reason: str = ""
 
  
 
@@ -161,19 +191,28 @@ class ORToolsSolver:
             return "time"
         return "distance"
 
+    def _time_objective_includes_waiting(self) -> bool:
+        return self._objective_metric() == "time" and bool(
+            getattr(self.config, "time_objective_include_waiting", True)
+        )
+
+    def _time_objective_cost_weight(self) -> int:
+        return _FULL_WORKDAY_TIME_COST_WEIGHT if self._time_objective_includes_waiting() else 1
+
     def _objective_penalty_cost(self, penalty_value) -> int:
         penalty = max(0.0, float(penalty_value or 0))
         if self._objective_metric() == "time":
             # Existing penalties are tuned as meter-like costs. In time mode we
             # convert them with an approximate 40 km/h reference speed.
             penalty *= 0.09
+            penalty *= self._time_objective_cost_weight()
         return max(0, int(round(penalty)))
 
     def solve(self) -> CVRPSolution:
         """
         Стартира OR-Tools търсенето и връща извлеченото решение.
 
-        Минимизира разстояние и спазва твърдите ограничения:
+        Минимизира избраната цел (разстояние или време) и спазва твърдите ограничения:
         - Обем (capacity)
         - Разстояние (distance)
         - Брой клиенти (stops)
@@ -195,13 +234,17 @@ class ORToolsSolver:
             routing = pywrapcp.RoutingModel(manager)
             objective_metric = self._objective_metric()
             logger.info(f"Solver objective metric: {objective_metric}")
+            logger.info(
+                "Full-workday time objective (including waiting): %s",
+                self._time_objective_includes_waiting(),
+            )
 
             # 2. ЦЕНА НА МАРШРУТА = РАЗСТОЯНИЕ
             def distance_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
                 # КРИТИЧЕН ФИКС: OR-Tools очаква ЦЯЛО ЧИСЛО.
-                return int(self.distance_matrix.distances[from_node][to_node])
+                return int(data['distance_matrix'][from_node][to_node])
             
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
@@ -216,8 +259,56 @@ class ORToolsSolver:
                 return int(data['demands'][from_node]) # int() за сигурност
             demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
             routing.AddDimensionWithVehicleCapacity(
-                demand_callback_index, 0, data['vehicle_capacities'], True, "Capacity"
+                demand_callback_index,
+                data.get('capacity_slack_max', 0),
+                data['vehicle_capacities'],
+                True,
+                "Capacity",
             )
+            capacity_dimension = routing.GetDimensionOrDie("Capacity")
+
+            # Positive capacity slack is useful only on negative-demand reload
+            # nodes. Fix it to zero everywhere else to keep the model exact and
+            # avoid needless search degrees of freedom.
+            for customer_node in data.get('customer_node_indices', []):
+                customer_index = manager.NodeToIndex(customer_node)
+                if customer_index >= 0:
+                    capacity_dimension.SlackVar(customer_index).SetValue(0)
+            for vehicle_id in range(data['num_vehicles']):
+                capacity_dimension.SlackVar(routing.Start(vehicle_id)).SetValue(0)
+
+            # A depot included solely to anchor reload clones is not itself a
+            # visitable stop. The clones below represent every legal reload and
+            # include loading time/reset semantics.
+            terminal_depot_nodes = set(data['vehicle_starts']) | set(data['vehicle_ends'])
+            for depot_node in data.get('depot_indices', []):
+                if depot_node in terminal_depot_nodes:
+                    continue
+                depot_index = manager.NodeToIndex(depot_node)
+                if depot_index >= 0:
+                    routing.ActiveVar(depot_index).SetValue(0)
+
+            # Each reload clone is optional and belongs to exactly one physical
+            # vehicle. Its negative demand plus this equality makes the outgoing
+            # load exactly zero, while all other dimensions continue accumulating.
+            for reload_node, reload_meta in data.get('reload_nodes', {}).items():
+                reload_index = manager.NodeToIndex(reload_node)
+                owner_vehicle_id = int(reload_meta['vehicle_id'])
+                vehicle_capacity = int(reload_meta['capacity'])
+                routing.AddDisjunction([reload_index], 0)
+                # Keep -1 available for an inactive optional node while allowing
+                # exactly its owning physical vehicle when active. This linear CP
+                # constraint is also compatible with OR-Tools builds whose Python
+                # Span converter rejects SetAllowedVehiclesForIndex(list, ...).
+                routing.solver().Add(
+                    routing.VehicleVar(reload_index)
+                    == (owner_vehicle_id + 1) * routing.ActiveVar(reload_index) - 1
+                )
+                routing.solver().Add(
+                    capacity_dimension.CumulVar(reload_index)
+                    + capacity_dimension.SlackVar(reload_index)
+                    == vehicle_capacity
+                )
 
             # Разстояние - АКТИВИРАНО
             routing.AddDimensionWithVehicleCapacity(
@@ -226,7 +317,8 @@ class ORToolsSolver:
 
             # Брой клиенти (спирки) - АКТИВИРАНО
             def stop_callback(from_index):
-                return 1 if manager.IndexToNode(from_index) not in data['depot_indices'] else 0
+                node = manager.IndexToNode(from_index)
+                return 1 if data['node_kinds'][node] == "customer" else 0
             stop_callback_index = routing.RegisterUnaryTransitCallback(stop_callback)
             routing.AddDimensionWithVehicleCapacity(
                 stop_callback_index, 0, data['vehicle_max_stops'], True, "Stops"
@@ -238,18 +330,8 @@ class ORToolsSolver:
             
             # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
             traffic_zones = get_traffic_zones(self.location_config)
-            location_coords = []
-            num_locations = len(self.distance_matrix.distances)
-            for loc_idx in range(num_locations):
-                if loc_idx < len(self.unique_depots):
-                    coords = self.unique_depots[loc_idx]
-                else:
-                    client_idx = loc_idx - len(self.unique_depots)
-                    if client_idx < len(self.customers):
-                        coords = self.customers[client_idx].coordinates or (0, 0)
-                    else:
-                        coords = (0, 0)
-                location_coords.append(coords)
+            location_coords = data['node_locations']
+            num_locations = len(data['distance_matrix'])
 
             if traffic_zones:
                 logger.info(f"🚗 Градски трафик АКТИВИРАН за OR-Tools: {len(traffic_zones)} зони")
@@ -274,15 +356,41 @@ class ORToolsSolver:
                             location_coords[to_node],
                         )
 
+            def node_service_seconds(node: int, customer_service_time_seconds: int) -> int:
+                node_kind = data['node_kinds'][node]
+                if node_kind == "customer":
+                    customer_index = data['customer_index_by_node'].get(node)
+                    if customer_index is not None:
+                        override = getattr(
+                            self.customers[int(customer_index)],
+                            "service_time_minutes",
+                            None,
+                        )
+                        if override is not None and not (
+                            isinstance(override, str) and not override.strip()
+                        ):
+                            try:
+                                return max(0, int(round(float(override) * 60)))
+                            except (TypeError, ValueError, OverflowError):
+                                pass
+                    return customer_service_time_seconds
+                if node_kind == "reload":
+                    return int(data['reload_nodes'][node]['reload_time_seconds'])
+                return 0
+
             def objective_arc_cost(from_node: int, to_node: int, service_time_seconds: int = 0) -> int:
                 if objective_metric == "time":
-                    value = float(self.distance_matrix.durations[from_node][to_node] or 0)
+                    if self._time_objective_includes_waiting():
+                        # The Time dimension prices the complete workday. Arc
+                        # cost is reserved for constraint/preference penalties;
+                        # real metres have zero objective cost in time mode.
+                        return 0
+                    value = float(data['duration_matrix'][from_node][to_node] or 0)
                     if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
                         value *= float(traffic_multipliers[from_node][to_node] or 1.0)
-                    if from_node >= len(self.unique_depots):
-                        value += service_time_seconds
+                    value += node_service_seconds(from_node, service_time_seconds)
                     return max(0, int(round(value)))
-                return max(0, int(round(float(self.distance_matrix.distances[from_node][to_node] or 0))))
+                return max(0, int(round(float(data['distance_matrix'][from_node][to_node] or 0))))
 
             def safe_matrix_value(matrix, from_node: int, to_node: int, default: float = 0.0) -> float:
                 try:
@@ -297,14 +405,13 @@ class ORToolsSolver:
                     return default
 
             def time_arc_seconds(from_node: int, to_node: int, service_time_seconds: int = 0) -> int:
-                travel_time = safe_matrix_value(self.distance_matrix.durations, from_node, to_node, 3600.0)
+                travel_time = safe_matrix_value(data['duration_matrix'], from_node, to_node, 3600.0)
                 if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
                     traffic_multiplier = float(traffic_multipliers[from_node][to_node] or 1.0)
                     if traffic_multiplier > 1.0:
                         travel_time *= traffic_multiplier
 
-                if from_node >= len(self.unique_depots):
-                    travel_time += service_time_seconds
+                travel_time += node_service_seconds(from_node, service_time_seconds)
 
                 result = int(round(travel_time))
                 if result < 0:
@@ -314,9 +421,9 @@ class ORToolsSolver:
                 return result
 
             def customer_for_node(node: int) -> Optional[Customer]:
-                customer_index = node - len(self.unique_depots)
-                if 0 <= customer_index < len(self.customers):
-                    return self.customers[customer_index]
+                customer_index = data['customer_index_by_node'].get(node)
+                if customer_index is not None:
+                    return self.customers[int(customer_index)]
                 return None
 
             vehicle_time_matrices = []
@@ -332,7 +439,8 @@ class ORToolsSolver:
                     time_row = []
                     objective_row = []
                     for to_node in range(num_locations):
-                        time_row.append(time_arc_seconds(from_node, to_node, service_time_seconds))
+                        arc_time_seconds = time_arc_seconds(from_node, to_node, service_time_seconds)
+                        time_row.append(arc_time_seconds)
 
                         cost = objective_arc_cost(from_node, to_node, service_time_seconds)
                         customer = customer_for_node(to_node)
@@ -372,42 +480,6 @@ class ORToolsSolver:
                     except Exception:
                         return 3600
 
-                    try:
-                        if from_index < 0 or to_index < 0:
-                            return 0
-
-                        from_node = manager.IndexToNode(from_index)
-                        to_node = manager.IndexToNode(to_index)
-
-                        if (from_node >= len(self.distance_matrix.durations) or
-                            to_node >= len(self.distance_matrix.durations[0])):
-                            logger.warning(f"⚠️ Индекси извън граници: from_node={from_node}, to_node={to_node}")
-                            return 0
-
-                        travel_time = self.distance_matrix.durations[from_node][to_node]
-
-                        if from_node < len(traffic_multipliers) and to_node < len(traffic_multipliers[from_node]):
-                            traffic_multiplier = traffic_multipliers[from_node][to_node]
-                            if traffic_multiplier > 1.0:
-                                travel_time = travel_time * traffic_multiplier
-
-                        if from_node >= len(self.unique_depots):
-                            travel_time += service_time_seconds
-
-                        result = int(travel_time)
-                        if result < 0 or result > 86400:
-                            logger.warning(f"⚠️ Подозрителна time стойност: {result} сек за {from_node}->{to_node}")
-                            return min(result, 86400)
-
-                        return result
-
-                    except (OverflowError, IndexError, ValueError) as e:
-                        logger.warning(f"⚠️ Грешка в time callback vehicle={vehicle_id} ({from_index}->{to_index}): {e}")
-                        return 3600
-                    except Exception as e:
-                        logger.error(f"❌ Неочаквана грешка в time callback vehicle={vehicle_id}: {e}")
-                        return 3600
-
                 return vehicle_time_callback
 
             time_callback_indices = []
@@ -429,8 +501,19 @@ class ORToolsSolver:
             )
             time_dimension = routing.GetDimensionOrDie("Time")
 
-            if data.get('time_windows_enabled'):
-                logger.info("🕒 Прилагам работно време на клиенти към OR-Tools Time dimension")
+            if self._time_objective_includes_waiting():
+                for vehicle_id in range(data['num_vehicles']):
+                    time_dimension.SetSpanCostCoefficientForVehicle(
+                        self._time_objective_cost_weight(),
+                        vehicle_id,
+                    )
+                logger.info(
+                    "OR-Tools pure full-workday time objective enabled: fitness uses "
+                    "travel, service, waiting and reload duration in seconds; real "
+                    "metres have zero objective cost and remain in hard limits/reports."
+                )
+
+            if data.get('absolute_time_tracking'):
                 for vehicle_id, start_time_seconds in enumerate(data.get('vehicle_start_times', [])):
                     start_index = routing.Start(vehicle_id)
                     time_dimension.CumulVar(start_index).SetRange(
@@ -438,6 +521,8 @@ class ORToolsSolver:
                         int(start_time_seconds),
                     )
 
+            if data.get('time_windows_enabled'):
+                logger.info("🕒 Прилагам работно време на клиенти към OR-Tools Time dimension")
                 applied_windows = 0
                 for node_idx, window in enumerate(data.get('time_windows', [])):
                     if not window or node_idx in data['depot_indices']:
@@ -445,8 +530,16 @@ class ORToolsSolver:
                     index = manager.NodeToIndex(node_idx)
                     if index < 0:
                         continue
-                    start_s, end_s = window
-                    time_dimension.CumulVar(index).SetRange(int(start_s), int(end_s))
+                    windows = list(window)
+                    start_s = int(windows[0][0])
+                    end_s = int(windows[-1][1])
+                    cumul_var = time_dimension.CumulVar(index)
+                    cumul_var.SetRange(start_s, end_s)
+                    for current_window, next_window in zip(windows, windows[1:]):
+                        gap_start = int(current_window[1]) + 1
+                        gap_end = int(next_window[0]) - 1
+                        if gap_start <= gap_end:
+                            cumul_var.RemoveInterval(gap_start, gap_end)
                     applied_windows += 1
 
                 logger.info(f"✅ Работно време приложено за {applied_windows} клиента")
@@ -537,15 +630,20 @@ class ORToolsSolver:
                     self.config,
                 )
                 logger.info("🔄 Добавяне на възможност за пропускане на клиенти...")
-                for node_idx in range(len(self.unique_depots), len(data['distance_matrix'])):
+                optional_count = 0
+                for node_idx in data['customer_node_indices']:
                     # Добавяме възможността за пропускане, но с умерена глоба
                     # Ограничаваме до максимално допустимата стойност за int64
                     max_safe_penalty = 9223372036854775807  # Максимално допустима стойност за int64 (2^63-1)
-                    customer_idx = node_idx - len(self.unique_depots)
+                    customer_idx = data['customer_index_by_node'][node_idx]
+                    if is_mandatory_customer(self.customers[customer_idx]):
+                        continue
                     penalty = min(self._objective_penalty_cost(drop_penalties[customer_idx]), max_safe_penalty)
                     routing.AddDisjunction([manager.NodeToIndex(node_idx)], penalty)
+                    optional_count += 1
                 logger.info(
-                    "✅ Добавена възможност за пропускане на клиенти с индивидуални глоби: "
+                    f"✅ Добавена възможност за пропускане на {optional_count} незадължителни клиенти "
+                    "с индивидуални глоби: "
                     f"min={min(drop_penalties) if drop_penalties else 0}, "
                     f"max={max(drop_penalties) if drop_penalties else 0}"
                 )
@@ -572,16 +670,14 @@ class ORToolsSolver:
                     base_distance = objective_arc_cost(from_node, to_node, center_bus_service_time)
                     
                     # Ако това е клиент в център зоната - давам голям DISCOUNT
-                    if to_node >= len(self.unique_depots):
-                        customer_index = to_node - len(self.unique_depots)
-                        customer = self.customers[customer_index]
-                        
+                    customer = customer_for_node(to_node)
+                    if customer is not None:
                         if customer.id in {c.id for c in self.center_zone_customers}:
                             # DISCOUNT: Намаляваме разходите за CENTER_BUS за клиенти В ЦЕНТЪРА
                             return int(base_distance * self.location_config.discount_center_bus)
                     
                     # За клиенти извън център зоната - конфигурируема глоба.
-                    if to_node >= len(self.unique_depots):
+                    if customer is not None:
                         return base_distance + self._objective_penalty_cost(center_bus_outside_penalty)
 
                     return base_distance
@@ -617,10 +713,8 @@ class ORToolsSolver:
                     to_node = manager.IndexToNode(to_index)
                     
                     # Ако това е клиент в център зоната
-                    if to_node >= len(self.unique_depots):
-                        customer_index = to_node - len(self.unique_depots)
-                        customer = self.customers[customer_index]
-                        
+                    customer = customer_for_node(to_node)
+                    if customer is not None:
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.external_bus_center_penalty if self.location_config else 50000
                             return objective_arc_cost(from_node, to_node, external_bus_service_time) + self._objective_penalty_cost(multiplier)
@@ -644,10 +738,8 @@ class ORToolsSolver:
                     to_node = manager.IndexToNode(to_index)
                     
                     # Ако това е клиент в център зоната
-                    if to_node >= len(self.unique_depots):
-                        customer_index = to_node - len(self.unique_depots)
-                        customer = self.customers[customer_index]
-                        
+                    customer = customer_for_node(to_node)
+                    if customer is not None:
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.internal_bus_center_penalty if self.location_config else 50000
                             return objective_arc_cost(from_node, to_node, internal_bus_service_time) + self._objective_penalty_cost(multiplier)
@@ -671,10 +763,8 @@ class ORToolsSolver:
                     to_node = manager.IndexToNode(to_index)
                     
                     # Ако това е клиент в център зоната
-                    if to_node >= len(self.unique_depots):
-                        customer_index = to_node - len(self.unique_depots)
-                        customer = self.customers[customer_index]
-                        
+                    customer = customer_for_node(to_node)
+                    if customer is not None:
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.special_bus_center_penalty if self.location_config else 50000
                             return objective_arc_cost(from_node, to_node, special_bus_service_time) + self._objective_penalty_cost(multiplier)
@@ -698,10 +788,8 @@ class ORToolsSolver:
                     to_node = manager.IndexToNode(to_index)
                     
                     # Ако това е клиент в център зоната
-                    if to_node >= len(self.unique_depots):
-                        customer_index = to_node - len(self.unique_depots)
-                        customer = self.customers[customer_index]
-                        
+                    customer = customer_for_node(to_node)
+                    if customer is not None:
                         if _customer_is_in_center_zone(customer):
                             multiplier = self.location_config.vratza_bus_center_penalty if self.location_config else 100000
                             return objective_arc_cost(from_node, to_node, vratza_bus_service_time) + self._objective_penalty_cost(multiplier)
@@ -792,6 +880,66 @@ class ORToolsSolver:
             logger.error(f"❌ Грешка в OR-Tools solver: {e}", exc_info=True)
             return self._create_empty_solution()
 
+    def _multiple_trips_enabled(self) -> bool:
+        """Whether one physical vehicle may return to reload during its workday."""
+        return bool(getattr(self.config, "enable_multiple_trips", False))
+
+    def _daily_customer_limit(self, vehicle_config: VehicleConfig) -> int:
+        """Returns the cumulative customer limit for a physical vehicle/day.
+
+        The explicit daily setting is authoritative even when multi-trip is off
+        (one trip is still one workday).  The old per-route setting remains a
+        compatibility fallback for existing configurations.
+        """
+        configured = getattr(vehicle_config, "max_customers_per_day", None)
+        if configured is None:
+            configured = getattr(vehicle_config, "max_customers_per_route", None)
+        if configured is None:
+            return len(self.customers) + 1
+        try:
+            return max(0, int(configured))
+        except (TypeError, ValueError, OverflowError):
+            return len(self.customers) + 1
+
+    def _max_useful_trips_for_vehicle(self, vehicle_config: VehicleConfig) -> int:
+        """Problem/resource-derived upper bound, never a configured trip count.
+
+        A non-empty trip must serve at least one customer. It also consumes one
+        customer service time, while every trip after the first consumes a reload.
+        Those facts give a finite complete set of optional reload nodes without a
+        business-level ``max_trips`` setting.
+        """
+        customer_bound = min(len(self.customers), self._daily_customer_limit(vehicle_config))
+        if customer_bound <= 1:
+            return max(0, customer_bound)
+
+        try:
+            work_minutes = max(0.0, float(vehicle_config.max_time_hours or 0) * 60.0)
+        except (TypeError, ValueError, OverflowError):
+            work_minutes = 0.0
+        try:
+            service_minutes = max(0.0, float(vehicle_config.service_time_minutes or 0))
+        except (TypeError, ValueError, OverflowError):
+            service_minutes = 0.0
+        try:
+            reload_minutes = max(0.0, float(getattr(vehicle_config, "reload_time_minutes", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            reload_minutes = 0.0
+
+        per_extra_trip = service_minutes + reload_minutes
+        if work_minutes > 0 and per_extra_trip > 0:
+            time_bound = int((work_minutes + reload_minutes) // per_extra_trip)
+            customer_bound = min(customer_bound, max(1, time_bound))
+        return max(1, customer_bound)
+
+    def _vehicle_key(self, vehicle_config: VehicleConfig, vehicle_id: int) -> str:
+        occurrence = self._get_vehicle_occurrence_for_id(vehicle_id)
+        base = str(getattr(vehicle_config, "config_id", "") or "").strip()
+        if base:
+            return f"{base}#{occurrence}"
+        vehicle_type = getattr(vehicle_config.vehicle_type, "value", vehicle_config.vehicle_type)
+        return f"{vehicle_type}#{vehicle_id + 1}"
+
     def _create_data_model(self):
         """
         Изцяло пренаписана функция, за да се гарантира, че ЧЕТИРИТЕ твърди ограничения
@@ -800,14 +948,101 @@ class ORToolsSolver:
         """
         logger.info("--- СЪЗДАВАНЕ НА DATA MODEL (СТРИКТЕН РЕЖИМ) ---")
         data = {}
-        data['distance_matrix'] = self.distance_matrix.distances
-        data['demands'] = [0] * len(self.unique_depots) + [int(c.volume * 100) for c in self.customers]
+        base_distance_matrix = self.distance_matrix.distances
+        base_duration_matrix = self.distance_matrix.durations
+        base_node_count = len(base_distance_matrix)
+        expected_base_nodes = len(self.unique_depots) + len(self.customers)
+        if base_node_count != expected_base_nodes or len(base_duration_matrix) != base_node_count:
+            raise ValueError(
+                "Distance matrices must contain depots followed by customers before "
+                "OR-Tools reload clones are added"
+            )
+
+        # Metadata is authoritative: numeric ranges are no longer used to decide
+        # whether an augmented node is a customer, depot, or reload separator.
+        node_kinds = ["depot"] * len(self.unique_depots) + ["customer"] * len(self.customers)
+        customer_index_by_node = {
+            len(self.unique_depots) + customer_index: customer_index
+            for customer_index in range(len(self.customers))
+        }
+        node_base_indices = list(range(base_node_count))
+        node_locations = self._matrix_location_coords()
+        reload_nodes: Dict[int, Dict[str, object]] = {}
+        vehicle_reload_nodes: Dict[int, List[int]] = {}
+
+        enabled_vehicle_instances: List[VehicleConfig] = []
+        for vehicle_config in self.vehicle_configs:
+            if vehicle_config.enabled:
+                enabled_vehicle_instances.extend([vehicle_config] * int(vehicle_config.count))
+
+        if self._multiple_trips_enabled():
+            for vehicle_id, vehicle_config in enumerate(enabled_vehicle_instances):
+                capacity = int(round(float(vehicle_config.capacity or 0) * 100))
+                max_useful_trips = self._max_useful_trips_for_vehicle(vehicle_config)
+                if capacity <= 0 or max_useful_trips <= 1:
+                    continue
+
+                start_depot_index = self._get_depot_index_for_vehicle(vehicle_config)
+                reload_location = getattr(vehicle_config, "reload_location", None)
+                reload_base_index = self._get_depot_index_for_location(
+                    reload_location,
+                    start_depot_index,
+                )
+                reload_coords = self.unique_depots[reload_base_index]
+                reload_seconds = max(
+                    0,
+                    int(round(float(getattr(vehicle_config, "reload_time_minutes", 0) or 0) * 60)),
+                )
+
+                vehicle_reload_nodes[vehicle_id] = []
+                for sequence in range(1, max_useful_trips):
+                    node = len(node_kinds)
+                    node_kinds.append("reload")
+                    node_base_indices.append(reload_base_index)
+                    node_locations.append(reload_coords)
+                    vehicle_reload_nodes[vehicle_id].append(node)
+                    reload_nodes[node] = {
+                        "vehicle_id": vehicle_id,
+                        "sequence": sequence,
+                        "base_node": reload_base_index,
+                        "location": reload_coords,
+                        "capacity": capacity,
+                        "reload_time_seconds": reload_seconds,
+                    }
+
+        def expand_matrix(matrix):
+            return [
+                [matrix[from_base][to_base] for to_base in node_base_indices]
+                for from_base in node_base_indices
+            ]
+
+        data['distance_matrix'] = expand_matrix(base_distance_matrix)
+        data['duration_matrix'] = expand_matrix(base_duration_matrix)
+        data['node_kinds'] = node_kinds
+        data['customer_index_by_node'] = customer_index_by_node
+        data['customer_node_indices'] = sorted(customer_index_by_node)
+        data['node_locations'] = node_locations
+        data['reload_nodes'] = reload_nodes
+        data['vehicle_reload_nodes'] = vehicle_reload_nodes
+        data['multi_trip_enabled'] = self._multiple_trips_enabled()
+        data['base_node_count'] = base_node_count
+
+        data['demands'] = (
+            [0] * len(self.unique_depots)
+            + [int(round(float(c.volume or 0) * 100)) for c in self.customers]
+            + [
+                -int(reload_nodes[node]['capacity'])
+                for node in range(base_node_count, len(node_kinds))
+            ]
+        )
         data['time_windows_enabled'] = self._time_windows_enabled()
+        data['absolute_time_tracking'] = data['time_windows_enabled'] or self._multiple_trips_enabled()
         data['time_slack_max'] = 24 * 3600 if data['time_windows_enabled'] else 0
-        data['time_windows'] = [None] * len(self.unique_depots) + [
-            self._customer_time_window_seconds(customer)
-            for customer in self.customers
-        ]
+        data['time_windows'] = (
+            [None] * len(self.unique_depots)
+            + [self._customer_time_windows_seconds(customer) for customer in self.customers]
+            + [None] * len(reload_nodes)
+        )
         
         # Създаваме vehicle-specific service times
         # За депата service time е 0
@@ -825,7 +1060,7 @@ class ORToolsSolver:
             logger.info(f"  - VRATZA_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.VRATZA_BUS), 7)} мин")
         
         # За клиентите използваме 0 - service time ще се изчислява в callback-а
-        data['service_times'] = service_times + [0] * len(self.customers)
+        data['service_times'] = [0] * len(node_kinds)
         
         # Създаваме mapping от vehicle_id към service_time
         vehicle_service_times = {}
@@ -891,21 +1126,23 @@ class ORToolsSolver:
                         vratza_bus_vehicle_ids.append(vehicle_id)
                     
                     # 1. Обем (Capacity) - стриктно
-                    vehicle_capacities.append(int(v_config.capacity * 100))
+                    vehicle_capacities.append(int(round(float(v_config.capacity or 0) * 100)))
                     
                     # 2. Разстояние (Distance) - стриктно
                     max_dist = int(v_config.max_distance_km * 1000) if v_config.max_distance_km else 999999999
                     vehicle_max_distances.append(max_dist)
                     
                     # 3. Брой клиенти (Stops) - стриктно
-                    max_stops = v_config.max_customers_per_route if v_config.max_customers_per_route is not None else len(self.customers) + 1
+                    # One physical OR-Tools route represents the complete workday;
+                    # the Stops dimension therefore remains cumulative over trips.
+                    max_stops = self._daily_customer_limit(v_config)
                     vehicle_max_stops.append(max_stops)
 
                     # 4. Време (Time) - стриктно
                     max_time_seconds = int(v_config.max_time_hours * 3600)
                     start_time_seconds = self._vehicle_start_seconds(v_config)
                     vehicle_start_times.append(start_time_seconds)
-                    if data['time_windows_enabled']:
+                    if data['absolute_time_tracking']:
                         vehicle_max_times.append(start_time_seconds + max_time_seconds)
                     else:
                         vehicle_max_times.append(max_time_seconds)
@@ -929,6 +1166,7 @@ class ORToolsSolver:
         data['internal_bus_vehicle_ids'] = internal_bus_vehicle_ids
         data['special_bus_vehicle_ids'] = special_bus_vehicle_ids
         data['vratza_bus_vehicle_ids'] = vratza_bus_vehicle_ids
+        data['capacity_slack_max'] = max(vehicle_capacities, default=0) if data['multi_trip_enabled'] else 0
         
         logger.info(f"  - Капацитети: {data['vehicle_capacities']}")
         logger.info(f"  - Макс. разстояния (м): {data['vehicle_max_distances']}")
@@ -938,6 +1176,11 @@ class ORToolsSolver:
             logger.info(f"  - Стартови времена (сек): {data['vehicle_start_times']}")
             logger.info("  - Работно време на клиенти: АКТИВНО")
         logger.info(f"  - Fixed costs: {data['vehicle_fixed_costs']}")
+        logger.info(
+            "  - Dynamic reload clones: %s (%s)",
+            len(data['reload_nodes']),
+            "enabled" if data['multi_trip_enabled'] else "disabled",
+        )
         logger.info(f"  - CENTER_BUS превозни средства: {center_bus_vehicle_ids}")
         logger.info(f"  - EXTERNAL_BUS превозни средства: {external_bus_vehicle_ids}")
         logger.info(f"  - INTERNAL_BUS превозни средства: {internal_bus_vehicle_ids}")
@@ -1012,15 +1255,7 @@ class ORToolsSolver:
         return f"{hours:02d}:{minutes:02d}"
 
     def _format_customer_time_window_for_schedule(self, customer: Customer) -> str:
-        window = self._customer_time_window_seconds(customer)
-        if not window:
-            return ""
-        if (
-            getattr(customer, "time_window_start_minutes", None) is None
-            and getattr(customer, "time_window_end_minutes", None) is None
-        ):
-            return "Постоянно"
-        return f"{self._format_schedule_time(window[0])}-{self._format_schedule_time(window[1])}"
+        return self._format_customer_time_windows_for_schedule(customer)
 
     def _build_route_schedule_entries(
         self,
@@ -1028,18 +1263,23 @@ class ORToolsSolver:
         depot_location: Tuple[float, float],
         vehicle_config: Optional[VehicleConfig],
         end_location: Optional[Tuple[float, float]] = None,
+        start_time_seconds_override: Optional[float] = None,
     ) -> Tuple[List[Dict[str, object]], float, float]:
         if not customers:
             return [], 0.0, 0.0
 
         depot_index = self._get_depot_index_for_location(depot_location, 0)
         end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
-        service_time_seconds = (
+        default_service_time_seconds = (
             float(vehicle_config.service_time_minutes) * 60
             if vehicle_config
             else 15 * 60
         )
-        start_time_seconds = float(self._vehicle_start_seconds(vehicle_config))
+        start_time_seconds = (
+            float(start_time_seconds_override)
+            if start_time_seconds_override is not None
+            else float(self._vehicle_start_seconds(vehicle_config))
+        )
         current_clock_seconds = start_time_seconds
         total_time_seconds = 0.0
         cumulative_distance_m = 0.0
@@ -1055,26 +1295,34 @@ class ORToolsSolver:
                 logger.warning("Customer %s was not found while building route schedule", customer.id)
                 continue
 
-            distance_m = float(self.distance_matrix.distances[current_node][customer_index])
+            distance_m = max(
+                0.0,
+                float(self.distance_matrix.distances[current_node][customer_index]),
+            )
             travel_time_seconds = self._travel_time_seconds(current_node, customer_index, location_coords)
+            service_override = getattr(customer, "service_time_minutes", None)
+            if service_override is None or (
+                isinstance(service_override, str) and not service_override.strip()
+            ):
+                service_time_seconds = default_service_time_seconds
+            else:
+                try:
+                    service_time_seconds = max(0.0, float(service_override) * 60)
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning(
+                        "Invalid service_time_minutes=%r for customer %s; using vehicle default.",
+                        service_override,
+                        customer.id,
+                    )
+                    service_time_seconds = default_service_time_seconds
             cumulative_distance_m += distance_m
 
             raw_arrival_seconds = current_clock_seconds + travel_time_seconds
-            wait_seconds = 0.0
-            time_window_status = ""
-            window = self._customer_time_window_seconds(customer)
-            if window:
-                window_start, window_end = window
-                if raw_arrival_seconds < window_start:
-                    wait_seconds = float(window_start - raw_arrival_seconds)
-                    time_window_status = "Изчакване"
-                arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
-                if arrival_after_wait_seconds > window_end:
-                    time_window_status = "След работно време"
-                elif not time_window_status:
-                    time_window_status = "OK"
-            else:
-                arrival_after_wait_seconds = raw_arrival_seconds
+            wait_seconds, time_window_status = self._time_window_status_for_arrival(
+                raw_arrival_seconds,
+                customer,
+            )
+            arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
 
             step_time_seconds = travel_time_seconds + wait_seconds + service_time_seconds
             total_time_seconds += step_time_seconds
@@ -1102,7 +1350,10 @@ class ORToolsSolver:
             previous_stop_name = customer.name
 
         if entries:
-            cumulative_distance_m += float(self.distance_matrix.distances[current_node][end_depot_index])
+            cumulative_distance_m += max(
+                0.0,
+                float(self.distance_matrix.distances[current_node][end_depot_index]),
+            )
             total_time_seconds += self._travel_time_seconds(
                 current_node,
                 end_depot_index,
@@ -1179,20 +1430,19 @@ class ORToolsSolver:
             total_time += travel_time
             current_clock_seconds += travel_time
 
-            window = self._customer_time_window_seconds(customer)
-            if window:
-                window_start, window_end = window
-                if current_clock_seconds < window_start:
-                    wait_seconds = window_start - current_clock_seconds
-                    total_time += wait_seconds
-                    current_clock_seconds += wait_seconds
-                elif current_clock_seconds > window_end:
-                    logger.debug(
-                        "Клиент %s е след работното време при преизчисление: %.1f мин > %.1f мин",
-                        customer.id,
-                        current_clock_seconds / 60,
-                        window_end / 60,
-                    )
+            wait_seconds, time_window_status = self._time_window_status_for_arrival(
+                current_clock_seconds,
+                customer,
+            )
+            if wait_seconds:
+                total_time += wait_seconds
+                current_clock_seconds += wait_seconds
+            elif time_window_status.startswith("След работно време"):
+                logger.debug(
+                    "Клиент %s е след работното време при преизчисление: %.1f мин",
+                    customer.id,
+                    current_clock_seconds / 60,
+                )
             
             # Service time за клиента (само за клиенти, не за депо)
             total_time += service_time_seconds
@@ -1225,6 +1475,9 @@ class ORToolsSolver:
         Обхожда маршрути по превозни средства, събира клиенти, изчислява разстояния и времена
         чрез Time dimension и матрицата, и връща агрегирани метрики.
         """
+        if data.get('multi_trip_enabled'):
+            return self._extract_multi_trip_solution(manager, routing, solution, data)
+
         logger.info("--- ИЗВЛИЧАНЕ НА РЕШЕНИЕ ---")
         start_time = time.time()
         
@@ -1298,9 +1551,17 @@ class ORToolsSolver:
                 # КЛЮЧОВА ПРОМЯНА: Взимаме времето директно от решението на солвъра.
                 # Това гарантира 100% консистентност между оптимизация и отчет.
                 route_end_index = routing.End(vehicle_id)
-                ortools_time_seconds = solution.Value(time_dimension.CumulVar(route_end_index))
-                if data.get('time_windows_enabled'):
-                    ortools_time_seconds -= int(data.get('vehicle_start_times', [0] * routing.vehicles())[vehicle_id])
+                dimension_end_seconds = solution.Value(time_dimension.CumulVar(route_end_index))
+                dimension_start_seconds = solution.Value(
+                    time_dimension.CumulVar(routing.Start(vehicle_id))
+                )
+                ortools_time_seconds = dimension_end_seconds - dimension_start_seconds
+                if data.get('absolute_time_tracking'):
+                    absolute_start_seconds = dimension_start_seconds
+                    absolute_end_seconds = dimension_end_seconds
+                else:
+                    absolute_start_seconds = self._vehicle_start_seconds(vehicle_config)
+                    absolute_end_seconds = absolute_start_seconds + ortools_time_seconds
 
                 # НОВА ФУНКЦИОНАЛНОСТ: Изчисляваме точното време с vehicle-specific service time
                 schedule_entries, _, accurate_time_seconds = self._build_route_schedule_entries(
@@ -1329,7 +1590,13 @@ class ORToolsSolver:
                     total_time_minutes=accurate_time_seconds / 60,  # Използваме точното време!
                     total_volume=sum(c.volume for c in route_customers),
                     is_feasible=True,
-                    schedule_entries=schedule_entries
+                    schedule_entries=schedule_entries,
+                    vehicle_key=self._vehicle_key(vehicle_config, vehicle_id),
+                    trip_number=1,
+                    trip_count=1,
+                    route_id=f"{self._vehicle_key(vehicle_config, vehicle_id)}:trip:1",
+                    planned_start_minutes=absolute_start_seconds / 60.0,
+                    planned_end_minutes=absolute_end_seconds / 60.0,
                 )
                 
                 # Връщаме валидациите, за да сме сигурни, че решението спазва правилата
@@ -1402,9 +1669,15 @@ class ORToolsSolver:
             total_distance_km=total_distance_km,  # ← СЛЕД TSP оптимизацията!
             total_time_minutes=total_time_minutes,  # ← СЛЕД TSP оптимизацията!
             total_vehicles_used=len(routes),
-            fitness_score=float(solution.ObjectiveValue()),
+            fitness_score=(
+                float(total_time_minutes * 60)
+                if self._objective_metric() == "time"
+                else float(solution.ObjectiveValue())
+            ),
             is_feasible=True, # Ще се обнови по-долу
-            total_served_volume=total_served_volume
+            total_served_volume=total_served_volume,
+            total_trips=len(routes),
+            second_trips_count=0,
         )
         
         # Проверка на общата валидност на решението
@@ -1414,6 +1687,213 @@ class ORToolsSolver:
         
         logger.info(f"--- РЕШЕНИЕТО ИЗВЛЕЧЕНО ({time.time() - start_time:.2f} сек.) ---")
         return cvrp_solution
+
+    def _extract_multi_trip_solution(self, manager, routing, solution, data) -> CVRPSolution:
+        """Flattens one cumulative physical-vehicle route into delivery trips."""
+        logger.info("--- ИЗВЛИЧАНЕ НА DYNAMIC MULTI-TRIP РЕШЕНИЕ ---")
+        time_dimension = routing.GetDimensionOrDie("Time")
+        routes: List[Route] = []
+        all_serviced_customer_indices = set()
+        used_vehicle_ids = set()
+        total_physical_distance_m = 0.0
+        total_physical_time_seconds = 0.0
+
+        for vehicle_id in range(routing.vehicles()):
+            vehicle_config = self._get_vehicle_config_for_id(vehicle_id)
+            start_index = routing.Start(vehicle_id)
+            end_index = routing.End(vehicle_id)
+            start_node = manager.IndexToNode(start_index)
+            final_end_node = manager.IndexToNode(end_index)
+            physical_start_seconds = float(solution.Value(time_dimension.CumulVar(start_index)))
+            physical_end_seconds = float(solution.Value(time_dimension.CumulVar(end_index)))
+
+            segment_start_node = start_node
+            segment_start_seconds = physical_start_seconds
+            segment_customers: List[Customer] = []
+            segment_distance_m = 0.0
+            vehicle_distance_m = 0.0
+            vehicle_customer_indices = []
+            raw_segments: List[Dict[str, object]] = []
+
+            index = start_index
+            iteration_count = 0
+            max_iterations = len(data['distance_matrix']) + routing.vehicles() + 5
+
+            while not routing.IsEnd(index):
+                iteration_count += 1
+                if iteration_count > max_iterations:
+                    logger.error(
+                        "Multi-trip extraction stopped after %s iterations for vehicle %s",
+                        max_iterations,
+                        vehicle_id,
+                    )
+                    break
+
+                node = manager.IndexToNode(index)
+                customer_index = data['customer_index_by_node'].get(node)
+                if customer_index is not None:
+                    customer_index = int(customer_index)
+                    segment_customers.append(self.customers[customer_index])
+                    vehicle_customer_indices.append(customer_index)
+                    all_serviced_customer_indices.add(customer_index)
+
+                next_index = solution.Value(routing.NextVar(index))
+                next_node = manager.IndexToNode(next_index)
+                arc_distance_m = float(data['distance_matrix'][node][next_node] or 0)
+                segment_distance_m += arc_distance_m
+                vehicle_distance_m += arc_distance_m
+
+                if data['node_kinds'][next_node] == "reload":
+                    reload_meta = data['reload_nodes'][next_node]
+                    reload_arrival_seconds = float(
+                        solution.Value(time_dimension.CumulVar(next_index))
+                    )
+                    if segment_customers:
+                        raw_segments.append({
+                            "customers": list(segment_customers),
+                            "start_node": segment_start_node,
+                            "end_node": next_node,
+                            "start_seconds": segment_start_seconds,
+                            "end_seconds": reload_arrival_seconds,
+                            "distance_m": segment_distance_m,
+                        })
+                    segment_customers = []
+                    segment_distance_m = 0.0
+                    segment_start_node = next_node
+                    segment_start_seconds = (
+                        reload_arrival_seconds
+                        + float(reload_meta['reload_time_seconds'])
+                    )
+
+                index = next_index
+
+            if segment_customers:
+                raw_segments.append({
+                    "customers": list(segment_customers),
+                    "start_node": segment_start_node,
+                    "end_node": final_end_node,
+                    "start_seconds": segment_start_seconds,
+                    "end_seconds": physical_end_seconds,
+                    "distance_m": segment_distance_m,
+                })
+
+            if not raw_segments:
+                continue
+
+            used_vehicle_ids.add(vehicle_id)
+            total_physical_distance_m += vehicle_distance_m
+            total_physical_time_seconds += max(
+                0.0,
+                physical_end_seconds - physical_start_seconds,
+            )
+
+            trip_count = len(raw_segments)
+            vehicle_key = self._vehicle_key(vehicle_config, vehicle_id)
+            vehicle_name = self._get_vehicle_display_name(
+                vehicle_config,
+                self._get_vehicle_occurrence_for_id(vehicle_id),
+            )
+            vehicle_routes: List[Route] = []
+
+            for trip_number, segment in enumerate(raw_segments, start=1):
+                customers = segment['customers']
+                depot_location = data['node_locations'][int(segment['start_node'])]
+                end_location = data['node_locations'][int(segment['end_node'])]
+                planned_start_seconds = float(segment['start_seconds'])
+                planned_end_seconds = float(segment['end_seconds'])
+                schedule_entries, _, _ = self._build_route_schedule_entries(
+                    customers,
+                    depot_location,
+                    vehicle_config,
+                    end_location,
+                    start_time_seconds_override=planned_start_seconds,
+                )
+                total_volume = sum(float(customer.volume or 0) for customer in customers)
+                trip_is_feasible = total_volume <= float(vehicle_config.capacity or 0) + 1e-9
+
+                route = Route(
+                    vehicle_type=vehicle_config.vehicle_type,
+                    vehicle_id=vehicle_id,
+                    customers=customers,
+                    depot_location=depot_location,
+                    end_location=end_location,
+                    vehicle_name=vehicle_name,
+                    total_distance_km=float(segment['distance_m']) / 1000.0,
+                    total_time_minutes=max(
+                        0.0,
+                        planned_end_seconds - planned_start_seconds,
+                    ) / 60.0,
+                    total_volume=total_volume,
+                    is_feasible=trip_is_feasible,
+                    schedule_entries=schedule_entries,
+                    vehicle_key=vehicle_key,
+                    trip_number=trip_number,
+                    trip_count=trip_count,
+                    route_id=f"{vehicle_key}:trip:{trip_number}",
+                    planned_start_minutes=planned_start_seconds / 60.0,
+                    planned_end_minutes=planned_end_seconds / 60.0,
+                )
+                vehicle_routes.append(route)
+
+            daily_limit = self._daily_customer_limit(vehicle_config)
+            work_limit_seconds = max(0.0, float(vehicle_config.max_time_hours or 0) * 3600.0)
+            physical_duration_seconds = max(
+                0.0,
+                physical_end_seconds - physical_start_seconds,
+            )
+            daily_violations = []
+            if len(vehicle_customer_indices) > daily_limit:
+                daily_violations.append(
+                    f"customers {len(vehicle_customer_indices)} > {daily_limit}"
+                )
+            if work_limit_seconds and physical_duration_seconds > work_limit_seconds + 60:
+                daily_violations.append(
+                    f"time {physical_duration_seconds / 60:.1f}m > {work_limit_seconds / 60:.1f}m"
+                )
+            max_distance_km = getattr(vehicle_config, "max_distance_km", None)
+            if max_distance_km and vehicle_distance_m > float(max_distance_km) * 1000 + 1:
+                daily_violations.append(
+                    f"distance {vehicle_distance_m / 1000:.1f}km > {float(max_distance_km):.1f}km"
+                )
+
+            if daily_violations:
+                logger.warning(
+                    "Vehicle %s violates cumulative daily limits: %s",
+                    vehicle_key,
+                    ", ".join(daily_violations),
+                )
+                for route in vehicle_routes:
+                    route.is_feasible = False
+
+            routes.extend(vehicle_routes)
+
+        all_customer_indices = set(range(len(self.customers)))
+        dropped_customer_indices = all_customer_indices - all_serviced_customer_indices
+        dropped_customers = [self.customers[index] for index in dropped_customer_indices]
+        dropped_customers.sort(key=lambda customer: customer.volume, reverse=True)
+
+        total_served_volume = sum(route.total_volume for route in routes)
+        total_trips = len(routes)
+        total_vehicles_used = len(used_vehicle_ids)
+        second_trips_count = max(0, total_trips - total_vehicles_used)
+        invalid_routes = [route for route in routes if not route.is_feasible]
+
+        return CVRPSolution(
+            routes=routes,
+            dropped_customers=dropped_customers,
+            total_distance_km=total_physical_distance_m / 1000.0,
+            total_time_minutes=total_physical_time_seconds / 60.0,
+            total_vehicles_used=total_vehicles_used,
+            fitness_score=(
+                float(total_physical_time_seconds)
+                if self._objective_metric() == "time"
+                else float(solution.ObjectiveValue())
+            ),
+            is_feasible=not invalid_routes and not dropped_customers,
+            total_served_volume=total_served_volume,
+            total_trips=total_trips,
+            second_trips_count=second_trips_count,
+        )
 
     def _get_customer_index_by_id(self, customer_id: str) -> int:
         """Намира индекса на клиент по ID"""
@@ -1468,23 +1948,46 @@ class ORToolsSolver:
         return max(0, minutes) * 60
 
     def _customer_time_window_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        return windows[0] if windows else None
+
+    def _customer_time_windows_seconds(self, customer: Customer) -> List[Tuple[int, int]]:
         if not self._time_windows_enabled():
+            return []
+
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            return []
+
+        return time_windows_to_seconds(windows)
+
+    def _format_customer_time_windows_for_schedule(self, customer: Customer) -> str:
+        windows = customer_time_windows_minutes(customer)
+        if not windows:
+            if self._time_windows_enabled():
+                return "Постоянно"
+            return ""
+        return format_time_windows_minutes(windows)
+
+    def _time_window_status_for_arrival(
+        self,
+        arrival_seconds: float,
+        customer: Customer,
+    ) -> Tuple[float, str]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
+            return 0.0, ""
+
+        _, wait_seconds, window_index, status = choose_time_window_for_arrival(arrival_seconds, windows)
+        if status and len(windows) > 1 and window_index >= 0:
+            status = f"{status} (прозорец {window_index + 1})"
+        return wait_seconds, status
+
+    def _customer_time_window_domain_seconds(self, customer: Customer) -> Optional[Tuple[int, int]]:
+        windows = self._customer_time_windows_seconds(customer)
+        if not windows:
             return None
-
-        start_minutes = getattr(customer, "time_window_start_minutes", None)
-        end_minutes = getattr(customer, "time_window_end_minutes", None)
-
-        if start_minutes is None:
-            start_minutes = 0
-        if end_minutes is None:
-            end_minutes = 1439
-
-        start_minutes = max(0, int(start_minutes))
-        end_minutes = max(0, int(end_minutes))
-        if end_minutes < start_minutes:
-            end_minutes += 24 * 60
-
-        return start_minutes * 60, end_minutes * 60
+        return windows[0][0], windows[-1][1]
     
     def _create_empty_solution(self) -> CVRPSolution:
         """Създава празно решение в случай на грешка."""
@@ -1540,7 +2043,17 @@ class ORToolsSolver:
                 total_time_minutes=new_time_minutes,
                 total_volume=sum(c.volume for c in optimized_customers),
                 is_feasible=True,
-                schedule_entries=schedule_entries
+                schedule_entries=schedule_entries,
+                vehicle_key=getattr(route, "vehicle_key", ""),
+                trip_number=getattr(route, "trip_number", 1),
+                trip_count=getattr(route, "trip_count", 1),
+                route_id=getattr(route, "route_id", ""),
+                planned_start_minutes=getattr(route, "planned_start_minutes", None),
+                planned_end_minutes=(
+                    float(route.planned_start_minutes) + new_time_minutes
+                    if getattr(route, "planned_start_minutes", None) is not None
+                    else getattr(route, "planned_end_minutes", None)
+                ),
             )
             
             # Валидираме новия маршрут
@@ -1862,6 +2375,8 @@ class ORToolsSolver:
                     f"max={max(drop_penalties) if drop_penalties else 0}"
                 )
                 for node in range(1, len(data['distance_matrix'])):
+                    if is_mandatory_customer(self.customers[node - 1]):
+                        continue
                     penalty = self._objective_penalty_cost(drop_penalties[node - 1])
                     routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
                 logger.info("✅ Добавена възможност за пропускане на клиенти")
@@ -2081,7 +2596,7 @@ class ORToolsSolver:
         
         # Demands - депо има 0, клиенти имат реални стойности
         # Конвертираме обемите към цели числа с по-голям мащаб за по-висока прецизност
-        data['demands'] = [0] + [max(1, int(c.volume * SCALE_FACTOR)) for c in self.customers]
+        data['demands'] = [0] + [max(1, int(round(float(c.volume or 0) * SCALE_FACTOR))) for c in self.customers]
         
         # Добавяме подробна информация за дебъг
         total_demand = sum(data['demands'])
@@ -2094,7 +2609,7 @@ class ORToolsSolver:
         for v_config in self.vehicle_configs:
             if v_config.enabled:
                 # Скалираме капацитета в СЪЩИЯ мащаб като изискванията
-                capacity = int(v_config.capacity * SCALE_FACTOR)
+                capacity = int(round(float(v_config.capacity or 0) * SCALE_FACTOR))
                 logger.info(f"🚚 Превозно средство {v_config.vehicle_type.value}: капацитет {v_config.capacity} → {capacity} (scaled)")
                 for _ in range(v_config.count):
                     data['vehicle_capacities'].append(capacity)
@@ -2252,7 +2767,22 @@ class ORToolsSolver:
                     total_time_minutes=route_time_minutes,
                     total_volume=total_volume,
                     is_feasible=True,
-                    schedule_entries=schedule_entries
+                    schedule_entries=schedule_entries,
+                    vehicle_key=self._vehicle_key(vehicle_config, vehicle_id) if vehicle_config else str(vehicle_id),
+                    trip_number=1,
+                    trip_count=1,
+                    route_id=(
+                        f"{self._vehicle_key(vehicle_config, vehicle_id)}:trip:1"
+                        if vehicle_config else f"{vehicle_id}:trip:1"
+                    ),
+                    planned_start_minutes=(
+                        float(self._vehicle_start_seconds(vehicle_config)) / 60.0
+                        if vehicle_config else None
+                    ),
+                    planned_end_minutes=(
+                        float(self._vehicle_start_seconds(vehicle_config)) / 60.0 + route_time_minutes
+                        if vehicle_config else None
+                    ),
                 )
                 
                 routes.append(route)
@@ -2307,9 +2837,15 @@ class ORToolsSolver:
             total_distance_km=total_distance_km,
             total_time_minutes=sum(r.total_time_minutes for r in routes),
             total_vehicles_used=len(routes),
-            fitness_score=float(solution.ObjectiveValue()),
+            fitness_score=(
+                float(total_time_minutes * 60)
+                if self._objective_metric() == "time"
+                else float(solution.ObjectiveValue())
+            ),
             is_feasible=True,
-            total_served_volume=total_served_volume
+            total_served_volume=total_served_volume,
+            total_trips=len(routes),
+            second_trips_count=0,
         )
 
 
@@ -2333,7 +2869,11 @@ class CVRPSolver:
         
         enabled_vehicles = self.vehicle_configs if self.vehicle_configs is not None else (get_config().vehicles or [])
         
-        sorted_depots = build_ordered_depots(depot_location, enabled_vehicles)
+        sorted_depots = build_ordered_depots(
+            depot_location,
+            enabled_vehicles,
+            include_reload_locations=bool(getattr(self.config, "enable_multiple_trips", False)),
+        )
         logger.info(f"Ред на депата в OR-Tools solver: {sorted_depots}")
         
         # Директно използваме OR-Tools
@@ -2347,10 +2887,12 @@ class CVRPSolver:
         logger.info(f"🔍 CVRPSolver: use_simple_solver = {self.config.use_simple_solver}")
         
         # Избираме кой solver да използваме
-        if self.config.use_simple_solver:
+        if self.config.use_simple_solver and not getattr(self.config, "enable_multiple_trips", False):
             logger.info("🔧 Използване на опростен solver (само capacity constraints)")
             return solver.solve_simple()
         else:
+            if self.config.use_simple_solver and getattr(self.config, "enable_multiple_trips", False):
+                logger.warning("Dynamic multi-trip requires the full OR-Tools solver; simple mode is bypassed")
             logger.info("🔧 Използване на пълен solver (всички constraints)")
             return solver.solve()
 

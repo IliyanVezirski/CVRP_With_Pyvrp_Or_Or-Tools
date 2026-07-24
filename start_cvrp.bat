@@ -3,12 +3,12 @@ set "APP_DIR=%~dp0"
 cd /d "%APP_DIR%"
 set "PYINSTALLER_RESET_ENVIRONMENT=1"
 set "_MEIPASS2="
-echo CVRP Optimizer - Starting...
+echo Bizant - Starting...
 echo.
 
-if exist "%APP_DIR%CVRP_Optimizer.exe" (
+if exist "%APP_DIR%Bizant.exe" (
     set "APP_MODE=exe"
-    set "APP_CMD=%APP_DIR%CVRP_Optimizer.exe"
+    set "APP_CMD=%APP_DIR%Bizant.exe"
 ) else if exist "%APP_DIR%.venv\Scripts\python.exe" (
     set "APP_MODE=python"
     set "APP_CMD=%APP_DIR%.venv\Scripts\python.exe"

@@ -23,6 +23,9 @@ wheels/
 
 # Virtual Environment
 .venv/
+.venv-vroom/
+.venv-pyvrp-next/
+.venv-vrp-rust/
 venv/
 ENV/
 env/

@@ -22,6 +22,14 @@ import config
 logger = logging.getLogger(__name__)
 
 
+class MandatoryCustomerError(ValueError):
+    """Base error for mandatory-client input or feasibility failures."""
+
+
+class MandatoryFlagError(MandatoryCustomerError):
+    """Raised when an explicit mandatory marker cannot be interpreted safely."""
+
+
 @dataclass
 class Customer:
     """Клас за представяне на клиент"""
@@ -35,8 +43,11 @@ class Customer:
     source_id_skld: str = ""
     time_window_start_minutes: Optional[int] = None
     time_window_end_minutes: Optional[int] = None
+    time_windows: List[Tuple[int, int]] = field(default_factory=list)
     delivery_comment: str = ""
     grouped_documents: List[Dict[str, object]] = field(default_factory=list)
+    service_time_minutes: Optional[float] = None
+    mandatory: bool = False
 
 
 TIME_WINDOW_FIELD_ALIASES = (
@@ -81,6 +92,35 @@ DELIVERY_COMMENT_FIELD_ALIASES = (
     "Коментар доставка",
     "Забележка",
     "Забележка доставка",
+)
+SERVICE_TIME_FIELD_ALIASES = (
+    "ServiceTimeMinutes",
+    "service_time_minutes",
+    "serviceTimeMinutes",
+    "ServiceMinutes",
+    "service_minutes",
+    "serviceMinutes",
+    "CustomerServiceTimeMinutes",
+    "customer_service_time_minutes",
+    "VisitTimeMinutes",
+    "visit_time_minutes",
+    "ServiceTime",
+    "service_time",
+    "Време за обслужване",
+)
+MANDATORY_FIELD_ALIASES = (
+    "Mandatory",
+    "mandatory",
+    "IsMandatory",
+    "is_mandatory",
+    "Required",
+    "required",
+    "IsRequired",
+    "is_required",
+    "MustServe",
+    "must_serve",
+    "Задължителен",
+    "Задължителна доставка",
 )
 
 
@@ -133,6 +173,110 @@ def _clean_text_value(value) -> str:
     return str(value).strip()
 
 
+def _parse_volume_value(value, context: str = "") -> float:
+    """Parse stack volume while preserving decimal halves from Excel/HTTP input."""
+    if _is_empty_value(value):
+        return 0.0
+
+    if isinstance(value, bool):
+        raise ValueError(f"Невалиден обем{context}: {value!r}")
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isnan(number):
+            return 0.0
+        return number
+
+    text = str(value).strip().replace("\xa0", " ")
+    if not text:
+        return 0.0
+
+    compact = re.sub(r"\s+", "", text)
+    matches = re.findall(r"[-+]?\d+(?:[.,]\d+)*", compact)
+    if not matches:
+        raise ValueError(f"Невалиден обем{context}: {value!r}")
+    compact = matches[0]
+
+    if "," in compact and "." in compact:
+        if compact.rfind(",") > compact.rfind("."):
+            compact = compact.replace(".", "").replace(",", ".")
+        else:
+            compact = compact.replace(",", "")
+    elif "," in compact:
+        compact = compact.replace(",", ".")
+
+    try:
+        return float(compact)
+    except ValueError as exc:
+        raise ValueError(f"Невалиден обем{context}: {value!r}") from exc
+
+
+def _safe_service_time_minutes(value, context: str = "") -> Optional[float]:
+    """Parse an optional per-stop service duration expressed in minutes.
+
+    Invalid values are treated as missing so the solver can safely fall back to
+    the service time configured for the selected vehicle.
+    """
+    if _is_empty_value(value):
+        return None
+
+    number: Optional[float] = None
+    if isinstance(value, bool):
+        logger.warning("Игнорирам невалидно време за обслужване%s: %r", context, value)
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().replace("\xa0", " ")
+        duration_match = re.fullmatch(r"(\d{1,3})\s*:\s*(\d{1,2})", text)
+        if duration_match:
+            hours = int(duration_match.group(1))
+            minutes = int(duration_match.group(2))
+            if minutes <= 59:
+                number = float(hours * 60 + minutes)
+        else:
+            minute_match = re.fullmatch(
+                r"([-+]?\d+(?:[.,]\d+)?)\s*(?:min(?:ute)?s?|мин(?:ута|ути)?\.?)?",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if minute_match:
+                number = float(minute_match.group(1).replace(",", "."))
+
+    if number is None or not math.isfinite(number) or number < 0:
+        logger.warning("Игнорирам невалидно време за обслужване%s: %r", context, value)
+        return None
+    return number
+
+
+def _parse_mandatory_flag(value, context: str = "") -> bool:
+    """Parse an optional hard-service marker from JSON or Excel input."""
+    if _is_empty_value(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number) and number in (0.0, 1.0):
+            return bool(int(number))
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "да", "mandatory", "required", "задължителен"}:
+        return True
+    if text in {"0", "false", "no", "n", "не", "optional", "незадължителен"}:
+        return False
+    raise MandatoryFlagError(
+        f"Невалидна стойност за задължителен клиент{context}: {value!r}. "
+        "Използвай true/false, 1/0 или да/не."
+    )
+
+
+def is_mandatory_customer(customer: Customer) -> bool:
+    """Return whether this customer must be served in an accepted solution."""
+    return bool(getattr(customer, "mandatory", False))
+
+
 def _safe_delivery_comment(value, context: str = "") -> str:
     """Return a safe one-line delivery comment, or empty string for invalid values."""
     if _is_empty_value(value):
@@ -171,7 +315,7 @@ def _loads_json_tolerant(raw: str):
         if "invalid control character" not in message:
             raise
         logger.warning(
-            "JSON отговорът съдържа суров newline/tab в текстово поле; "
+            "JSON съдържанието съдържа суров newline/tab в текстово поле; "
             "опитвам tolerant JSON decode."
         )
         return json.loads(raw, strict=False)
@@ -273,29 +417,64 @@ def _time_tokens_from_text(text: str) -> List[str]:
     return valid_compact
 
 
-def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
-    """Парсира работен прозорец от различни GET/Excel формати."""
+def _normalise_time_window_pair(start, end) -> Optional[Tuple[int, int]]:
+    if start is None or end is None:
+        return None
+
+    try:
+        start = int(start)
+        end = int(end)
+    except (TypeError, ValueError):
+        return None
+
+    if not (0 <= start <= 1439 and 0 <= end <= 1439):
+        return None
+    if start == end:
+        return None
+    return start, end
+
+
+def _dedupe_time_windows(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    unique: List[Tuple[int, int]] = []
+    seen = set()
+    for start, end in windows:
+        key = (int(start), int(end))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return sorted(unique, key=lambda item: (item[0], item[1] if item[1] >= item[0] else item[1] + 24 * 60))
+
+
+def parse_time_window_values(value) -> List[Tuple[Optional[int], Optional[int]]]:
+    """Parse one or more customer working windows from GET/Excel formats."""
     if _is_empty_value(value):
-        return None, None
+        return []
 
     if isinstance(value, dict):
         start = _record_value(value, "start", ("begin",))
         end = _record_value(value, "end", ("finish",))
         if start is not None or end is not None:
-            return parse_time_value_to_minutes(start), parse_time_value_to_minutes(end)
+            return [(parse_time_value_to_minutes(start), parse_time_value_to_minutes(end))]
         value = _record_value(value, "value", TIME_WINDOW_FIELD_ALIASES)
         if _is_empty_value(value):
-            return None, None
+            return []
 
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        first_start, first_end = parse_time_window_value(value[0])
-        if first_start is not None or first_end is not None:
-            return first_start, first_end
-        return parse_time_value_to_minutes(value[0]), parse_time_value_to_minutes(value[1])
+    if isinstance(value, (list, tuple)):
+        windows: List[Tuple[Optional[int], Optional[int]]] = []
+        for item in value:
+            windows.extend(parse_time_window_values(item))
+
+        if windows:
+            return windows
+
+        if len(value) >= 2:
+            return [(parse_time_value_to_minutes(value[0]), parse_time_value_to_minutes(value[1]))]
+        return []
 
     text = str(value).strip()
     if not text or text.lower() in ("nan", "none", "null", "-"):
-        return None, None
+        return []
 
     normalized = (
         text.replace("–", "-")
@@ -306,56 +485,129 @@ def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
 
     if re.fullmatch(r"\d{6,8}", normalized):
         half = len(normalized) // 2
-        return parse_time_value_to_minutes(normalized[:half]), parse_time_value_to_minutes(normalized[half:])
+        return [(parse_time_value_to_minutes(normalized[:half]), parse_time_value_to_minutes(normalized[half:]))]
 
     time_tokens = _time_tokens_from_text(normalized)
     if len(time_tokens) >= 2:
-        return parse_time_value_to_minutes(time_tokens[0]), parse_time_value_to_minutes(time_tokens[1])
+        return [
+            (parse_time_value_to_minutes(time_tokens[i]), parse_time_value_to_minutes(time_tokens[i + 1]))
+            for i in range(0, len(time_tokens) - 1, 2)
+        ]
 
     range_match = re.match(r"^\s*(.+?)\s*(?:-|до|to|/|;|,)\s*(.+?)\s*$", normalized, flags=re.IGNORECASE)
     if range_match:
         start = parse_time_value_to_minutes(range_match.group(1))
         end = parse_time_value_to_minutes(range_match.group(2))
-        return start, end
+        return [(start, end)]
 
-    return None, None
+    return []
+
+
+def parse_time_window_value(value) -> Tuple[Optional[int], Optional[int]]:
+    """Парсира работен прозорец от различни GET/Excel формати."""
+    windows = parse_time_window_values(value)
+    if not windows:
+        return None, None
+    return windows[0]
+
+
+def safe_parse_time_window_values(value, context: str = "") -> List[Tuple[int, int]]:
+    """Parse and validate all customer time windows. Invalid values are ignored."""
+    if _is_empty_value(value):
+        return []
+
+    try:
+        raw_windows = parse_time_window_values(value)
+    except Exception as exc:
+        logger.warning("Игнорирам невалидно работно време%s: %r (%s)", context, value, exc)
+        return []
+
+    if not raw_windows:
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return []
+
+    windows: List[Tuple[int, int]] = []
+    invalid_count = 0
+    for start, end in raw_windows:
+        normalised = _normalise_time_window_pair(start, end)
+        if normalised is None:
+            invalid_count += 1
+            continue
+        windows.append(normalised)
+
+    windows = _dedupe_time_windows(windows)
+    if not windows:
+        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
+        return []
+    if invalid_count:
+        logger.warning(
+            "Игнорирам %s невалидни части от работно време%s: %r",
+            invalid_count,
+            context,
+            value,
+        )
+    return windows
 
 
 def safe_parse_time_window_value(value, context: str = "") -> Tuple[Optional[int], Optional[int]]:
-    """Parse and validate one customer time window. Invalid values are ignored."""
-    if _is_empty_value(value):
+    """Parse and validate the first customer time window. Invalid values are ignored."""
+    windows = safe_parse_time_window_values(value, context)
+    if not windows:
         return None, None
+    return windows[0]
 
-    try:
-        start, end = parse_time_window_value(value)
-    except Exception as exc:
-        logger.warning("Игнорирам невалидно работно време%s: %r (%s)", context, value, exc)
-        return None, None
 
-    if start is None and end is None:
-        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
-        return None, None
+def customer_time_windows_minutes(customer: Customer) -> List[Tuple[int, int]]:
+    windows = getattr(customer, "time_windows", None) or []
+    normalised = [
+        window
+        for window in (_normalise_time_window_pair(start, end) for start, end in windows)
+        if window is not None
+    ]
+    if normalised:
+        return _dedupe_time_windows(normalised)
 
-    if start is None or end is None:
-        logger.warning("Игнорирам непълно работно време%s: %r", context, value)
-        return None, None
+    start = getattr(customer, "time_window_start_minutes", None)
+    end = getattr(customer, "time_window_end_minutes", None)
+    fallback = _normalise_time_window_pair(start, end)
+    return [fallback] if fallback else []
 
-    try:
-        start = int(start)
-        end = int(end)
-    except (TypeError, ValueError):
-        logger.warning("Игнорирам невалидно работно време%s: %r", context, value)
-        return None, None
 
-    if not (0 <= start <= 1439 and 0 <= end <= 1439):
-        logger.warning("Игнорирам работно време извън 00:00-23:59%s: %r", context, value)
-        return None, None
+def format_time_windows_minutes(windows: List[Tuple[int, int]]) -> str:
+    def fmt(minutes: int) -> str:
+        minutes = int(minutes)
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
-    if start == end:
-        logger.warning("Игнорирам работно време с еднакви начало и край%s: %r", context, value)
-        return None, None
+    return "; ".join(f"{fmt(start)}-{fmt(end)}" for start, end in windows)
 
-    return start, end
+
+def time_windows_to_seconds(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    result = []
+    for start, end in windows:
+        start_s = max(0, int(start)) * 60
+        end_s = max(0, int(end)) * 60
+        if end_s < start_s:
+            end_s += 24 * 3600
+        result.append((start_s, end_s))
+    return sorted(result, key=lambda item: (item[0], item[1]))
+
+
+def choose_time_window_for_arrival(
+    arrival_seconds: float,
+    windows_seconds: List[Tuple[int, int]],
+) -> Tuple[Optional[Tuple[int, int]], float, int, str]:
+    """Return selected window, wait seconds, window index, and status for an arrival."""
+    if not windows_seconds:
+        return None, 0.0, -1, ""
+
+    for index, (start_s, end_s) in enumerate(windows_seconds):
+        if arrival_seconds <= end_s:
+            wait_seconds = max(0.0, float(start_s) - float(arrival_seconds))
+            if wait_seconds > 0:
+                return (start_s, end_s), wait_seconds, index, "Изчакване"
+            return (start_s, end_s), 0.0, index, "OK"
+
+    return windows_seconds[-1], 0.0, len(windows_seconds) - 1, "След работно време"
 
 
 def _unique_join(values: List[object], separator: str = "; ") -> str:
@@ -467,6 +719,7 @@ class InputHandler:
             
             # Обработка на данните
             customers = self._process_dataframe(df)
+            self._validate_mandatory_coordinates(customers)
             
             # Филтриране на валидни клиенти
             valid_customers = [c for c in customers if c.coordinates is not None]
@@ -491,6 +744,7 @@ class InputHandler:
         records = self._extract_json_records(payload)
         logger.info(f"Получени {len(records)} JSON записа от POST payload")
         customers = self._process_json_records(records)
+        self._validate_mandatory_coordinates(customers)
         valid_customers = [c for c in customers if c.coordinates is not None]
         depot_location = self.main_config.locations.depot_location
 
@@ -583,6 +837,7 @@ class InputHandler:
             
             # Конвертиране в Customer обекти
             customers = self._process_json_records(data)
+            self._validate_mandatory_coordinates(customers)
             valid_customers = [c for c in customers if c.coordinates is not None]
             
             depot_location = self.main_config.locations.depot_location
@@ -670,28 +925,46 @@ class InputHandler:
         skld_field = getattr(self.config, "json_id_skld_field", "IdSkld")
         tw_field = getattr(self.config, "json_time_window_field", "WorkTime")
         comment_field = getattr(self.config, "json_delivery_comment_field", "DeliveryComment")
+        service_time_field = getattr(self.config, "json_service_time_field", "ServiceTimeMinutes")
+        mandatory_field = getattr(self.config, "json_mandatory_field", "Mandatory")
         
         for idx, record in enumerate(records):
+            mandatory = False
+            record_context = f" (JSON запис {idx})"
             try:
-                gps_data = str(record.get(gps_field, "")).strip()
+                if not isinstance(record, dict):
+                    raise TypeError("JSON записът трябва да е обект")
+
+                # Read the hard-service marker before parsing any fallible
+                # customer fields.  Otherwise an invalid volume/column value
+                # could send a mandatory record through the legacy skip path.
                 client_id = str(record.get(id_field, "")).strip()
+                record_context = f" (JSON запис {idx}, клиент {client_id})"
+                mandatory = _parse_mandatory_flag(
+                    _record_value(record, mandatory_field, MANDATORY_FIELD_ALIASES),
+                    record_context,
+                )
+
+                gps_data = str(record.get(gps_field, "")).strip()
                 client_name = str(record.get(name_field, "")).strip()
-                volume = float(record.get(vol_field, 0))
+                volume = _parse_volume_value(
+                    record.get(vol_field, 0),
+                    record_context,
+                )
                 document = str(record.get(doc_field, "")).strip()
                 plas_doc = str(record.get(plas_doc_field, "")).strip()
                 source_id_skld = str(record.get(skld_field, "")).strip()
                 tw_value = _record_value(record, tw_field, TIME_WINDOW_FIELD_ALIASES)
-                record_context = f" (JSON запис {idx}, клиент {client_id})"
-                tw_start, tw_end = (
-                    safe_parse_time_window_value(tw_value, record_context)
-                    if tw_value is not None
-                    else (None, None)
-                )
+                time_windows = safe_parse_time_window_values(tw_value, record_context) if tw_value is not None else []
+                tw_start, tw_end = time_windows[0] if time_windows else (None, None)
                 delivery_comment = _safe_delivery_comment(
                     _record_value(record, comment_field, DELIVERY_COMMENT_FIELD_ALIASES),
                     record_context,
                 )
-                
+                service_time_minutes = _safe_service_time_minutes(
+                    _record_value(record, service_time_field, SERVICE_TIME_FIELD_ALIASES),
+                    record_context,
+                )
                 coordinates = parser.parse_gps_string(gps_data)
                 
                 customer = Customer(
@@ -705,7 +978,10 @@ class InputHandler:
                     source_id_skld=source_id_skld,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    time_windows=time_windows,
                     delivery_comment=delivery_comment,
+                    service_time_minutes=service_time_minutes,
+                    mandatory=mandatory,
                     grouped_documents=[
                         {
                             "customer_id": client_id,
@@ -713,12 +989,20 @@ class InputHandler:
                             "plas_doc": plas_doc,
                             "source_id_skld": source_id_skld,
                             "volume": volume,
+                            "service_time_minutes": service_time_minutes,
+                            "mandatory": mandatory,
                         }
                     ],
                 )
                 customers.append(customer)
                 
+            except MandatoryCustomerError:
+                raise
             except Exception as e:
+                if mandatory:
+                    raise MandatoryCustomerError(
+                        f"Грешка при обработка на задължителен клиент{record_context}: {e}"
+                    ) from e
                 logger.error(f"Грешка при обработка на JSON запис {idx}: {e}")
                 continue
         
@@ -730,11 +1014,29 @@ class InputHandler:
         parser = GPSParser()
         
         for index, row in df.iterrows():
+            mandatory = False
+            record_context = f" (Excel ред {index})"
             try:
+                # Determine mandatory status first, before accessing required
+                # columns or parsing volume.  Mandatory rows must never be
+                # silently discarded by the backwards-compatible skip path.
+                mandatory = _parse_mandatory_flag(
+                    _record_value(
+                        row.to_dict(),
+                        getattr(self.config, "mandatory_column", "Задължителен"),
+                        MANDATORY_FIELD_ALIASES,
+                    ),
+                    record_context,
+                )
+
                 client_id = str(row[self.config.client_id_column]).strip()
+                record_context = f" (Excel ред {index}, клиент {client_id})"
                 client_name = str(row[self.config.client_name_column]).strip()
                 gps_data = str(row[self.config.gps_column]).strip()
-                volume = float(row[self.config.volume_column])
+                volume = _parse_volume_value(
+                    row[self.config.volume_column],
+                    record_context,
+                )
                 
                 # Четем номер на документ/поръчка ако колоната съществува
                 document = ""
@@ -745,18 +1047,20 @@ class InputHandler:
 
                 tw_start = None
                 tw_end = None
+                time_windows = []
                 tw_column = getattr(self.config, "time_window_column", "")
                 if tw_column and tw_column in row.index:
-                    tw_start, tw_end = safe_parse_time_window_value(
+                    time_windows = safe_parse_time_window_values(
                         row[tw_column],
-                        f" (Excel ред {index}, клиент {client_id})",
+                        record_context,
                     )
+                    tw_start, tw_end = time_windows[0] if time_windows else (None, None)
                 delivery_comment = ""
                 comment_column = getattr(self.config, "delivery_comment_column", "")
                 if comment_column and comment_column in row.index:
                     delivery_comment = _safe_delivery_comment(
                         row[comment_column],
-                        f" (Excel ред {index}, клиент {client_id})",
+                        record_context,
                     )
                 
                 coordinates = parser.parse_gps_string(gps_data)
@@ -770,7 +1074,9 @@ class InputHandler:
                     document=document,
                     time_window_start_minutes=tw_start,
                     time_window_end_minutes=tw_end,
+                    time_windows=time_windows,
                     delivery_comment=delivery_comment,
+                    mandatory=mandatory,
                     grouped_documents=[
                         {
                             "customer_id": client_id,
@@ -778,13 +1084,20 @@ class InputHandler:
                             "plas_doc": "",
                             "source_id_skld": "",
                             "volume": volume,
+                            "mandatory": mandatory,
                         }
                     ],
                 )
                 
                 customers.append(customer)
                 
+            except MandatoryCustomerError:
+                raise
             except Exception as e:
+                if mandatory:
+                    raise MandatoryCustomerError(
+                        f"Грешка при обработка на задължителен клиент{record_context}: {e}"
+                    ) from e
                 # Променяме съобщението, за да работи с всякакъв тип индекс (не само числа)
                 logger.error(f"Грешка при обработка на ред с индекс '{index}': {e}")
                 continue
@@ -833,17 +1146,34 @@ class InputHandler:
                 [target.delivery_comment, customer.delivery_comment],
                 separator=" | ",
             )
+            # A grouped visit is mandatory when any source document marks it so.
+            target.mandatory = is_mandatory_customer(target) or is_mandatory_customer(customer)
 
-            if target.time_window_start_minutes is None and target.time_window_end_minutes is None:
+            target_service = getattr(target, "service_time_minutes", None)
+            customer_service = getattr(customer, "service_time_minutes", None)
+            if target_service is None and customer_service is not None:
+                target.service_time_minutes = customer_service
+            elif (
+                target_service is not None
+                and customer_service is not None
+                and not math.isclose(float(target_service), float(customer_service))
+            ):
+                selected_service = max(float(target_service), float(customer_service))
+                logger.warning(
+                    "Клиент %s има различно време за обслужване в няколко документа; "
+                    "използвам по-голямото %.2f минути за общото посещение.",
+                    customer.id,
+                    selected_service,
+                )
+                target.service_time_minutes = selected_service
+
+            target_windows = customer_time_windows_minutes(target)
+            customer_windows = customer_time_windows_minutes(customer)
+            if not target_windows and customer_windows:
                 target.time_window_start_minutes = customer.time_window_start_minutes
                 target.time_window_end_minutes = customer.time_window_end_minutes
-            elif (
-                (customer.time_window_start_minutes is not None or customer.time_window_end_minutes is not None)
-                and (
-                    target.time_window_start_minutes != customer.time_window_start_minutes
-                    or target.time_window_end_minutes != customer.time_window_end_minutes
-                )
-            ):
+                target.time_windows = list(customer_windows)
+            elif customer_windows and target_windows != customer_windows:
                 logger.warning(
                     "Клиент %s има различно работно време в няколко документа; "
                     "запазвам първото за общото посещение.",
@@ -868,6 +1198,8 @@ class InputHandler:
                     "plas_doc": getattr(customer, "plas_doc", ""),
                     "source_id_skld": getattr(customer, "source_id_skld", ""),
                     "volume": getattr(customer, "volume", 0),
+                    "service_time_minutes": getattr(customer, "service_time_minutes", None),
+                    "mandatory": is_mandatory_customer(customer),
                 }
             ]
         normalised = []
@@ -881,6 +1213,10 @@ class InputHandler:
                     "plas_doc": str(item.get("plas_doc", "") or ""),
                     "source_id_skld": str(item.get("source_id_skld", "") or ""),
                     "volume": float(item.get("volume", 0) or 0),
+                    "service_time_minutes": _safe_service_time_minutes(
+                        item.get("service_time_minutes", None)
+                    ),
+                    "mandatory": _parse_mandatory_flag(item.get("mandatory", False)),
                 }
             )
         return normalised
@@ -909,6 +1245,13 @@ class InputHandler:
                     existing["plas_doc"] = plas_doc
                 if not existing.get("source_id_skld") and item.get("source_id_skld"):
                     existing["source_id_skld"] = str(item.get("source_id_skld", ""))
+                existing_service = existing.get("service_time_minutes")
+                item_service = item.get("service_time_minutes")
+                if item_service is not None and (
+                    existing_service is None or float(item_service) > float(existing_service)
+                ):
+                    existing["service_time_minutes"] = float(item_service)
+                existing["mandatory"] = bool(existing.get("mandatory")) or bool(item.get("mandatory"))
                 continue
 
             copied = dict(item)
@@ -917,6 +1260,26 @@ class InputHandler:
             merged.append(copied)
 
         return merged
+
+    @staticmethod
+    def _validate_mandatory_coordinates(customers: List[Customer]) -> None:
+        missing = [
+            customer
+            for customer in customers
+            if is_mandatory_customer(customer) and not customer.coordinates
+        ]
+        if not missing:
+            return
+
+        sample = ", ".join(
+            str(getattr(customer, "id", "") or getattr(customer, "name", ""))
+            for customer in missing[:10]
+        )
+        suffix = f" и още {len(missing) - 10}" if len(missing) > 10 else ""
+        raise MandatoryCustomerError(
+            "Задължителен клиент няма валидни GPS координати и не може да бъде "
+            f"подаден към solver-а: {sample}{suffix}"
+        )
 
 
 # Функция за лесно използване

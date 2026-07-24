@@ -1,618 +1,383 @@
 # Работни процеси и алгоритми
 
-Този документ описва как реално минава една оптимизация от входния Excel/JSON до финалните HTML, Excel и CSV файлове.
+Този документ описва реалния поток в текущия source код. За потребителски инструкции виж [Ръководство за работа](docs/USER_GUIDE.md), а за точна solver матрица — [Решители и ограничения](docs/SOLVERS_AND_CONSTRAINTS.md).
 
-## Общ workflow
-
-```text
-Потребител / Scheduler / start_cvrp.bat
-  -> main.py или main_exe.py
-  -> config.py
-  -> input_handler.py
-  -> warehouse_manager.py
-  -> osrm_client.py или valhalla_client.py
-  -> cvrp_solver.py или pyvrp_solver.py
-  -> output_handler.py
-  -> output/, logs/
-```
-
-Основните стъпки в `main.py` са:
-
-1. Подготовка на данни.
-2. Изчисляване на матрица с разстояния.
-3. Решаване на CVRP.
-4. Обработка на резултата.
-5. Генериране на изходни файлове.
-
-## Стъпка 1: Подготовка на данни
-
-Модул: `input_handler.py`
-
-Входът може да бъде:
-
-- Excel файл;
-- HTTP JSON endpoint.
-
-За всеки клиент се създава `Customer`:
-
-```python
-Customer(
-    id=...,
-    name=...,
-    coordinates=(lat, lon),
-    volume=...,
-    original_gps_data=...,
-    document=...
-)
-```
-
-GPS parser-ът приема координати като текст и връща `(latitude, longitude)`. Невалидните координати се логват и не се използват в solver-а.
-
-Ако входът съдържа няколко реда за един и същ клиент и една и съща GPS точка, `input_handler.py` може да ги групира в едно посещение. Това е включено по подразбиране чрез `input.enable_customer_document_grouping = True`. Solver-ът получава един клиент със сборен обем, но `grouped_documents` пази оригиналните документи, `IdPlasDoc`, `IdSkld` и обемите, за да могат отчетите и `setData` да работят по документи. Ако настройката е изключена, всеки документ остава отделен клиент/стоп.
-
-HTTP JSON режимът:
-
-- добавя дата към URL;
-- използва ръчно зададена дата, ако има;
-- иначе изчислява следващ работен ден;
-- пробва няколко encoding режима;
-- поддържа JSON list или object с list ключ.
-
-## Стъпка 1.1: Предварително складово разпределение
-
-Модул: `warehouse_manager.py`
-
-Целта е да се отделят заявки, които не трябва или не могат да влязат в solver-а.
-
-Логиката отчита:
-
-- максимален обем за клиент;
-- капацитет на най-големия бус;
-- общ капацитет на активните бусове;
-- `capacity_toleranse`;
-- сортиране по обем и разстояние;
-- център зона.
-
-Важно: warehouse manager работи преди OR-Tools/PyVRP и подава към solver-а само клиентите за бусове.
-
-## Стъпка 1.5: Матрица с разстояния
-
-Модули:
-
-- `osrm_client.py`
-- `valhalla_client.py`
-
-Матрицата включва:
-
-- всички уникални депа;
-- всички клиенти, които са останали за бусове.
-
-OSRM режимът:
-
-- първо проверява централен кеш;
-- ако няма кеш, прави Table API заявки;
-- за средни dataset-и използва batch заявки;
-- попълва междублокови връзки по посока;
-- използва fallback само при нужда.
-
-Важна корекция: A->B и B->A вече не се копират симетрично. Това е важно при еднопосочни улици, завои, забрани и различни времена по посока.
-
-Valhalla режимът може да се използва за time-dependent routing, ако има работещ Valhalla сървър. Ако Valhalla върне липсваща клетка (`None` distance/time), програмата попълва приблизителна fallback стойност и продължава, вместо batch-ът да счупи целия run.
-
-## Стъпка 2: CVRP решаване
-
-Избор:
-
-```python
-cvrp.solver_type = "or_tools"
-cvrp.solver_type = "pyvrp"
-cvrp.objective_metric = "distance"  # най-къси километри
-cvrp.objective_metric = "time"      # най-кратко време
-```
-
-`objective_metric` определя коя цена минимизира solver-ът. И двата solver-а използват една и съща входна distance/duration матрица, но при `time` основната цена е duration матрицата, а глобите/fixed cost стойностите се преобразуват към същия мащаб.
-
-### OR-Tools workflow
-
-Модул: `cvrp_solver.py`
-
-OR-Tools моделът включва:
-
-- location индекси;
-- vehicle индекси;
-- capacity dimension;
-- time dimension;
-- vehicle-specific transit callbacks;
-- precomputed vehicle cost matrices за arc cost;
-- disjunction penalties за пропускане на клиенти;
-- ограничения за брой клиенти, време и капацитет;
-- depot mapping.
-
-OR-Tools вече не пресмята пълната бизнес цена на всяка дъга при всяко питане от solver-а. За всеки vehicle предварително се смята cost matrix, в която са включени objective по време/км, service time, center zone penalties и fixed cost мащабиране. По време на търсенето callback-ът само връща готово число от таблица.
-
-Времето за обслужване е по конкретен бус:
+## 1. Архитектура
 
 ```text
-internal_bus -> service_time_minutes на internal_bus
-center_bus   -> service_time_minutes на center_bus
-...
+Desktop GUI / config.py / Web / HTTP API
+                  |
+                  v
+          input_handler.py
+                  |
+                  v
+       warehouse_manager.py
+                  |
+                  v
+  osrm_client.py / valhalla_client.py
+                  |
+                  v
+  OR-Tools / PyVRP / VROOM / VRP-Rust
+                  |
+                  v
+ native OR-Tools checks / shared adapter audit
+                  |
+                  v
+ central mandatory invariant (all backends)
+                  |
+                  v
+ output_handler.py -> maps / Excel / CSV / charts
+                  |
+                  v
+       setdata_client.py -> setData / makeGroup
 ```
 
-Това е по-точно от стария подход със средно време.
+`main.py` е оркестраторът. `main_exe.py` избира режимите на замразения EXE. `cvrp_api_server.py` управлява публичните HTTP заявки, Web GUI, run subprocess-ите и статусите.
 
-### PyVRP workflow
+## 2. Конфигурационни scopes
 
-Модул: `pyvrp_solver.py`
+### 2.1 Постоянна конфигурация
 
-PyVRP моделът включва:
+`config.py` съдържа `MainConfig`. Desktop GUI записва всички свои позволени секции и създава backup. Web GUI има отделно:
 
-- отделни депа;
-- clients;
-- vehicle types;
-- компресирани profiles за еднакви vehicle правила;
-- service time в edge duration;
-- prizes/penalties за пропускане на клиенти;
-- извличане на route резултат в общия `CVRPSolution` формат.
+- глобален запис на видимите solver/output/`setData` настройки, без бусовете;
+- глобален запис само на списъка `VehicleConfig`;
+- потребители, записвани веднага в `data/web_gui_auth.json`.
 
-PyVRP profile compression споделя един profile между бусове, които имат еднакъв service time и еднакви правила за center zone цена. Стартовото и крайното депо не са част от profile signature, защото PyVRP ги пази на vehicle type; така различните депа остават коректни.
+### 2.2 Request-local API override
 
-PyVRP и OR-Tools използват еднакъв output contract, така че `output_handler.py` не се интересува кой solver е използван.
+`/run` и `/solve` deep-copy-ват базовата конфигурация и прилагат само приетите настройки за конкретната заявка. Отговорът различава `settings_overrides` и `ignored_settings`. `config.py` не се променя.
 
-## Паралелно решаване
+### 2.3 Web run без запис
 
-Ако `enable_parallel_solving = True` и има повече от едно CPU ядро, `main.py` стартира няколко worker-а.
+Web страницата изпраща временни `cvrp`, `output` и `set_data` стойности към изолиран child process. Input, routing, депа, зони и бусове идват от последно записания global config. Незапазени редакции по бусовете не участват.
 
-Всеки worker получава:
+Legacy `web_gui_run_defaults_json` и вътрешният save endpoint още съществуват, но текущата Web страница не ги предлага и Web стартът не смесва този preset.
 
-- едно и също warehouse allocation;
-- една и съща distance matrix;
-- различна solver стратегия;
-- отделен worker id.
+## 3. Нормален CVRP run
 
-След края се избира валидно решение. При равни условия се предпочита по-добър fitness score и обслужен обем.
+1. Зарежда се активният `MainConfig` или request-local copy.
+2. Избира се Excel/HTTP/директен JSON вход.
+3. Клиентските редове се нормализират и валидират.
+4. По желание документи със същия клиент/GPS се групират.
+5. Невалидните и предварително складовите заявки се отделят.
+6. Изгражда се единен ред на депата и клиентите.
+7. Routing engine-ът връща distance и duration матрици.
+8. Активните traffic zones преобразуват duration стойностите.
+9. Dispatcher-ът стартира избрания solver/backend.
+10. При portfolio режим няколко worker-а решават с различни seeds/strategies.
+11. PyVRP/VROOM/VRP-Rust кандидатите минават общия независим audit; директният OR-Tools разчита на native dimensions и extraction-time проверки.
+12. Всеки backend минава централен mandatory invariant по детерминирано посещение и брой.
+13. Избира се най-добрият валиден резултат.
+14. Mandatory invariant се повтаря непосредствено преди output и преди `setData`.
+15. Маршрутите се преобразуват към карти/Excel/CSV/JSON.
+16. По желание се изпълняват route-map upload, `setData` и `makeGroup`.
 
-## Приоритетно пропускане на клиенти
+## 4. Входен workflow
 
-Функция:
+### 4.1 Excel
 
-```python
-calculate_customer_drop_penalties(...)
-```
+`input_handler.py` чете настроения лист и mapping на колоните. В текущата версия Excel mapping включва ID, име, GPS, обем, документ, работно време и коментар, но няма отделна колона за индивидуално клиентско service time. За Excel то идва от буса.
 
-Идеята е, когато не всички заявки могат да се вместят, solver-ът да предпочете за пропускане:
+### 4.2 HTTP JSON
 
-- големи заявки;
-- близки до депо заявки.
+Заявката използва URL, метод, `cmd`, дата, `Sklad`, `DoneFlag` и допълнителни query параметри. Декодирането опитва подходящи кодировки и има tolerant path за някои външни отговори с raw control characters.
 
-Причината е оперативна: голяма и близка заявка е по-лесна за отделна доставка или складова обработка от малка далечна заявка, която би развалила маршрута.
-
-Настройки:
-
-```python
-enable_priority_dropping
-drop_volume_weight
-drop_closeness_weight
-min_customer_drop_penalty
-max_customer_drop_penalty
-```
-
-При OR-Tools това влияе на `AddDisjunction` penalty.
-
-При PyVRP това влияе на prize/penalty логиката.
-
-## Център зона
-
-Център зоната се определя от:
-
-```python
-is_location_in_center_zone(...)
-```
-
-Режими:
-
-- `circle`: център + радиус;
-- `polygon`: начертан полигон.
-
-GUI поток за polygon:
-
-1. В таб `Локации` се избира `polygon`.
-2. Натиска се `Чертай на карта`.
-3. Отваря се локална Leaflet карта.
-4. Потребителят чертае/редактира полигон.
-5. Полигонът се записва в `center_zone_polygon`.
-
-Допълнителните център зони са отделни от основната зона и се записват в `center_zones`. Всяка зона има:
-
-- собствена геометрия (`circle` или `polygon`);
-- `priority_vehicle_types`: типове бусове, които получават отстъпка вътре в зоната;
-- `restricted_vehicle_types`: типове бусове, които получават глоба вътре в зоната;
-- `vehicle_penalties`: глоба по тип бус;
-- `priority_vehicle_outside_penalty`: глоба за приоритетен бус, ако е извън всички зони, които го таргетират.
-
-Така може да има повече от една център зона, без новата да променя правилата на старата. Solver-ите използват общата функция `center_zone_cost_adjustment(...)`, за да прилагат еднакви правила в OR-Tools и PyVRP.
-
-Тези зони се използват и в solver логика, и във визуализацията.
-
-## Депа
-
-Има вградени депа:
-
-- `Главно депо`;
-- `Център`;
-- `Враца`.
-
-Могат да се добавят и допълнителни:
-
-```python
-depot_locations = {
-    "Ново депо": (42.123456, 23.123456),
-}
-```
-
-GUI формат:
-
-```text
-Ново депо: 42.123456, 23.123456
-```
-
-Всеки тип бус може да избере начално депо по име.
-
-## Output workflow
-
-Модул: `output_handler.py`
-
-Генерира:
-
-- обща карта;
-- отделни route карти;
-- Excel report;
-- CSV routes;
-- charts.
-
-### HTML карти
-
-Картите поддържат:
-
-- Folium/Esri tiles;
-- Google Maps;
-- депа;
-- център зона;
-- route geometry от OSRM/Valhalla;
-- fallback прави линии;
-- посока на движение;
-- popup-и;
-- navigation links.
-- ETA пристигане за клиентите.
-- GPS търсачка в общата карта за временни пинове по координати.
-- optional upload на индивидуалните route HTML файлове към Effect endpoint.
-
-Отделните route карти имат сгъваем клиентски панел:
-
-```text
-Клиенти -> списък -> ETA -> клик върху клиент -> popup + навигация
-```
-
-### Excel
-
-Основният Excel съдържа:
-
-- маршрути;
-- необслужени клиенти;
-- summary;
-- статистики по бусове.
-- ETA пристигане, чакане и time-window статус, когато има schedule данни.
-
-Колоната `Посока на движение` показва от коя спирка към коя спирка се движи маршрутът.
-
-### CSV
-
-CSV файлът остава със стабилно име:
-
-```text
-output/routes.csv
-```
-
-Това е умишлено, за да не се чупят външни процеси.
-
-### Дата в имената
-
-Дата се добавя към:
-
-- HTML обща карта;
-- отделни route HTML карти;
-- Excel файлове.
-
-Пример:
-
-```text
-interactive_map_2026-04-28.html
-route_1_2026-04-28.html
-cvrp_report_2026-04-28.xlsx
-```
-
-## Scheduler workflow
-
-GUI табът `Автоматично стартиране` използва Windows `schtasks`.
-
-Вече могат да се създават няколко schedule задачи. В GUI има поле `Име на задача`; всяко различно име създава отделна Windows Task Scheduler задача. Примерни имена:
-
-```text
-CVRP_Optimizer_Auto_1
-CVRP_Optimizer_Auto_2
-CVRP_Optimizer_Auto_Morning
-```
-
-Ако името е същото, задачата се обновява. Ако името е различно, старата задача остава и се добавя нова.
-
-В EXE режим Scheduler стартира `start_cvrp.bat`, ако го намери.
-
-В Python режим Scheduler стартира:
-
-```text
-python main.py
-```
-
-спрямо текущата project директория.
-
-## Runtime режими
-
-### Python режим
-
-```powershell
-.\.venv\Scripts\python.exe main.py
-```
-
-### Settings режим
-
-```powershell
-.\.venv\Scripts\python.exe config_gui.py
-```
-
-### Batch режим
-
-```powershell
-.\start_cvrp.bat
-.\Settings.bat
-```
-
-### EXE режим
-
-```powershell
-.\CVRP_Optimizer.exe
-.\CVRP_Optimizer.exe --settings
-```
-
-## Какво да гледаш при проблем
-
-1. `logs/cvrp.log`
-2. дали `.venv\Scripts\python.exe` е правилният Python;
-3. дали `ortools` и `pyvrp` се импортват;
-4. дали OSRM/Valhalla сървърът отговаря;
-5. дали input Excel има правилните колони;
-6. дали output директориите са writable;
-7. дали новите HTML карти са регенерирани след промени по визуализацията.
-
-## Нов работен поток с Bizant API
-
-### 1. Вземане на клиенти
-
-Клиентите могат да се вземат от Bizant чрез настройваем URL:
-
-```text
-http://sio.effect.bg:7080/lubiv_Bizant?cmd=getData&Date=YYYY-MM-DD&Sklad=106&DoneFlag=1973
-```
-
-Датата остава по старата логика: ако не е зададена ръчно в GUI, програмата я изчислява автоматично.
-
-От GET отговора се четат стандартните клиентски полета плюс:
-
-- `IdPlasDoc` за връщане към `setData`;
-- `IdSkld` като оригинален склад на заявката.
-
-При няколко документа за един и същ `IdCust` и същ GPS, включеното групиране прави един стоп със сборен обем. Това намалява изкуственото дублиране на спирки, но не губи документите: при `setData` се изпраща отделна заявка за всеки оригинален `IdPlasDoc`.
-
-### 2. Решаване през GUI или API
-
-Решението може да се стартира от основната програма или чрез API:
-
-```text
-POST /solve
-```
-
-API сървърът остава активен след всяка заявка и чака следваща. Host, порт и endpoint се сменят от GUI.
-
-### 3. Генериране на файлове
-
-От GUI може да се включва/изключва отделно:
-
-- Excel отчет;
-- CSV;
-- интерактивни карти;
-- chart-ове.
-
-В Excel отчета времето е в часове, използва се “бусове”, има ID на буса от серията `1004501001...` и отделна колона за номер на маршрут.
-
-### 4. Връщане към Bizant със setData
-
-Ако `setData` е включено, след успешно решение се изпраща заявка за всеки обслужен клиент:
-
-```text
-cmd=setData&IdPlasDoc=...&DoneFlag=...&IdSkld=...&Bukva=...&IdGrafik=...
-```
-
-За обслужени клиенти:
-
-- `IdPlasDoc` идва от GET;
-- `IdSkld` се определя по депото/буса;
-- `Bukva` е `БХ{route_number}-{stop_number}`;
-- `IdGrafik` може да бъде Excel номерът на буса.
-
-### 5. Необслужени клиенти
-
-Ако настройката е включена, необслужените клиенти също се изпращат към `setData`.
-
-За тях:
-
-- `IdSkld` се взема от оригиналния GET запис на клиента;
-- `Bukva` е `HOF-{id_plas_doc}`;
-- `IdGrafik` се задава от отделно GUI поле/шаблон.
-
-### 6. makeGroup
-
-Накрая, ако всички `setData` заявки са успешни и отметката е включена, програмата изпраща:
-
-```text
-cmd=makeGroup&IdSkld=...
-```
-
-Командата се изпраща по веднъж за всеки различен склад, последователно.
-
-## Крайна точка на бус
-
-Всеки `VehicleConfig` вече има:
-
-```python
-start_location = (...)
-end_location = None
-```
-
-Ако `end_location` е зададена, OR-Tools и PyVRP получават различен краен depot index за този тип бус. Ако е празна, крайната точка пада обратно към `start_location`.
-
-Това влияе на:
-
-- матрицата, защото крайните координати се включват към списъка с депа;
-- solver модела, защото start и end depot могат да са различни;
-- преизчисляването на километри и време след решението;
-- Excel, CSV и HTML route картите.
-
-Когато крайната точка е различна от стартовата, TSP reorder-ът не пренарежда маршрута като затворен цикъл към стартовото депо, а запазва реда от solver-а и преизчислява метриките към реалната крайна точка.
-
-## Работно време на клиентите
-
-Клиентите могат да имат работно време от Excel или JSON. Поддържа се общо поле във формат:
-
-```text
-08:00 - 16:00
-08:00-13:00
-```
-
-или с няколко реда:
-
-```text
-08:00-13:00
-16:00-18:00
-```
-
-Работното време се подава само през едно поле, например `WorkTime` в JSON или колоната `Работно време` в Excel. При подадени два реда програмата използва първия прозорец, защото текущата конфигурация на solver-ите работи с един прозорец на клиент. Ако клиентът няма работно време, се използва default прозорецът от настройките. Ако `enable_customer_time_windows = False`, solver-ите игнорират тези прозорци, но работното време пак се показва в индивидуалните route карти.
-
-Коментар към доставката се чете от `DeliveryComment` или близки fallback имена като `DeliveryNote`, `Comment`, `Note`. Коментарът се показва в индивидуалните route карти, popup-ите, Excel/CSV отчетите и JSON резултата.
-
-## API управление на настройките
-
-API-то може да стартира програмата по два начина:
-
-- `POST /solve` приема клиентски записи и настройки в същото body.
-- `GET/POST /run` стартира текущо конфигурирания вход, но може да приеме временни настройки.
-
-Настройките могат да се подават така:
+Надеждният формат остава валиден JSON. Два работни прозореца се изпращат така:
 
 ```json
 {
-  "return_result": true,
-  "settings": {
-    "solver_type": "pyvrp",
-    "objective_metric": "time",
-    "time_limit_seconds": 180,
-    "vehicles": [
-      {
-        "vehicle_type": "internal_bus",
-        "name": "HELL 1",
-        "count": 1,
-        "capacity": 385,
-        "start_location": [42.695785, 23.231659],
-        "end_location": [42.700000, 23.400000]
-      }
-    ],
-    "set_data": {
-      "enable_set_data_upload": false,
-      "set_data_unserved_done_flag": "1975"
-    }
-  }
+  "WorkTime": "08:00-13:00\n16:00-18:00"
 }
 ```
 
-`settings` може да съдържа solver, OSRM/Valhalla, output, депа, трафик зони, основна center зона, допълнителни `center_zones`, бусове и `setData` настройки. Override-ите важат само за заявката и не записват автоматично `config.py`.
+### 4.3 Директен `/solve`
 
-Пример за независима допълнителна център зона:
+Body може да бъде списък клиенти или wrapper с `customers`, `clients`, `orders`, `data`, `items` или `records`. Wrapper-ът може да съдържа request-local `settings`.
 
-```json
-{
-  "settings": {
-    "center_zones": [
-      {
-        "name": "Център 2",
-        "mode": "circle",
-        "center": [42.7093, 23.3137],
-        "radius_km": 1.2,
-        "priority_vehicle_types": ["center_bus"],
-        "restricted_vehicle_types": ["internal_bus", "external_bus", "vratza_bus"],
-        "discount_priority_vehicle": 0.9,
-        "vehicle_penalties": {
-          "internal_bus": 40000,
-          "external_bus": 40000,
-          "vratza_bus": 40000
-        },
-        "enabled": true
-      }
-    ]
-  }
-}
-```
+### 4.4 Нормализация на клиент
 
-За качване на индивидуалните HTML карти през API:
+За solver-а се пазят:
 
-```json
-{
-  "settings": {
-    "output": {
-      "route_maps_upload_mode": "effect_upload",
-      "route_maps_upload_url": "https://effect.bg/dragon/hellbizante/upload-files.php",
-      "route_maps_upload_token": "Effect-Bizante-Token",
-      "route_maps_upload_file_field": "files[]"
-    }
-  }
-}
-```
+- ID, име, документ/документи и оригинален склад;
+- GPS координати;
+- обем;
+- всички валидни времеви прозорци;
+- коментар;
+- optional индивидуално service time.
 
-`disabled` изключва качването. `legacy` запазва старото поведение без нов HTTP upload.
+Невалидна част от работния график се игнорира с warning. Ако не остане валиден прозорец, клиентът се приема без специфичен прозорец. Настройките `customer_time_window_default_start_minutes/end_minutes` в момента не променят този parser workflow.
 
-Кратки aliases, които са удобни за API:
+### 4.5 Групиране на документи
 
-```json
-{
-  "settings": {
-    "solver": "or_tools",
-    "objective": "distance",
-    "optimize_by": "time",
-    "time_limit": 300,
-    "routing_engine": "osrm",
-    "group_customer_documents": true
-  }
-}
-```
+Ключът е клиентски ID + координати. При групиране:
 
-При Excel вход програмата не изключва автоматично Враца бусовете заради липсващ `IdSkld`. Автоматичното скриване на Враца бусове по склад се прилага само при `input_source = "http_json"`, където `IdSkld` идва от Bizant.
+- обемите се сумират;
+- solver-ът вижда един stop;
+- документите остават отделни за report/`setData`;
+- ако service times се различават, използва се по-голямото валидно време.
 
-## JSON резултат
+### 4.6 Невалидни и складови заявки
 
-Когато `return_result=true`, `/run` изчаква края на оптимизацията и връща JSON резултат. Това е удобно за външна система, която иска веднага да получи маршрути, необслужени клиенти, файлове и summary.
+Липсващ GPS, непарсваема координата или невалиден обем не стигат до solver-а. Складовият модул може допълнително да отдели големи/неизпълними заявки според `WarehouseConfig`.
 
-При background run може да се подаде:
+## 5. Депа и matrix workflow
 
-```json
-{
-  "callback_url": "https://example.com/cvrp-finished"
-}
-```
+### 5.1 Единен ред на точките
 
-След края API сървърът изпраща POST към този URL със статус `completed` или `failed`.
+`build_ordered_depots()` започва с главното депо и добавя уникалните start/end точки. При включени втори курсове добавя и reload точките. След депата се добавят клиентите.
+
+Индексите трябва да останат еднакви в:
+
+- distance матрицата;
+- duration матрицата;
+- solver client/depot моделите;
+- route extraction-а и output-а.
+
+### 5.2 OSRM
+
+Table API връща метри и секунди. Batch-овете пазят посоката: A→B и B→A се изчисляват отделно. При недостъпна клетка може да има fallback приблизителна стойност според настройките.
+
+OSRM cache key в текущия код не version-ва надеждно server URL, profile и всички routing modes. След смяна на OSRM данни/profile изчисти cache-а или го дръж изключен, докато това не бъде коригирано.
+
+### 5.3 Valhalla
+
+Valhalla може да работи с time-dependent дата/час, curbside/preferred side и truck dimensions. `null` клетки се заменят индивидуално с fallback, вместо да спират целия run.
+
+### 5.4 Traffic zones
+
+След суровата матрица активните traffic правила умножават duration arcs. Тази операция е еднаква преди всички backend-и. `show_on_map` не участва — то управлява само визуализацията.
+
+## 6. Solver dispatch
+
+| `solver_type` | Workflow |
+|---|---|
+| `or_tools` | Директен Python OR-Tools модел. |
+| `pyvrp` | Стабилен PyVRP 0.13.x (минимум 0.13.4) в основната `.venv`. |
+| `pyvrp_experimental` | JSON IPC към изолиран PyVRP 0.14 worker. |
+| `vroom` | JSON IPC към official VROOM/pyvroom worker. |
+| `vrp` | JSON IPC към VRP-Rust/vrp-cli worker. |
+
+VROOM и VRP-Rust използват собствена вътрешна паралелизация, затова външният portfolio mode се изключва. OR-Tools и PyVRP могат да използват няколко outer worker процеса.
+
+При `num_workers=-1` текущият избор е приблизително CPU ядра минус едно. `performance.max_workers` и `memory_limit_mb` не налагат строг runtime cap.
+
+## 7. Objectives
+
+### 7.1 `distance`
+
+Основната транспортна цена е distance матрицата. Върху нея backend-ът добавя fixed costs, skip penalties/prizes и center zone soft costs.
+
+### 7.2 `time`
+
+Основната транспортна цена е duration. При OR-Tools/PyVRP `time_objective_include_waiting=true` оценява пълния shift span: travel + service + waiting + reload. При `false` чакането остава ограничение/отчет, без пряка objective цена.
+
+VROOM и VRP-Rust имат собствена time objective семантика. Числовият fitness между различни engines не е директно сравним.
+
+### 7.3 Center zone разлика
+
+Center zone правилата са soft, не абсолютни забрани. В pure shift-duration `time` режим multiplicative zone discount може да няма ефект при OR-Tools/PyVRP, когато edge cost е нулирана; additive penalties могат да останат. VROOM прилага зоните върху custom time cost, а VRP-Rust не представя center zones в `time` режим.
+
+Ако зоната е критично бизнес предпочитание в текущата версия, `distance` дава най-последователна семантика между backend-ите.
+
+## 8. Constraints workflow
+
+### 8.1 Capacity
+
+Demand се натрупва по route. При reload капацитетът се възстановява само за следващия курс.
+
+### 8.2 Работен ден
+
+Start time + travel + service + waiting + reload формират дневния span. Максимумът е vehicle-specific. Post-solve audit допуска до 1 минута rounding tolerance.
+
+### 8.3 Клиентски прозорци
+
+- OR-Tools използва общия диапазон и забранява интервалите между прозорците.
+- PyVRP 0.13 използва alternative clients; 0.14 използва group semantics зад същия adapter.
+- VROOM и VRP-Rust получават native списъци от прозорци.
+
+### 8.4 Фиксиран край
+
+Start/end индексите се подават в native vehicle/shift модела. Пътят до end участва в objective и ограниченията. Празен end се нормализира към start depot.
+
+### 8.5 Индивидуално service time
+
+JSON/HTTP клиентът може да има `ServiceTimeMinutes`. При липса solver callback/profile използва времето от конкретния бус. Service time участва в arrival/working-time логиката.
+
+JSON/HTTP клиентът може да има и `Mandatory=true` (aliases: `Required`, `IsMandatory`, `IsRequired`, `MustServe`), а Excel — колоната `Задължителен`. Този клиент не получава skip механизъм. Предварителното разпределение му резервира капацитет първо; невъзможен mandatory клиент прекратява ръна с ясна грешка.
+
+### 8.6 Километри и клиенти за деня
+
+При multi-trip те не се нулират. Някои backend комбинации използват fallback или се отказват, за да не дадат тихо невалидно решение.
+
+## 9. Втори курсове
+
+### 9.1 Общ модел
+
+`enable_multiple_trips=true` разрешава reload activity. Броят курсове се изчислява динамично според клиентите и дневните лимити.
+
+- capacity — на курс;
+- time/distance/customers — на физически бус за деня;
+- reload time — между курсовете;
+- `vehicle_key` — общ за физическия бус;
+- `trip_number` и output bus number — различни по курс.
+
+### 9.2 Backend-и
+
+- OR-Tools моделира optional reload nodes и кумулативни day dimensions.
+- PyVRP използва reload depots/max reloads, но fallback-ва към OR-Tools при активен реален дневен customer limit или при `time + max_distance_km`.
+- VROOM отказва multi-trip.
+- VRP-Rust използва shift reloads, но отказва `max_customers_per_day + multiple trips`.
+
+## 10. Пропускане
+
+При разрешено skipping penalty/prize се изчислява по конфигурацията. Priority dropping в текущата формула защитава по-силно малки и далечни заявки, а по-големи и близки до депо са по-лесни за пропускане.
+
+Backend преобразуване:
+
+- OR-Tools — `AddDisjunction`;
+- PyVRP — prize/required;
+- VROOM — приближена priority скала;
+- VRP-Rust — job value и ordered objectives.
+
+Известно текущо ограничение: single-trip OR-Tools extraction маркира всяко решение с dropped клиент като infeasible дори при разрешено skipping. Това може да отхвърли иначе допустим penalty резултат.
+
+## 11. Portfolio и избор на резултат
+
+Worker конфигурациите могат да използват различни seeds, first solution strategies и metaheuristics. След завършване:
+
+- невалидните/failed кандидати не участват;
+- в `time` режим се предпочитат по-малко dropped клиенти, след това по-нисък fitness;
+- в `distance` режим се избира най-нисък fitness.
+
+Провери metadata за **реалния** engine, защото PyVRP adapter може да е fallback-нал към OR-Tools.
+
+## 12. Проверка на hard constraints след solve
+
+След native solve PyVRP, VROOM и VRP-Rust маршрутите се преизчисляват от общия audit с оригиналните входни данни. Проверяват се:
+
+- всички задължителни/повторени клиенти;
+- capacity;
+- time windows;
+- start/end;
+- service, wait и reload;
+- max day time и 1-minute tolerance;
+- max distance;
+- max customers per day;
+- dropped semantics.
+
+Решение от тези адаптери с нарушение се маркира невалидно и не се използва за файлове/интеграции. Директният OR-Tools backend не извиква същия общ audit: ограниченията са моделирани в неговите Capacity/Distance/Stops/Time dimensions и се допълват от проверки при извличане на решението.
+
+След това отделен централен mandatory invariant се изпълнява за **всички** backend-и. Той сравнява задължителните посещения по стабилен fingerprint и occurrence count, издържа на pickle round-trip и различава посещения с еднакво business ID. Проверката се повтаря преди output и преди `setData`.
+
+## 13. Output workflow
+
+### 13.1 Номериране
+
+`vehicle_numbering.py` подрежда физическите бусове, center buses и курсовете. Един физически бус може да има общ `vehicle_key`, но всеки курс получава различен business output number.
+
+### 13.2 Карти
+
+Общата карта показва маршрутите без solver route ID като видим надпис. Center/traffic зоните се рисуват само при съответния `show_on_map`.
+
+За физически бус с много курсове се създава една индивидуална карта. Тя съдържа course filter, отделни линии/клиенти и правилен клиентски panel за избрания курс.
+
+### 13.3 Excel
+
+Активният workflow създава един общ `cvrp_report_<date>.xlsx` с отделни sheets. При multi-trip sheet `Маршрути` добавя само колоната `Курс`; не добавя `vehicle_key`/`route_id` като бизнес колони.
+
+### 13.4 CSV
+
+CSV е отделен технически export. При multi-trip той добавя `ID бус`, `Курс`, `ID курс` и `Ключ бус`, за да пази машинната връзка между курс и физически бус.
+
+### 13.5 Графики и upload
+
+Chart-овете се създават само при включен switch. Route-map upload е отделна стъпка след локалното генериране и не заменя локалните файлове.
+
+## 14. Нормален run през `/run`
+
+### Background
+
+GET или POST без `return_result=true` създава `run_id`, записва status и стартира child thread/process. Втори основен run връща `409`.
+
+### Synchronous
+
+POST с `return_result`, `return_json`, `wait` или `sync` чака края и връща пълния резултат.
+
+### Callback
+
+`callback_url`/aliases изпраща финален POST payload след background run.
+
+## 15. `/run_saturday`
+
+Специалният endpoint:
+
+1. намира съботата от текущата седмица;
+2. записва request-local `json_override_date`;
+3. заменя request-local normal bus prefix/digits със Saturday стойностите;
+4. задава output stamp `YYYY-MM-DD_събота`;
+5. стартира същия CVRP workflow.
+
+Постоянният normal prefix в `config.py` не се променя. При включено `center_bus_numbering_enabled` специалната CENTER_BUS серия от `center_bus_numbering_start_id` има предимство пред съботния prefix. CSV и charts запазват собствените си naming правила и не получават задължително Saturday suffix.
+
+## 16. Web workflow
+
+1. Login проверява PBKDF2 credential store и login throttling.
+2. Успешният вход връща session cookie; state-changing POST изисква CSRF token.
+3. Config GET презарежда `config.py` от диска.
+4. Run изпраща временните Web-editable полета към child process.
+5. Global save прави backup и атомарно заменя позволените полета.
+6. Vehicles save атомарно подменя само vehicle list-а.
+7. Status/log endpoints захранват dashboard-а.
+8. Stop прекратява active run process; shutdown спира и сървъра.
+
+Web страницата няма собствен Saturday бутон; `/run_saturday` се извиква през публичния API.
+
+## 17. TSP workflow
+
+`/tsp` не използва CVRP разпределение. Потокът е:
+
+1. валидира driver ID, current GPS, optional end и клиенти;
+2. групира документи според общата input настройка;
+3. избира normal routing или Valhalla truck profile по driver ID;
+4. строи distance/duration матрица;
+5. прави greedy initial order;
+6. по желание изпълнява 2-opt;
+7. изчислява ETA, waiting/late status и totals;
+8. връща JSON или HTML и по желание записва/upload-ва карта;
+9. добавя запис в TSP history за дневния Excel отчет.
+
+TSP time windows са soft score/ETA, не hard feasibility — late stop може да остане. Service time е една обща стойност за всички stops: body `service_time_minutes`, TSP default или fallback. Клиентското `ServiceTimeMinutes` не се прилага в TSP.
+
+## 18. `setData` workflow
+
+За всеки оригинален `IdPlasDoc` се подготвят `DoneFlag`, `IdSkld`, `Bukva` и `IdGrafik`. Групиран клиент може да създаде няколко `setData` заявки, въпреки че е един solver stop.
+
+Необслужените имат отделни шаблони и flags. След успешни заявки и при включен switch се изпраща `makeGroup` по веднъж на използван склад.
+
+## 19. Статус и откази
+
+API status се пази и в `logs/api_run_status.json`. Run-specific логът е `logs/api_run_<run_id>.log`.
+
+Типични прекъсвания:
+
+- невалиден вход — 400;
+- липсващ API key — 401;
+- вече активен run — 409;
+- прекалено голям body — 413;
+- неподдържан content type — 415;
+- worker липсва/protocol mismatch/timeout — failed run;
+- memory/pagefile/OpenBLAS failure — failed worker/run;
+- hard-audit нарушение — кандидатът е отхвърлен.
+
+## 20. Известни текущи разминавания
+
+1. `customer_time_window_default_*` и `enable_start_time_tracking` не управляват очакваната отделна логика.
+2. Single-trip OR-Tools dropped резултат може да бъде маркиран infeasible при разрешено skipping.
+3. Center zone правилата са soft и pure `time` семантиката се различава по backend.
+4. OSRM cache key не включва всички server/profile/mode данни.
+5. Excel няма client service-time mapping; JSON/HTTP има.
+6. Legacy Web run defaults не се прилагат от текущата страница.
+7. Logging rotation и performance memory/max-worker полетата не се налагат стриктно от runtime-а.
+
+Тези точки са описани, за да не се приема настройка в GUI като гарантирано приложена. Пълният списък и препоръчителният избор на backend са в [solver документа](docs/SOLVERS_AND_CONSTRAINTS.md).
