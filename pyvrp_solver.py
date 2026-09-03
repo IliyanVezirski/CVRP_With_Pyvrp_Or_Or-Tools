@@ -88,10 +88,8 @@ from cvrp_solver import (
 
 logger = logging.getLogger(__name__)
 
-# Reporting recomputes OSRM travel and traffic-adjusted durations with their
-# fractional seconds, while PyVRP operates on integer durations.  Keep the
-# final hard-limit audit consistent with the one-minute rounding allowance
-# already used by the OR-Tools output path.
+# The one-minute allowance is an explicit business policy for the complete
+# workday only. Customer time windows use one strict, canonical integer clock.
 WORK_TIME_AUDIT_TOLERANCE_MINUTES = 1.0
 
 # Full-workday time is expressed directly in seconds. Distance must not leak
@@ -326,6 +324,62 @@ class PyVRPSolver:
                 return 0
             return max(0, int(round(float(duration_s or 0))))
         return max(0, int(round(float(distance_m or 0))))
+
+    @staticmethod
+    def _ceil_nonnegative_seconds(value, label: str) -> int:
+        """Conservatively quantise a finite duration to whole seconds."""
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {label}: {value!r}") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(
+                f"Invalid {label}: expected a finite non-negative value, got {value!r}"
+            )
+
+        # Move down by one floating-point step before ceil so values that are
+        # mathematically integral (for example 7.1 * 60) cannot gain a phantom
+        # second solely because of binary floating-point representation.
+        adjusted = math.nextafter(numeric, -math.inf) if numeric > 0 else 0.0
+        return int(math.ceil(adjusted))
+
+    @classmethod
+    def _canonical_travel_seconds(
+        cls,
+        raw_duration_seconds,
+        traffic_multiplier=1.0,
+    ) -> int:
+        """Return the one travel duration used by every model and report."""
+        try:
+            multiplier = float(traffic_multiplier or 1.0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Invalid traffic multiplier: {traffic_multiplier!r}"
+            ) from exc
+        if not math.isfinite(multiplier) or multiplier < 0:
+            raise ValueError(
+                "Invalid traffic multiplier: expected a finite non-negative "
+                f"value, got {traffic_multiplier!r}"
+            )
+        multiplier = max(1.0, multiplier)
+        try:
+            adjusted_duration = float(raw_duration_seconds) * multiplier
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Invalid travel duration: {raw_duration_seconds!r}"
+            ) from exc
+        return cls._ceil_nonnegative_seconds(adjusted_duration, "travel duration")
+
+    @classmethod
+    def _canonical_service_seconds(cls, service_time_minutes) -> int:
+        """Return service time on the same conservative integer clock."""
+        try:
+            duration = float(service_time_minutes or 0) * 60
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Invalid service time: {service_time_minutes!r}"
+            ) from exc
+        return cls._ceil_nonnegative_seconds(duration, "service duration")
 
     def _time_windows_enabled(self) -> bool:
         return bool(getattr(self.config, "enable_customer_time_windows", False))
@@ -572,10 +626,35 @@ class PyVRPSolver:
                     if not self._time_windows_enabled():
                         continue
                     windows = self._customer_time_windows_seconds(customer)
-                    arrival_seconds = float(entry.get("arrival_time_minutes", 0) or 0) * 60
+                    exact_arrival = entry.get("arrival_time_seconds")
+                    if exact_arrival is None:
+                        # Backward-compatible fallback for externally created
+                        # or legacy schedule entries. New entries always carry
+                        # exact seconds and never round-trip through minutes.
+                        arrival_seconds = (
+                            float(entry.get("arrival_time_minutes", 0) or 0) * 60
+                        )
+                    else:
+                        arrival_seconds = float(exact_arrival)
                     if windows and not any(start <= arrival_seconds <= end for start, end in windows):
+                        window_text = ", ".join(
+                            f"{self._format_schedule_time_seconds(start)}-"
+                            f"{self._format_schedule_time_seconds(end)}"
+                            for start, end in windows
+                        )
+                        delta_seconds = min(
+                            (
+                                start - arrival_seconds
+                                if arrival_seconds < start
+                                else arrival_seconds - end
+                            )
+                            for start, end in windows
+                        )
                         violations.append(
-                            f"{vehicle_key}/клиент {customer_id}: пристигане извън работното време"
+                            f"{vehicle_key}/клиент {customer_id}: пристигане "
+                            f"{self._format_schedule_time_seconds(arrival_seconds)} "
+                            f"извън работното време [{window_text}] "
+                            f"(отклонение {delta_seconds:.3f} сек)"
                         )
 
             daily_limit = getattr(vehicle, "max_customers_per_day", None)
@@ -597,7 +676,13 @@ class PyVRPSolver:
             else:
                 work_minutes = sum(float(route.total_time_minutes or 0) for route in vehicle_routes)
                 if len(vehicle_routes) > 1:
-                    work_minutes += (len(vehicle_routes) - 1) * float(vehicle.reload_time_minutes or 0)
+                    reload_minutes = (
+                        self._canonical_service_seconds(
+                            getattr(vehicle, "reload_time_minutes", 0) or 0
+                        )
+                        / 60
+                    )
+                    work_minutes += (len(vehicle_routes) - 1) * reload_minutes
             max_work_minutes = float(vehicle.max_time_hours or 0) * 60
             if (
                 max_work_minutes
@@ -812,9 +897,8 @@ class PyVRPSolver:
                 )
                 reload_matrix_idx = self._get_depot_index_for_location(reload_location, 0)
                 reload_coords = self.unique_depots[reload_matrix_idx]
-                reload_seconds = max(
-                    0,
-                    int(getattr(v_config, "reload_time_minutes", 0) or 0) * 60,
+                reload_seconds = self._canonical_service_seconds(
+                    getattr(v_config, "reload_time_minutes", 0) or 0
                 )
                 reload_key = (reload_matrix_idx, reload_seconds)
                 if reload_key in reload_depot_to_obj:
@@ -954,7 +1038,9 @@ class PyVRPSolver:
 
         # 4. Създаваме профил за всеки тип бус, за да има точен service time.
         def profile_signature(v_config: VehicleConfig):
-            service_time_seconds = int(v_config.service_time_minutes * 60)
+            service_time_seconds = self._canonical_service_seconds(
+                v_config.service_time_minutes
+            )
             vehicle_type_value = getattr(v_config.vehicle_type, "value", str(v_config.vehicle_type))
 
             # Service time affects shift duration and time-window feasibility,
@@ -1059,7 +1145,6 @@ class PyVRPSolver:
                 matrix_i = self._pyvrp_location_matrix_indices[i]
                 matrix_j = self._pyvrp_location_matrix_indices[j]
                 base_distance = int(self.distance_matrix.distances[matrix_i][matrix_j])
-                duration = int(self.distance_matrix.durations[matrix_i][matrix_j])
                 
                 # Прилагаме множител за градски трафик ако отсечката попада в активна зона.
                 traffic_multiplier = get_traffic_multiplier(
@@ -1067,8 +1152,11 @@ class PyVRPSolver:
                     location_coords[i],
                     location_coords[j],
                 )
+                duration = self._canonical_travel_seconds(
+                    self.distance_matrix.durations[matrix_i][matrix_j],
+                    traffic_multiplier,
+                )
                 if traffic_multiplier > 1.0:
-                    duration = int(duration * traffic_multiplier)
                     city_edges_count += 1
                 reload_service_seconds = reload_service_by_location_index.get(i, 0)
                 base_objective_cost = self._objective_arc_cost(
@@ -1108,9 +1196,8 @@ class PyVRPSolver:
                             service_seconds = int(profile_spec["service_time_seconds"])
                         else:
                             try:
-                                service_seconds = max(
-                                    0,
-                                    int(round(float(service_override) * 60)),
+                                service_seconds = self._canonical_service_seconds(
+                                    service_override
                                 )
                             except (TypeError, ValueError, OverflowError):
                                 service_seconds = int(profile_spec["service_time_seconds"])
@@ -1191,9 +1278,8 @@ class PyVRPSolver:
                     or self.unique_depots[0]
                 )
                 reload_matrix_idx = self._get_depot_index_for_location(reload_location, 0)
-                reload_seconds = max(
-                    0,
-                    int(getattr(v_config, "reload_time_minutes", 0) or 0) * 60,
+                reload_seconds = self._canonical_service_seconds(
+                    getattr(v_config, "reload_time_minutes", 0) or 0
                 )
                 max_reloads = self._dynamic_max_reloads(v_config)
                 reload_depot = reload_depot_to_obj.get((reload_matrix_idx, reload_seconds))
@@ -1664,11 +1750,9 @@ class PyVRPSolver:
                         reload_seconds = float(reload_activity.service_duration)
                     except Exception:
                         reload_seconds = float(
-                            max(
-                                0,
-                                int(getattr(vehicle_config, "reload_time_minutes", 0) or 0),
+                            self._canonical_service_seconds(
+                                getattr(vehicle_config, "reload_time_minutes", 0) or 0
                             )
-                            * 60
                         )
                     day_clock_seconds += reload_seconds
                     total_time_minutes += reload_seconds / 60
@@ -1785,23 +1869,31 @@ class PyVRPSolver:
         from_node: int,
         to_node: int,
         location_coords: List[Tuple[float, float]],
-    ) -> float:
-        travel_time = float(self.distance_matrix.durations[from_node][to_node])
+    ) -> int:
+        traffic_multiplier = 1.0
         if from_node < len(location_coords) and to_node < len(location_coords):
             traffic_multiplier = get_traffic_multiplier(
                 self.location_config,
                 location_coords[from_node],
                 location_coords[to_node],
             )
-            if traffic_multiplier > 1.0:
-                travel_time *= traffic_multiplier
-        return max(0.0, travel_time)
+        return self._canonical_travel_seconds(
+            self.distance_matrix.durations[from_node][to_node],
+            traffic_multiplier,
+        )
 
     def _format_schedule_time(self, total_seconds: float) -> str:
         total_minutes = int(round(total_seconds / 60))
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return f"{hours:02d}:{minutes:02d}"
+
+    def _format_schedule_time_seconds(self, total_seconds: float) -> str:
+        rounded_seconds = int(round(float(total_seconds)))
+        hours = rounded_seconds // 3600
+        minutes = (rounded_seconds % 3600) // 60
+        seconds = rounded_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _format_customer_time_window_for_schedule(self, customer: Customer) -> str:
         return self._format_customer_time_windows_for_schedule(customer)
@@ -1819,10 +1911,8 @@ class PyVRPSolver:
 
         depot_index = self._get_depot_index_for_location(depot_location, 0)
         end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
-        default_service_time_seconds = (
-            float(vehicle_config.service_time_minutes) * 60
-            if vehicle_config
-            else 15 * 60
+        default_service_time_seconds = self._canonical_service_seconds(
+            vehicle_config.service_time_minutes if vehicle_config else 15
         )
         effective_start_seconds = (
             float(start_time_seconds)
@@ -1856,7 +1946,9 @@ class PyVRPSolver:
                 service_time_seconds = default_service_time_seconds
             else:
                 try:
-                    service_time_seconds = max(0.0, float(service_override) * 60)
+                    service_time_seconds = self._canonical_service_seconds(
+                        service_override
+                    )
                 except (TypeError, ValueError, OverflowError):
                     logger.warning(
                         "Invalid service_time_minutes=%r for customer %s; using vehicle default.",
@@ -1890,6 +1982,7 @@ class PyVRPSolver:
                 "cumulative_time": total_time_seconds / 60,
                 "start_time_minutes": effective_start_seconds / 60,
                 "arrival_time_minutes": arrival_after_wait_seconds / 60,
+                "arrival_time_seconds": arrival_after_wait_seconds,
                 "total_time_with_start": current_clock_seconds / 60,
                 "time_window_text": self._format_customer_time_window_for_schedule(customer),
                 "time_window_status": time_window_status,
@@ -1935,93 +2028,6 @@ class PyVRPSolver:
             vehicle_config,
             end_location,
         )
-        return total_distance, total_time
-
-        if not customers:
-            return 0.0, 0.0
-
-        total_distance = 0.0
-        total_time = 0.0
-
-        depot_index = self._get_depot_index_for_location(depot_location, 0)
-        end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
-
-        # От депо до първия клиент
-        current_node = depot_index
-        
-        if vehicle_config:
-            service_time_s = vehicle_config.service_time_minutes * 60
-        else:
-            service_time_s = 15 * 60
-        current_clock_s = self._vehicle_start_seconds(vehicle_config)
-
-        # === ГРАДСКИ ТРАФИК: координати за всички локации и активни зони ===
-        num_locations = len(self.distance_matrix.distances)
-        location_coords = []
-        for loc_idx in range(num_locations):
-            if loc_idx < len(self.unique_depots):
-                coords = self.unique_depots[loc_idx]
-            else:
-                client_idx = loc_idx - len(self.unique_depots)
-                if client_idx < len(self.customers):
-                    coords = self.customers[client_idx].coordinates or (0, 0)
-                else:
-                    coords = (0, 0)
-            location_coords.append(coords)
-
-        for customer in customers:
-            # Намираме индекса на клиента в матрицата
-            try:
-                customer_matrix_idx = len(self.unique_depots) + self.customers.index(customer)
-            except ValueError:
-                logger.warning(f"⚠️ Клиент {customer.id} не намерен в списъка")
-                continue
-
-            # Добавяме разстояние
-            total_distance += self.distance_matrix.distances[current_node][customer_matrix_idx]
-            
-            # Добавяме време с трафик корекция
-            travel_time = self.distance_matrix.durations[current_node][customer_matrix_idx]
-            if current_node < len(location_coords) and customer_matrix_idx < len(location_coords):
-                traffic_multiplier = get_traffic_multiplier(
-                    self.location_config,
-                    location_coords[current_node],
-                    location_coords[customer_matrix_idx],
-                )
-                if traffic_multiplier > 1.0:
-                    travel_time = travel_time * traffic_multiplier
-            total_time += travel_time
-            current_clock_s += travel_time
-
-            wait_time, time_window_status = self._time_window_status_for_arrival(current_clock_s, customer)
-            if wait_time:
-                total_time += wait_time
-                current_clock_s += wait_time
-            elif time_window_status.startswith("След работно време"):
-                logger.debug(
-                    "Клиент %s е след работното време при PyVRP метрики: %.1f мин",
-                    customer.id,
-                    current_clock_s / 60,
-                )
-
-            total_time += service_time_s  # vehicle-specific service time
-            current_clock_s += service_time_s
-
-            current_node = customer_matrix_idx
-
-        # От последния клиент до крайната точка
-        total_distance += self.distance_matrix.distances[current_node][end_depot_index]
-        travel_time_back = self.distance_matrix.durations[current_node][end_depot_index]
-        if current_node < len(location_coords) and end_depot_index < len(location_coords):
-            traffic_multiplier = get_traffic_multiplier(
-                self.location_config,
-                location_coords[current_node],
-                location_coords[end_depot_index],
-            )
-            if traffic_multiplier > 1.0:
-                travel_time_back = travel_time_back * traffic_multiplier
-        total_time += travel_time_back
-
         return total_distance, total_time
 
     def _get_vehicle_config_for_type(self, vehicle_type) -> Optional[VehicleConfig]:

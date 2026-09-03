@@ -391,7 +391,10 @@ class VROOMSolver(PyVRPSolver):
                     matrix_coords[to_index],
                 )
                 adjusted_duration = self._uint32(
-                    raw_duration * max(1.0, float(traffic_multiplier or 1.0)),
+                    self._canonical_travel_seconds(
+                        raw_duration,
+                        traffic_multiplier,
+                    ),
                     f"traffic-adjusted duration matrix[{from_index}][{to_index}]",
                 )
 
@@ -715,7 +718,7 @@ class VROOMSolver(PyVRPSolver):
     @classmethod
     def _minutes_to_seconds(cls, value: Any, label: str) -> int:
         numeric = cls._finite_nonnegative(value, label)
-        return cls._uint32(numeric * 60, label)
+        return cls._uint32(cls._canonical_service_seconds(numeric), label)
 
     @classmethod
     def _scaled_volume(cls, value: Any, label: str) -> int:

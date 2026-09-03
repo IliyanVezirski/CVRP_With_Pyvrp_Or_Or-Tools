@@ -100,6 +100,21 @@ _OUTPUT_COMPAT_FIELD_SPECS = {
         "Брой цифри след съботния префикс.",
     ),
 }
+_SET_DATA_COMPAT_DEFAULTS = {
+    "enable_unserved_final_done_flag_update": True,
+}
+_SET_DATA_COMPAT_FIELD_SPECS = {
+    "enable_unserved_final_done_flag_update": (
+        "bool",
+        "set_data_unserved_done_flag",
+        "Дали след makeGroup да се задава отделен финален DoneFlag.",
+    ),
+    "set_data_unserved_final_done_flag": (
+        "str",
+        "enable_unserved_final_done_flag_update",
+        "Финален DoneFlag само за необслужените; празно = общият DoneFlag.",
+    ),
+}
 _API_RUN_DATE_OUTPUT_FIELDS = {
     "map_output_file",
     "routes_output_dir",
@@ -119,6 +134,19 @@ def _output_config_value(output: Any, field_name: str) -> Any:
     if field_name in _OUTPUT_COMPAT_DEFAULTS:
         return deepcopy(_OUTPUT_COMPAT_DEFAULTS[field_name])
     raise AttributeError(field_name)
+
+
+def _set_data_config_value(set_data: Any, field_name: str) -> Any:
+    """Read a setData field with defaults for preserved legacy configs."""
+    if hasattr(set_data, field_name):
+        return getattr(set_data, field_name)
+    if field_name == "set_data_unserved_final_done_flag":
+        return str(getattr(set_data, "set_data_done_flag", "") or "")
+    if field_name in _SET_DATA_COMPAT_DEFAULTS:
+        return deepcopy(_SET_DATA_COMPAT_DEFAULTS[field_name])
+    raise AttributeError(field_name)
+
+
 _TRIGGER_COMMANDS = {"run", "start", "trigger", "solve_config", "start_program"}
 _SHUTDOWN_COMMANDS = {"shutdown", "stop", "stop_program", "exit", "quit"}
 _REQUEST_BODY_LOG_LIMIT = 100_000
@@ -323,6 +351,9 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "set_data_done_flag": ("set_data", "set_data_done_flag"),
     "set_data_unserved_done_flag": ("set_data", "set_data_unserved_done_flag"),
     "unserved_done_flag": ("set_data", "set_data_unserved_done_flag"),
+    "enable_unserved_final_done_flag_update": ("set_data", "enable_unserved_final_done_flag_update"),
+    "set_data_unserved_final_done_flag": ("set_data", "set_data_unserved_final_done_flag"),
+    "unserved_final_done_flag": ("set_data", "set_data_unserved_final_done_flag"),
     "set_data_timeout": ("set_data", "set_data_timeout_seconds"),
     "set_data_timeout_seconds": ("set_data", "set_data_timeout_seconds"),
     "main_depot": ("locations", "depot_location"),
@@ -455,6 +486,9 @@ _QUERY_SETTING_ALIASES = {
     "set_data_done_flag": "set_data_done_flag",
     "set_data_unserved_done_flag": "set_data_unserved_done_flag",
     "unserved_done_flag": "unserved_done_flag",
+    "enable_unserved_final_done_flag_update": "enable_unserved_final_done_flag_update",
+    "set_data_unserved_final_done_flag": "set_data_unserved_final_done_flag",
+    "unserved_final_done_flag": "unserved_final_done_flag",
     "set_data_timeout": "set_data_timeout",
     "set_data_timeout_seconds": "set_data_timeout_seconds",
     "main_depot": "main_depot",
@@ -698,6 +732,8 @@ def _api_commands_reference(
                         "enable_set_data_upload": False,
                         "set_data_done_flag": "1973",
                         "set_data_unserved_done_flag": "1975",
+                        "enable_unserved_final_done_flag_update": True,
+                        "set_data_unserved_final_done_flag": "1973",
                     },
                 }
             },
@@ -1859,6 +1895,8 @@ _WEB_RUN_SET_DATA_FIELDS = {
     "set_data_bukva_template",
     "enable_unserved_set_data_upload",
     "set_data_unserved_done_flag",
+    "enable_unserved_final_done_flag_update",
+    "set_data_unserved_final_done_flag",
     "set_data_unserved_id_grafik",
     "set_data_unserved_id_grafik_template",
     "set_data_unserved_bukva_template",
@@ -2387,7 +2425,11 @@ def _apply_web_run_settings(config_obj: MainConfig, settings: Dict[str, Dict[str
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
-                else getattr(section_obj, field_name)
+                else (
+                    _set_data_config_value(section_obj, field_name)
+                    if section_name == "set_data"
+                    else getattr(section_obj, field_name)
+                )
             )
             if field_name in {
                 "parallel_first_solution_strategies",
@@ -2449,13 +2491,24 @@ def _web_run_settings_from_config(config_obj: MainConfig) -> Dict[str, Dict[str,
                 else (
                     _output_config_value(getattr(config_obj, section_name), field_name)
                     if section_name == "output"
-                    else getattr(getattr(config_obj, section_name), field_name)
+                    else (
+                        _set_data_config_value(getattr(config_obj, section_name), field_name)
+                        if section_name == "set_data"
+                        else getattr(getattr(config_obj, section_name), field_name)
+                    )
                 )
             )
             for field_name in sorted(allowed_fields)
             if (
                 hasattr(getattr(config_obj, section_name), field_name)
                 or (section_name == "output" and field_name in _OUTPUT_COMPAT_DEFAULTS)
+                or (
+                    section_name == "set_data"
+                    and (
+                        field_name in _SET_DATA_COMPAT_DEFAULTS
+                        or field_name == "set_data_unserved_final_done_flag"
+                    )
+                )
             )
         }
         for section_name, allowed_fields in _WEB_RUN_SECTION_FIELDS.items()
@@ -2687,6 +2740,21 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
             )
             if inserted_count:
                 return inserted
+        if class_name == "SetDataConfig" and field_name in _SET_DATA_COMPAT_FIELD_SPECS:
+            annotation, anchor_name, comment = _SET_DATA_COMPAT_FIELD_SPECS[field_name]
+            anchor_pattern = rf'(?m)^(\s*){re.escape(anchor_name)}\s*:.*$'
+            inserted, inserted_count = re.subn(
+                anchor_pattern,
+                lambda anchor_match: (
+                    f"{anchor_match.group(0)}\n"
+                    f"{anchor_match.group(1)}{field_name}: {annotation} = "
+                    f"{_python_literal(value)} # {comment}"
+                ),
+                class_block,
+                count=1,
+            )
+            if inserted_count:
+                return inserted
         return class_block
 
     return re.sub(class_pattern, replace_in_class, content, count=1, flags=re.S)
@@ -2856,7 +2924,11 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
-                else getattr(section_obj, field_name)
+                else (
+                    _set_data_config_value(section_obj, field_name)
+                    if section_name == "set_data"
+                    else getattr(section_obj, field_name)
+                )
             )
             setattr(
                 section_obj,
@@ -3357,7 +3429,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           <div class="solver-fine-panel" data-solvers="pyvrp_experimental">
             <h4>PyVRP 0.14 worker</h4>
             <div class="solver-settings-grid">
-              <div><label for="pyvrpNextTimeout">Worker timeout (сек.)</label><input id="pyvrpNextTimeout" type="number" min="0" max="86400" title="0 = автоматично спрямо solver лимита."></div>
+              <div><label for="pyvrpNextTimeout">Worker timeout (сек.)</label><input id="pyvrpNextTimeout" type="number" min="0" max="86400" title="0 = solver лимитът плюс автоматичен резерв от 180 секунди за построяване и запис."></div>
               <div class="check-line"><input id="pyvrpNextFallback" type="checkbox"><label for="pyvrpNextFallback">Fallback към PyVRP 0.13</label></div>
             </div>
           </div>
@@ -3459,7 +3531,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           <div class="muted">Изпращането променя данни във външната система и винаги се потвърждава преди старт.</div>
           <div class="check-grid">
             <div class="check-line wide"><input id="setDataEnabled" type="checkbox"><label for="setDataEnabled">Изпращай обслужените клиенти</label></div>
-            <div class="check-line"><input id="setDataUnserved" type="checkbox"><label for="setDataUnserved">Изпращай необслужените</label></div>
+            <div class="check-line"><input id="setDataUnserved" type="checkbox"><label for="setDataUnserved" title="Изпращат се с отделния DoneFlag преди makeGroup; след него получават общия DoneFlag.">Изпращай необслужените</label></div>
             <div class="check-line"><input id="setDataMakeGroup" type="checkbox"><label for="setDataMakeGroup">Изпрати makeGroup</label></div>
           </div>
           <div class="field-grid">
@@ -3483,7 +3555,9 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           <details>
             <summary>Необслужени клиенти и makeGroup</summary>
             <div class="field-grid">
-              <div><label for="setDataUnservedDoneFlag">DoneFlag</label><input id="setDataUnservedDoneFlag"></div>
+              <div><label for="setDataUnservedDoneFlag" title="Начален DoneFlag за необслужените преди makeGroup.">Начален DoneFlag</label><input id="setDataUnservedDoneFlag"></div>
+              <div class="check-line wide"><input id="setDataUnservedFinalEnabled" type="checkbox"><label for="setDataUnservedFinalEnabled" title="Изключи, за да останат необслужените с началния DoneFlag.">Задавай финален DoneFlag след makeGroup</label></div>
+              <div><label for="setDataUnservedFinalDoneFlag" title="Независим финален DoneFlag само за необслужените.">Финален DoneFlag</label><input id="setDataUnservedFinalDoneFlag"></div>
               <div><label for="setDataUnservedGrafik">IdGrafik</label><input id="setDataUnservedGrafik"></div>
               <div><label for="setDataUnservedGrafikTemplate">IdGrafik шаблон</label><input id="setDataUnservedGrafikTemplate"></div>
               <div><label for="setDataUnservedBukvaTemplate">Bukva шаблон</label><input id="setDataUnservedBukvaTemplate"></div>
@@ -3713,6 +3787,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("setDataIdGrafikTemplate", setData.set_data_id_grafik_template);
       put("setDataBukvaTemplate", setData.set_data_bukva_template);
       put("setDataUnservedDoneFlag", setData.set_data_unserved_done_flag);
+      put("setDataUnservedFinalEnabled", setData.enable_unserved_final_done_flag_update !== false);
+      put("setDataUnservedFinalDoneFlag", setData.set_data_unserved_final_done_flag ?? setData.set_data_done_flag);
       put("setDataUnservedGrafik", setData.set_data_unserved_id_grafik);
       put("setDataUnservedGrafikTemplate", setData.set_data_unserved_id_grafik_template);
       put("setDataUnservedBukvaTemplate", setData.set_data_unserved_bukva_template);
@@ -3767,9 +3843,11 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       setDisabled([
         "setDataUnserved", "setDataMakeGroup", "setDataUrl", "setDataMethod", "setDataTimeout", "setDataCommand",
         "setDataDoneFlag", "setDataMainSkld", "setDataVratzaSkld", "setDataDepotMap", "setDataIdGrafik",
-        "setDataIdGrafikTemplate", "setDataBukvaTemplate", "setDataUnservedDoneFlag", "setDataUnservedGrafik",
+        "setDataIdGrafikTemplate", "setDataBukvaTemplate", "setDataUnservedDoneFlag", "setDataUnservedFinalEnabled",
+        "setDataUnservedFinalDoneFlag", "setDataUnservedGrafik",
         "setDataUnservedGrafikTemplate", "setDataUnservedBukvaTemplate", "setDataMakeGroupCommand"
       ], !setDataEnabled);
+      setDisabled(["setDataUnservedFinalDoneFlag"], !setDataEnabled || !bool("setDataUnservedFinalEnabled"));
     }}
 
     function collectOutputSettings() {{
@@ -3797,6 +3875,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         set_data_depot_id_skld_map:value("setDataDepotMap"), set_data_id_grafik:value("setDataIdGrafik"),
         set_data_id_grafik_template:value("setDataIdGrafikTemplate"), set_data_bukva_template:value("setDataBukvaTemplate"),
         enable_unserved_set_data_upload:bool("setDataUnserved"), set_data_unserved_done_flag:value("setDataUnservedDoneFlag"),
+        enable_unserved_final_done_flag_update:bool("setDataUnservedFinalEnabled"),
+        set_data_unserved_final_done_flag:value("setDataUnservedFinalDoneFlag"),
         set_data_unserved_id_grafik:value("setDataUnservedGrafik"), set_data_unserved_id_grafik_template:value("setDataUnservedGrafikTemplate"),
         set_data_unserved_bukva_template:value("setDataUnservedBukvaTemplate"), enable_make_group:bool("setDataMakeGroup"),
         set_data_make_group_command:value("setDataMakeGroupCommand"), set_data_timeout_seconds:requiredInt("setDataTimeout", "setData timeout")

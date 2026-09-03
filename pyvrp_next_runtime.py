@@ -37,6 +37,14 @@ PUBLIC_SOLVER_BACKEND = "pyvrp_experimental"
 REQUIRED_PYVRP_VERSION_PREFIX = "0.14"
 HARD_MANDATORY_CUSTOMERS_CAPABILITY = "hard_mandatory_customers"
 REQUIRED_WORKER_CAPABILITIES = frozenset({HARD_MANDATORY_CUSTOMERS_CAPABILITY})
+
+# The worker timeout covers the complete sidecar lifetime, not only PyVRP's
+# MaxRuntime search.  Frozen workers must first unpack/import, construct the
+# model and all profile-specific edges, and must afterwards validate and
+# serialise the solution.  Large instances (300+ clients, several profiles and
+# parallel workers) have been observed to need more than the old 60 second
+# allowance even though the solver itself stopped exactly on time.
+DEFAULT_WORKER_OVERHEAD_SECONDS = 180.0
 PROJECT_DIR = Path(__file__).resolve().parent
 WORKER_FILENAME = "CVRP_PyVRP_Next_Worker.exe"
 logger = logging.getLogger(__name__)
@@ -350,7 +358,10 @@ def _worker_timeout_seconds(config: Any) -> float:
         solve_limit = float(getattr(config, "time_limit_seconds", 0) or 0)
     except (TypeError, ValueError):
         solve_limit = 0
-    return max(60.0, solve_limit + 60.0)
+    return max(
+        DEFAULT_WORKER_OVERHEAD_SECONDS,
+        solve_limit + DEFAULT_WORKER_OVERHEAD_SECONDS,
+    )
 
 
 def _worker_environment() -> Dict[str, str]:
@@ -690,6 +701,16 @@ def _solve_experimental(
 ) -> Any:
     command = _resolve_worker_command(config)
     timeout = _worker_timeout_seconds(config)
+    configured_timeout = float(
+        getattr(config, "pyvrp_next_worker_timeout_seconds", 0) or 0
+    )
+    logger.info(
+        "Experimental PyVRP worker process timeout: %.0fs (%s); "
+        "solver search limit: %ss",
+        timeout,
+        "explicit" if configured_timeout > 0 else "automatic",
+        getattr(config, "time_limit_seconds", 0),
+    )
 
     request = {
         "protocol_version": PROTOCOL_VERSION,

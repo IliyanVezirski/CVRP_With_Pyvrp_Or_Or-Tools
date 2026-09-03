@@ -328,13 +328,21 @@ assert raw.getvalue().decode("utf-8").strip() == "Ред на депата"
         self.assertTrue(result.solver_fallback_used)
         self.assertIn("timed out", result.solver_fallback_reason)
 
-    def test_automatic_timeout_is_solver_limit_plus_sixty_seconds(self):
+    def test_automatic_timeout_includes_full_worker_overhead_reserve(self):
         config = make_config(
             str(self.worker),
             pyvrp_next_worker_timeout_seconds=0,
             time_limit_seconds=37,
         )
-        self.assertEqual(97, runtime._worker_timeout_seconds(config))
+        self.assertEqual(217, runtime._worker_timeout_seconds(config))
+
+    def test_explicit_worker_timeout_is_not_changed(self):
+        config = make_config(
+            str(self.worker),
+            pyvrp_next_worker_timeout_seconds=420,
+            time_limit_seconds=360,
+        )
+        self.assertEqual(420, runtime._worker_timeout_seconds(config))
 
 
 if __name__ == "__main__":

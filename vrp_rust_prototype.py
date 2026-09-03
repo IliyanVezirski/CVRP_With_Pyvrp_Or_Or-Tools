@@ -261,9 +261,8 @@ class VRPRustPrototype(VROOMSolver):
                 shift["reloads"] = [
                     {
                         "location": {"index": reload_index},
-                        "duration": max(
-                            0,
-                            int(round(float(getattr(vehicle_config, "reload_time_minutes", 0) or 0) * 60)),
+                        "duration": self._canonical_service_seconds(
+                            getattr(vehicle_config, "reload_time_minutes", 0) or 0
                         ),
                     }
                 ]
@@ -383,9 +382,8 @@ class VRPRustPrototype(VROOMSolver):
         size = len(matrix_coords)
         travel_times: List[int] = []
         objective_distances: List[int] = []
-        default_service_seconds = max(
-            0,
-            int(round(float(getattr(vehicle_config, "service_time_minutes", 0) or 0) * 60)),
+        default_service_seconds = self._canonical_service_seconds(
+            getattr(vehicle_config, "service_time_minutes", 0) or 0
         )
 
         service_by_source = [0 for _ in range(size)]
@@ -394,7 +392,7 @@ class VRPRustPrototype(VROOMSolver):
             if override is None or (isinstance(override, str) and not override.strip()):
                 service_seconds = default_service_seconds
             else:
-                service_seconds = max(0, int(round(float(override) * 60)))
+                service_seconds = self._canonical_service_seconds(override)
             service_by_source[len(self.unique_depots) + customer_index] = service_seconds
 
         for from_index in range(size):
@@ -415,11 +413,10 @@ class VRPRustPrototype(VROOMSolver):
                     matrix_coords[from_index],
                     matrix_coords[to_index],
                 )
-                # Match the existing PyVRP quantisation exactly: truncate the
-                # OSRM value first and then truncate the traffic-adjusted value.
-                duration = int(raw_duration)
-                if traffic_multiplier > 1.0:
-                    duration = int(duration * float(traffic_multiplier))
+                duration = self._canonical_travel_seconds(
+                    raw_duration,
+                    traffic_multiplier,
+                )
                 # Service belongs to the source customer.  This preserves
                 # arrival-time-window semantics while allowing each vehicle
                 # profile to have a different service duration.

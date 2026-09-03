@@ -74,6 +74,30 @@ class OutputConfig:
         self.assertIn("saturday_excel_bus_number_digits: int = 1", updated)
         compile(updated, "legacy_config.py", "exec")
 
+    def test_global_save_can_insert_missing_unserved_final_done_flag_fields(self):
+        source = '''@dataclass
+class SetDataConfig:
+    set_data_done_flag: str = "1973"
+    set_data_unserved_done_flag: str = "0"
+    set_data_unserved_id_grafik: str = "1004501000"
+'''
+        updated = api._replace_class_field_literal(
+            source,
+            "SetDataConfig",
+            "enable_unserved_final_done_flag_update",
+            True,
+        )
+        updated = api._replace_class_field_literal(
+            updated,
+            "SetDataConfig",
+            "set_data_unserved_final_done_flag",
+            "1973",
+        )
+
+        self.assertIn("enable_unserved_final_done_flag_update: bool = True", updated)
+        self.assertIn('set_data_unserved_final_done_flag: str = "1973"', updated)
+        compile(updated, "legacy_config.py", "exec")
+
     def test_legacy_strategy_strings_are_normalised_before_web_rendering(self):
         base = deepcopy(get_config())
         base.cvrp.parallel_first_solution_strategies = "['SAVINGS', 'PATH_CHEAPEST_ARC']"
@@ -253,6 +277,8 @@ class CVRPConfig:
         self.assertNotIn("Запази като Web defaults", page)
         self.assertIn("cvrp:collectCvrpSettings()", page)
         self.assertIn("const runSettings = collectRunSettings()", page)
+        self.assertIn('id="setDataUnservedFinalEnabled"', page)
+        self.assertIn('id="setDataUnservedFinalDoneFlag"', page)
         self.assertIn("run_settings:runSettings", page)
         self.assertIn(
             "stringList(cvrp.parallel_first_solution_strategies).join",
