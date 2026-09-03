@@ -67,6 +67,17 @@ def _resolve_unserved_done_flag(set_data: Any) -> str:
     return str(getattr(set_data, "set_data_done_flag", "") or "")
 
 
+def _unserved_final_done_flag_enabled(set_data: Any) -> bool:
+    return bool(getattr(set_data, "enable_unserved_final_done_flag_update", True))
+
+
+def _resolve_unserved_final_done_flag(set_data: Any) -> str:
+    configured = str(getattr(set_data, "set_data_unserved_final_done_flag", "") or "").strip()
+    if configured:
+        return configured
+    return str(getattr(set_data, "set_data_done_flag", "") or "")
+
+
 def _coords_match(left: Any, right: Any, tolerance: float = 0.0001) -> bool:
     if not left or not right:
         return False
@@ -253,7 +264,12 @@ def _unique_customers(customers: List[Any]) -> List[Any]:
 
 
 def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict[str, str]]:
-    """Builds setData rows for unserved customers, using IdSkld from the original GET data."""
+    """Builds the initial setData rows for unserved customers.
+
+    Unserved documents are initially sent with their dedicated DoneFlag so
+    makeGroup can distinguish them from served documents. Afterwards, the
+    same complete setData row is sent again with only DoneFlag changed.
+    """
     set_data = config.set_data
     rows: List[Dict[str, str]] = []
 
@@ -307,6 +323,38 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
             )
 
     return rows
+
+
+def build_unserved_done_flag_rows(
+    unserved_rows: List[Dict[str, str]],
+    set_data_config: Any,
+) -> List[Dict[str, str]]:
+    """Build complete final setData requests with only DoneFlag changed.
+
+    The remote setData implementation expects the routing fields on updates as
+    well as on inserts. Reusing the original unserved row also guarantees that
+    the final stage cannot accidentally change its warehouse, schedule or
+    route letter.
+    """
+    if not _unserved_final_done_flag_enabled(set_data_config):
+        return []
+
+    initial_done_flag = _resolve_unserved_done_flag(set_data_config)
+    final_done_flag = _resolve_unserved_final_done_flag(set_data_config)
+    if final_done_flag == initial_done_flag:
+        return []
+
+    result: List[Dict[str, str]] = []
+    seen = set()
+    for row in unserved_rows:
+        id_plas_doc = str(row.get("IdPlasDoc", "") or "")
+        if not id_plas_doc or id_plas_doc in seen:
+            continue
+        seen.add(id_plas_doc)
+        final_row = dict(row)
+        final_row["DoneFlag"] = final_done_flag
+        result.append(final_row)
+    return result
 
 
 def build_make_group_rows(set_data_rows: List[Dict[str, str]], set_data_config: Any) -> List[Dict[str, str]]:
@@ -371,6 +419,7 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
         else []
     )
     rows = served_rows + unserved_rows
+    unserved_done_flag_rows = build_unserved_done_flag_rows(unserved_rows, set_data)
     result = {
         "enabled": True,
         "attempted": len(rows),
@@ -417,6 +466,44 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
                 logger.error("makeGroup грешка за IdSkld=%s: %s", params.get("IdSkld", ""), exc)
     else:
         logger.warning("Пропускам makeGroup, защото има неуспешни setData заявки.")
+
+    final_update_enabled = _unserved_final_done_flag_enabled(set_data)
+    final_flags = {
+        "enabled": final_update_enabled,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "errors": [],
+    }
+    result["unserved_done_flag"] = final_flags
+    make_group_failed = bool(result["make_group"]["failed"])
+    initial_set_data_failed = bool(result["failed"])
+    if not final_update_enabled:
+        logger.info("Финалният DoneFlag за необслужените е изключен от настройките.")
+    elif initial_set_data_failed:
+        logger.warning("Пропускам финалния DoneFlag за необслужените заради неуспешни първоначални setData заявки.")
+    elif make_group_enabled and make_group_failed:
+        logger.warning("Пропускам финалния DoneFlag за необслужените заради неуспешна makeGroup заявка.")
+    else:
+        logger.info(
+            "Изпращам %s финални DoneFlag заявки за необслужените клиенти",
+            len(unserved_done_flag_rows),
+        )
+        for params in unserved_done_flag_rows:
+            final_flags["attempted"] += 1
+            try:
+                response = send_set_data_row(params, set_data)
+                final_flags["succeeded"] += 1
+                logger.debug("Необслужен DoneFlag OK: %s -> %s", params, response)
+            except Exception as exc:
+                final_flags["failed"] += 1
+                error = {"IdPlasDoc": params.get("IdPlasDoc", ""), "error": str(exc)}
+                final_flags["errors"].append(error)
+                logger.error(
+                    "Грешка при финален DoneFlag за необслужен IdPlasDoc=%s: %s",
+                    params.get("IdPlasDoc", ""),
+                    exc,
+                )
 
     logger.info("setData резултат: %s", json.dumps(result, ensure_ascii=False))
     return result

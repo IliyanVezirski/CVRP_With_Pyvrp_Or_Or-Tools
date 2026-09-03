@@ -424,6 +424,7 @@ class ConfigGUI:
             "output.route_maps_upload_mode",
             "output.map_provider",
             "set_data.enable_set_data_upload",
+            "set_data.enable_unserved_final_done_flag_update",
             "api.web_gui_enabled",
             "api.tsp_use_time_windows",
         )
@@ -482,6 +483,13 @@ class ConfigGUI:
         for key in self.controls:
             if key.startswith("set_data.") and key != "set_data.enable_set_data_upload":
                 self._set_control_enabled(key, set_data_enabled)
+        final_unserved_flag_enabled = set_data_enabled and bool(
+            current("set_data.enable_unserved_final_done_flag_update", True)
+        )
+        self._set_control_enabled(
+            "set_data.set_data_unserved_final_done_flag",
+            final_unserved_flag_enabled,
+        )
 
         web_gui_enabled = bool(current("api.web_gui_enabled", False))
         for key in self.controls:
@@ -1970,7 +1978,9 @@ set_data.set_data_id_grafik             фиксиран IdGrafik
 set_data.set_data_id_grafik_template    шаблон за IdGrafik
 set_data.set_data_bukva_template        шаблон за Bukva
 set_data.enable_unserved_set_data_upload изпраща необслужени
-set_data.set_data_unserved_done_flag    DoneFlag за необслужени; празно = общия DoneFlag
+set_data.set_data_unserved_done_flag    начален DoneFlag за необслужени преди makeGroup
+set_data.enable_unserved_final_done_flag_update включва/спира финалната промяна
+set_data.set_data_unserved_final_done_flag отделен финален DoneFlag за необслужени
 set_data.set_data_unserved_id_grafik    IdGrafik за необслужени
 set_data.set_data_unserved_id_grafik_template шаблон за необслужени
 set_data.set_data_unserved_bukva_template     Bukva за необслужени
@@ -4934,7 +4944,11 @@ enable_unserved_set_data_upload:
   Дали да се изпращат необслужени клиенти.
 
 set_data_unserved_done_flag:
-  DoneFlag само за необслужени клиенти. Ако е празно, използва set_data_done_flag.
+  Начален DoneFlag за необслужените преди makeGroup.
+
+enable_unserved_final_done_flag_update / set_data_unserved_final_done_flag:
+  Включва или спира финалната промяна след makeGroup и задава независимия
+  финален DoneFlag само за необслужените.
 
 enable_make_group:
   След успешен setData може да изпрати makeGroup.
@@ -5934,7 +5948,7 @@ setData не трябва да се пуска:
             "cvrp.pyvrp_next_worker_timeout_seconds",
             "Worker timeout (сек):",
             getattr(c, "pyvrp_next_worker_timeout_seconds", 0),
-            tooltip="0 = лимитът на решителя плюс автоматичен резерв за стартиране и IPC.",
+            tooltip="0 = лимитът на решителя плюс 180 секунди за стартиране, построяване на модела, проверка и IPC.",
         ); r += 1
         self._add_field(
             pyvrp_next,
@@ -7365,14 +7379,35 @@ TSP имената на полетата се настройват от GUI:
             "Отделни правила за клиенти, които са оставени за склад или не са обслужени от solver-а.",
         ); r += 1
         self._add_field(unserved, gr, "set_data.enable_unserved_set_data_upload", "Изпращай необслужени:", getattr(set_data, "enable_unserved_set_data_upload", True), "bool",
-                        tooltip="IdSkld се взима от входното поле IdSkld на клиента."); gr += 1
+                        tooltip="Изпращат се с отделния DoneFlag преди makeGroup; след него получават общия DoneFlag."); gr += 1
         self._add_field(
             unserved,
             gr,
             "set_data.set_data_unserved_done_flag",
-            "DoneFlag:",
+            "Начален DoneFlag:",
             getattr(set_data, "set_data_unserved_done_flag", ""),
-            tooltip="Само за необслужени клиенти. Празно поле = използва общия DoneFlag.",
+            tooltip="DoneFlag за необслужените при първоначалния setData преди makeGroup.",
+        ); gr += 1
+        self._add_field(
+            unserved,
+            gr,
+            "set_data.enable_unserved_final_done_flag_update",
+            "Финален DoneFlag след makeGroup:",
+            getattr(set_data, "enable_unserved_final_done_flag_update", True),
+            "bool",
+            tooltip="Изключи, за да остават необслужените с началния DoneFlag след makeGroup.",
+        ); gr += 1
+        self._add_field(
+            unserved,
+            gr,
+            "set_data.set_data_unserved_final_done_flag",
+            "Финален DoneFlag:",
+            getattr(
+                set_data,
+                "set_data_unserved_final_done_flag",
+                getattr(set_data, "set_data_done_flag", "1973"),
+            ),
+            tooltip="Независим финален DoneFlag само за необслужените. Празно = общия DoneFlag.",
         ); gr += 1
         self._add_field(unserved, gr, "set_data.set_data_unserved_id_grafik", "IdGrafik:", getattr(set_data, "set_data_unserved_id_grafik", "")); gr += 1
         self._add_field(
@@ -7396,7 +7431,7 @@ TSP имената на полетата се настройват от GUI:
             f,
             r,
             "Групиране",
-            "По желание след успешни setData заявки се праща makeGroup по склад.",
+            "След първоначалния setData се праща makeGroup, после по желание се задава отделният финален DoneFlag.",
         ); r += 1
         self._add_field(grouping, gr, "set_data.enable_make_group", "Изпращай makeGroup:", getattr(set_data, "enable_make_group", True), "bool"); gr += 1
         self._add_field(grouping, gr, "set_data.set_data_make_group_command", "makeGroup cmd:", getattr(set_data, "set_data_make_group_command", "makeGroup")); gr += 1
@@ -7869,6 +7904,8 @@ TSP имената на полетата се настройват от GUI:
             "set_data.set_data_bukva_template": ("set_data_bukva_template", "str"),
             "set_data.enable_unserved_set_data_upload": ("enable_unserved_set_data_upload", "bool"),
             "set_data.set_data_unserved_done_flag": ("set_data_unserved_done_flag", "str"),
+            "set_data.enable_unserved_final_done_flag_update": ("enable_unserved_final_done_flag_update", "bool"),
+            "set_data.set_data_unserved_final_done_flag": ("set_data_unserved_final_done_flag", "str"),
             "set_data.set_data_unserved_id_grafik": ("set_data_unserved_id_grafik", "str"),
             "set_data.set_data_unserved_id_grafik_template": ("set_data_unserved_id_grafik_template", "str"),
             "set_data.set_data_unserved_bukva_template": ("set_data_unserved_bukva_template", "str"),

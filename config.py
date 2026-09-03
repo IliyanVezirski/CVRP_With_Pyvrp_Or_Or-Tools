@@ -948,7 +948,7 @@ class CVRPConfig:
     pyvrp_next_worker_path: str = ""
     # Празно = runtime-ът търси стандартния companion worker до приложението.
     pyvrp_next_worker_timeout_seconds: int = 0
-    # 0 = time_limit_seconds плюс безопасен startup/IPC резерв.
+    # 0 = time_limit_seconds плюс автоматичен 180-секунден резерв за startup, model build, validation и IPC.
     pyvrp_next_fallback_to_stable: bool = False
     # Ако sidecar-ът липсва/се провали, разрешава изричен fallback към стабилния PyVRP 0.13.
 
@@ -1176,11 +1176,13 @@ class SetDataConfig:
     set_data_id_grafik_template: str = "{bus_number}"  # Шаблон за IdGrafik. По подразбиране е номерът на буса от Excel.
     set_data_bukva_template: str = "БХ{route_number}-{stop_number}"  # Шаблон за Bukva, напр. БХ1-1.
     enable_unserved_set_data_upload: bool = False  # Дали да се изпращат и необслужените клиенти към setData.
-    set_data_unserved_done_flag: str = "0"  # DoneFlag за необслужени. Празно = използва set_data_done_flag.
+    set_data_unserved_done_flag: str = "0"  # Начален DoneFlag за необслужени преди makeGroup.
+    enable_unserved_final_done_flag_update: bool = True  # Дали след makeGroup да се задава отделен финален DoneFlag.
+    set_data_unserved_final_done_flag: str = "1973"  # Финален DoneFlag само за необслужените; празно = общият set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
     set_data_unserved_bukva_template: str = "HOF1-{stop_number}"  # Шаблон за Bukva на необслужени клиенти.
-    enable_make_group: bool = False  # Дали след успешни setData заявки да се изпрати cmd=makeGroup по склад.
+    enable_make_group: bool = False  # След първоначалния setData изпраща makeGroup; после необслужените получават общия DoneFlag.
     set_data_make_group_command: str = "makeGroup"  # cmd за групиране след успешни setData заявки.
     set_data_timeout_seconds: int = 30  # Таймаут за setData заявка.
 
