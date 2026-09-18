@@ -351,6 +351,28 @@ def tsp_worker_exe():
         sys.exit(1)
 
 
+def self_check_exe():
+    """Import/configuration smoke check: never starts a solver or HTTP server."""
+    import json
+    setup_exe_environment()
+    load_config()
+    import config
+    import config_gui
+    import cvrp_api_server
+    from customer_deferral import DEFERRAL_FIELDS, validate_deferral_config
+    cfg = config.get_config()
+    validate_deferral_config(cfg.cvrp)
+    missing = sorted(field for field in DEFERRAL_FIELDS if not hasattr(cfg.cvrp, field))
+    if missing:
+        raise ValueError("Runtime config lacks deferral fields: " + ", ".join(missing))
+    page = cvrp_api_server._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
+    assert 'id="customerDroppingStrategy"' in page
+    assert hasattr(config_gui.ConfigGUI, "_validate_values")
+    print(json.dumps({"ok": True, "kind": "self_check", "app": "Bizant",
+                      "deferral_strategy": cfg.cvrp.customer_dropping_strategy,
+                      "desktop_settings_import": True, "web_settings_render": True}))
+
+
 def web_run_worker_exe():
     """Runs one web-triggered CVRP request in a separate EXE process."""
     try:
@@ -376,7 +398,9 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     
-    if "--web-run-worker" in sys.argv:
+    if "--self-check" in sys.argv:
+        self_check_exe()
+    elif "--web-run-worker" in sys.argv:
         web_run_worker_exe()
     elif "--tsp-worker" in sys.argv:
         tsp_worker_exe()

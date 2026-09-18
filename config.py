@@ -15,8 +15,8 @@ from enum import Enum
 # Public solver identifiers shared by the desktop GUI, Web/API validation and
 # the runtime dispatcher.  The stable PyVRP backend intentionally remains the
 # default; the experimental backend is executed by an isolated sidecar.
-CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "or_tools", "vroom", "vrp")
-PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental"})
+CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "pyvrp_one", "or_tools", "vroom", "vrp")
+PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental", "pyvrp_one"})
 
 
 # --- Path Configuration ---
@@ -105,6 +105,11 @@ class VehicleConfig:
     max_distance_km: Optional[int] = None  # Максимален дневен пробег на физическия бус. None означава без лимит.
     max_time_hours: int = 8    # Максимално дневно работно време (включва пътуване, обслужване и презареждане).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
+    service_time_mode: str = "fixed"  # fixed or formula; old configurations stay unchanged.
+    service_base_seconds: float = 0.0
+    service_seconds_per_unit: float = 12.0
+    service_quantity_units: float = 1.0
+    service_max_seconds: float = 900.0
     enabled: bool = True       # Дали този тип превозно средство е активно и може да се използва от solver-а.
     start_location: Optional[Tuple[float, float]] = None  # Персонална начална точка (депо) за този тип. Ако е None, използва се главното депо.
     end_location: Optional[Tuple[float, float]] = None  # Персонална крайна точка за този тип. Ако е None, маршрутът завършва в стартовото депо.
@@ -871,6 +876,13 @@ class CVRPConfig:
     min_customer_drop_penalty: int = 45000
     max_customer_drop_penalty: int = 500000
 
+    # A/B alternative, PyVRP 0.14 only. Existing deployments remain legacy.
+    customer_dropping_strategy: str = "legacy"
+    drop_geo_reference_km: float = 20.0
+    drop_geo_strength: float = 1.0
+    drop_repair_max_ejections: int = 6
+    drop_repair_budget_fraction: float = 0.15
+
     enable_parallel_solving: bool = True  # Keep disabled for PyVRP stability
     # Описание: Дали да се стартират няколко solver-а паралелно с различни стратегии.
     
@@ -924,7 +936,7 @@ class CVRPConfig:
     pyvrp_exhaustive_on_best: bool = True
     # Описание: По-скъпо локално търсене при ново най-добро решение.
     pyvrp_use_extended_operators: bool = True
-    # Описание: Добавя по-тежки PyVRP move operators (Exchange30/31/32/33, SwapStar, SwapRoutes).
+    # 0.13: Exchange30/31/32/33, SwapStar, SwapRoutes; 0.14: Relocate3, Swap31/32/33.
     pyvrp_min_perturbations: int = 1
     pyvrp_max_perturbations: int = 25
     # Описание: Сила на perturbation при restart-и. По-високо помага да излезе от лош локален оптимум.
@@ -946,6 +958,8 @@ class CVRPConfig:
 
     # --- Experimental PyVRP 0.14 sidecar ---
     pyvrp_next_worker_path: str = ""
+    # Isolated, pinned 1.x alpha. Never replaces either existing PyVRP runtime.
+    pyvrp_one_worker_path: str = ""
     # Празно = runtime-ът търси стандартния companion worker до приложението.
     pyvrp_next_worker_timeout_seconds: int = 0
     # 0 = time_limit_seconds плюс автоматичен 180-секунден резерв за startup, model build, validation и IPC.
@@ -1010,6 +1024,11 @@ class CVRPConfig:
 @dataclass
 class OutputConfig:
     """Конфигурации за генериране на изходни файлове (карти, Excel отчети, графики)."""
+    volume_unit_label: str = "стекове" # Само текст: стекове, кашони, оборот и т.н.; числата и API полетата не се променят.
+    mandatory_customer_comment: str = "Задължителен клиент — не пропускайте доставката." # Текст в индивидуалните карти; не променя solver флага.
+    mobile_driver_panel: bool = False # Алтернативен компактен панел с един разгънат клиент.
+    driver_total_volume_label: str = "" # Надпис за капацитети и общи количества навсякъде; празно = общата единица.
+    driver_customer_volume_label: str = "" # Единица при клиентите и заявките навсякъде; празно = общата единица.
     # Интерактивна карта
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("D:\\Iliyan\\bizant_source\\output/interactive_map.html") # Път и име на файла за картата.
@@ -1017,7 +1036,7 @@ class OutputConfig:
     route_maps_upload_mode: str = "disabled" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
-    route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
+    route_maps_upload_token: str = os.environ.get("BIZANT_MAP_UPLOAD_TOKEN", "") # Token стойност за upload endpoint-а.
     route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
     route_maps_upload_bus_id_field: str = "pData2[]" # Multipart POST поле за ID-та на бусовете, подредени като files[].
     route_maps_upload_timeout_seconds: int = 60 # Таймаут за качване на route HTML файловете.
@@ -1030,6 +1049,7 @@ class OutputConfig:
     
     # Excel файлове
     enable_excel_output: bool = True # Дали да се генерира Excel CVRP отчет.
+    enable_routing_quality_report: bool = False # Допълнителен Excel отчет за приблизителни отсечки и неизвестен произход.
     excel_output_dir: str = _abs_path("D:\\Iliyan\\bizant_source\\output/excel") # Директория за запис на Excel отчетите.
     warehouse_excel_file: str = "warehouse_orders.xlsx" # Име на файла с необслужените клиенти (за склада).
     routes_excel_file: str = "vehicle_routes.xlsx" # Име на файла с детайли за всеки маршрут.

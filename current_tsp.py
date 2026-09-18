@@ -12,6 +12,7 @@ from copy import deepcopy
 import html
 from itertools import permutations
 import logging
+from service_time import customer_service_seconds
 import math
 import os
 import re
@@ -32,6 +33,8 @@ from input_handler import (
     Customer,
     GPSParser,
     _safe_delivery_comment,
+    _safe_service_time_minutes,
+    SERVICE_TIME_FIELD_ALIASES,
     choose_time_window_for_arrival,
     customer_time_windows_minutes,
     format_time_windows_minutes,
@@ -141,6 +144,7 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     two_opt_max_passes = _tsp_two_opt_max_passes(payload, active_config)
     vehicle_type = _vehicle_type(payload)
     vehicle_config = _vehicle_config_for_type(active_config, vehicle_type)
+    _prepare_customer_service_times(customers, vehicle_config, payload, service_time_minutes)
     tsp_valhalla_config = _tsp_valhalla_truck_config(active_config, driver_id)
 
     matrix_locations = [start_location] + [c.coordinates for c in customers]
@@ -380,6 +384,9 @@ def _parse_tsp_customers(records: Iterable[Any], config: MainConfig) -> Tuple[Li
             name=name,
             coordinates=coords,
             volume=quantity,
+            service_time_minutes=_safe_service_time_minutes(_first_present(
+                record, getattr(getattr(config, "input", None), "json_service_time_field", "ServiceTimeMinutes"),
+                *SERVICE_TIME_FIELD_ALIASES)),
             original_gps_data=f"{coords[0]:.6f},{coords[1]:.6f}",
             document=order_no,
             plas_doc=plas_doc,
@@ -1126,6 +1133,20 @@ def _greedy_step_score(
     return base + wait_seconds * wait_weight + late_seconds * late_weight
 
 
+def _prepare_customer_service_times(customers, vehicle_config, payload, default_minutes):
+    explicit_global = _first_present(payload, "service_time_minutes", "service_minutes", "serviceTimeMinutes")
+    for customer in customers:
+        # A TSP request can still explicitly supply one common duration. A
+        # per-customer input overrides it; otherwise the vehicle formula applies.
+        policy = vehicle_config if explicit_global is None and getattr(vehicle_config, "service_time_mode", "fixed") == "formula" else None
+        customer._tsp_service_seconds = customer_service_seconds(customer, policy, default_minutes)
+
+
+def _tsp_customer_service_seconds(customer, default_minutes):
+    cached = getattr(customer, "_tsp_service_seconds", None)
+    return cached if cached is not None else customer_service_seconds(customer, default_minutes=default_minutes)
+
+
 def _arrival_after_service_seconds(
     current_node: int,
     next_node: int,
@@ -1141,7 +1162,7 @@ def _arrival_after_service_seconds(
     if windows:
         _, wait_seconds, _, _ = choose_time_window_for_arrival(arrival_seconds, windows)
         arrival_seconds += wait_seconds
-    return arrival_seconds + service_time_minutes * 60
+    return arrival_seconds + _tsp_customer_service_seconds(customer, service_time_minutes)
 
 
 def _two_opt_open_route(
@@ -1325,7 +1346,10 @@ def _open_route_cost(
                 cost += wait_seconds * wait_weight + late_seconds * late_weight
                 current_clock_seconds += wait_seconds
 
-        current_clock_seconds += service_time_minutes * 60
+        current_clock_seconds += (
+            _tsp_customer_service_seconds(customers[node - 1], service_time_minutes)
+            if customers and 0 <= node - 1 < len(customers) else service_time_minutes * 60
+        )
         current_node = node
 
     if end_node is not None:
@@ -1377,7 +1401,8 @@ def _build_schedule_entries(
             status = f"{status} (прозорец {window_index + 1})"
         arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
 
-        current_clock_seconds = arrival_after_wait_seconds + service_time_minutes * 60
+        visit_service_seconds = _tsp_customer_service_seconds(customer, service_time_minutes)
+        current_clock_seconds = arrival_after_wait_seconds + visit_service_seconds
         total_time_seconds = current_clock_seconds - start_time_minutes * 60
 
         entries.append(
@@ -1388,9 +1413,9 @@ def _build_schedule_entries(
                 "distance_from_previous": distance_m / 1000,
                 "cumulative_distance": cumulative_distance_m / 1000,
                 "travel_time_minutes": travel_seconds / 60,
-                "service_time_minutes": service_time_minutes,
+                "service_time_minutes": visit_service_seconds / 60,
                 "wait_minutes": wait_seconds / 60,
-                "total_time_for_step": (travel_seconds + wait_seconds + service_time_minutes * 60) / 60,
+                "total_time_for_step": (travel_seconds + wait_seconds + visit_service_seconds) / 60,
                 "cumulative_time": total_time_seconds / 60,
                 "start_time_minutes": start_time_minutes,
                 "arrival_time_minutes": arrival_after_wait_seconds / 60,

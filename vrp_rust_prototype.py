@@ -7,6 +7,7 @@ tools continue to work.  The application-facing import is :mod:`vrp_solver`.
 from __future__ import annotations
 
 import logging
+from service_time import customer_service_seconds
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -382,17 +383,9 @@ class VRPRustPrototype(VROOMSolver):
         size = len(matrix_coords)
         travel_times: List[int] = []
         objective_distances: List[int] = []
-        default_service_seconds = self._canonical_service_seconds(
-            getattr(vehicle_config, "service_time_minutes", 0) or 0
-        )
-
         service_by_source = [0 for _ in range(size)]
         for customer_index, customer in enumerate(self.customers):
-            override = getattr(customer, "service_time_minutes", None)
-            if override is None or (isinstance(override, str) and not override.strip()):
-                service_seconds = default_service_seconds
-            else:
-                service_seconds = self._canonical_service_seconds(override)
+            service_seconds = self._ceil_nonnegative_seconds(customer_service_seconds(customer, vehicle_config), "service duration")
             service_by_source[len(self.unique_depots) + customer_index] = service_seconds
 
         for from_index in range(size):

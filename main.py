@@ -22,6 +22,7 @@ from dataclasses import asdict
 # Импортираме всички необходими модули
 from ortools.constraint_solver import routing_enums_pb2
 import config as config_module
+from display_units import total_volume_unit_label
 from config import (
     get_config,
     MainConfig,
@@ -245,7 +246,7 @@ def prepare_data(
             logger.error("Не са намерени валидни клиенти във входния файл.")
             return None, None
         
-        logger.info(f"Заредени {len(input_data.customers)} клиенти с общ обем {input_data.total_volume:.2f} ст.")
+        logger.info(f"Заредени {len(input_data.customers)} клиенти с общ обем {input_data.total_volume:.2f} {total_volume_unit_label(effective_config.output, short=True)}")
         
         warehouse_allocation = warehouse_manager.allocate_customers(input_data)
         warehouse_allocation = warehouse_manager.optimize_allocation(warehouse_allocation)
@@ -550,7 +551,7 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
             default_used="pyvrp",
             default_version=_installed_package_version("pyvrp"),
         )
-    elif solver_type == "pyvrp_experimental":
+    elif solver_type in {"pyvrp_experimental", "pyvrp_one"}:
         solution = solve_cvrp_pyvrp_next(
             allocation=warehouse_allocation,
             depot_location=location_config.depot_location,
@@ -562,7 +563,7 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
         _set_solver_metadata(
             solution,
             requested=solver_type,
-            default_used="pyvrp_experimental",
+            default_used=solver_type,
             default_version="",
         )
     elif solver_type == "or_tools":
@@ -638,7 +639,8 @@ def process_results(
     input_data: InputData,
     warehouse_allocation: WarehouseAllocation,
     execution_time: float,
-    sorted_depots: List[Tuple[float, float]]
+    sorted_depots: List[Tuple[float, float]],
+    distance_matrix=None,
 ):
     """
     Стъпка 3: Обработва финалното (най-доброто) решение.
@@ -659,7 +661,7 @@ def process_results(
         output_handler = OutputHandler()
         # Предаваме входното депо за съвместимост (ще се използват индивидуалните депа от маршрутите)
         output_files = output_handler.generate_all_outputs(
-                    solution, warehouse_allocation, input_data.depot_location
+                    solution, warehouse_allocation, input_data.depot_location, distance_matrix=distance_matrix
                 )
     except Exception as exc:
         logger.error(f"Генерирането на изходни файлове завърши с грешка, продължавам към резюмето: {exc}", exc_info=True)
@@ -696,7 +698,7 @@ def _print_summary(input_data, warehouse_allocation, solution, output_files, exe
             if not vehicle_name:
                 vehicle_name = route.vehicle_type.value.replace('_', ' ').title()
             logger.info(f"  Маршрут {i+1} ({vehicle_name}):")
-            logger.info(f"    Клиенти: {len(route.customers)}, Обем: {route.total_volume:.2f} ст., "
+            logger.info(f"    Клиенти: {len(route.customers)}, Обем: {route.total_volume:.2f} {total_volume_unit_label(short=True)}, "
                         f"Разстояние: {route.total_distance_km:.2f} км, Време: {route.total_time_minutes:.1f} мин")
     
     # Изходни файлове
@@ -758,6 +760,10 @@ def _solution_to_api_response(
         "solver_version": str(getattr(solution, "solver_version", "") or ""),
         "solver_fallback_used": bool(getattr(solution, "solver_fallback_used", False)),
         "solver_fallback_reason": str(getattr(solution, "solver_fallback_reason", "") or ""),
+        "deferral_strategy": getattr(solution, "deferral_strategy", "legacy"),
+        "deferral_selection_score": getattr(solution, "deferral_selection_score", None),
+        "deferral_repair_stats": getattr(solution, "deferral_repair_stats", {}),
+        "deferral_summary": getattr(solution, "deferral_summary", {}),
         "execution_time_seconds": round(execution_time, 2),
         "customers_total": len(input_data.customers),
         "mandatory_customers_total": sum(
@@ -868,11 +874,16 @@ def run_optimization(
     
     config = get_config()
 
+    from customer_deferral import (geographic_enabled, prepare_customer_depots,
+                                   validate_deferral_config, solution_selection_key)
+    validate_deferral_config(config.cvrp)
     input_data, warehouse_allocation = prepare_data(input_file, input_data_override, config)
     if not input_data or not warehouse_allocation:
         raise RuntimeError("Не са намерени валидни клиенти във входните данни.")
     warehouse_allocation = move_customers_without_coordinates_to_unserved(warehouse_allocation)
     active_vehicle_configs = get_active_vehicle_configs(warehouse_allocation, config)
+    if geographic_enabled(config.cvrp):
+        prepare_customer_depots(warehouse_allocation.vehicle_customers, config)
 
     # --- Стъпка 1.5: Изчисляване на матрица с разстояния ---
     distance_matrix = get_distance_matrix(warehouse_allocation, config.locations, active_vehicle_configs)
@@ -948,15 +959,7 @@ def run_optimization(
                  sol.total_served_volume = sum(r.total_volume for r in sol.routes)
 
             objective_metric = getattr(config.cvrp, "objective_metric", "distance")
-            if str(objective_metric).strip().lower() in {
-                "time", "duration", "fastest", "shortest_time"
-            }:
-                best_solution = min(
-                    valid_solutions,
-                    key=lambda s: (len(s.dropped_customers), s.fitness_score),
-                )
-            else:
-                best_solution = min(valid_solutions, key=lambda s: s.fitness_score)
+            best_solution = min(valid_solutions, key=lambda s: solution_selection_key(s, config.cvrp))
             
             logger.info(f"🏆 Избрано е най-доброто решение по ФИТНЕС СКОР от {len(valid_solutions)} намерени, "
                         f"objective={objective_metric}, fitness score: {best_solution.fitness_score:.2f} "
@@ -986,7 +989,8 @@ def run_optimization(
             include_reload_locations=bool(getattr(config.cvrp, "enable_multiple_trips", False)),
         )
         
-        output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots)
+        output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots,
+                                       distance_matrix=distance_matrix)
         set_data_result = None
         _assert_mandatory_customer_solution(
             warehouse_allocation,

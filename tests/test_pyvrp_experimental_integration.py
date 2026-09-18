@@ -74,7 +74,7 @@ class SolverDispatchTests(unittest.TestCase):
 
     def test_experimental_backend_dispatches_to_sidecar_runtime(self):
         solution = _solution_with_route()
-        solution.solver_version = "0.14.0a0"
+        solution.solver_version = "0.14.0"
 
         with patch.object(main, "solve_cvrp_pyvrp_next", return_value=solution) as solve_next:
             result = main.solve_cvrp_worker(_worker_args("pyvrp_experimental"))
@@ -84,7 +84,7 @@ class SolverDispatchTests(unittest.TestCase):
         self.assertEqual(result.solver_requested, "pyvrp_experimental")
         self.assertEqual(result.solver_used, "pyvrp_experimental")
         self.assertEqual(result.solver_backend, "pyvrp_experimental")
-        self.assertEqual(result.solver_version, "0.14.0a0")
+        self.assertEqual(result.solver_version, "0.14.0")
         self.assertFalse(result.solver_fallback_used)
 
     def test_stable_backend_remains_separate(self):
@@ -314,10 +314,12 @@ class SolverSettingsSurfaceTests(unittest.TestCase):
         self.assertIn('id="vroomExploration"', page)
         self.assertIn('solver_type:value("solverType")', page)
         self.assertIn('time_objective_include_waiting:bool("timeObjectiveIncludeWaiting")', page)
-        self.assertIn("Запази глобално в config.py", page)
-        self.assertIn("Запази само бусовете глобално", page)
-        self.assertIn("Стартирай без запис", page)
-        self.assertIn("body:JSON.stringify(collectConfigPayload())", page)
+        self.assertIn("Запази основните настройки", page)
+        self.assertIn("Запази бусовете", page)
+        self.assertIn("Стартирай тест", page)
+        save_function = page.split('async function saveGlobalSettings()', 1)[1].split('async function saveVehicles()', 1)[0]
+        self.assertIn('const payload=collectConfigPayload();', save_function)
+        self.assertIn('body:JSON.stringify(payload)', save_function)
 
         fake_manager = types.SimpleNamespace(config=cfg)
         with (

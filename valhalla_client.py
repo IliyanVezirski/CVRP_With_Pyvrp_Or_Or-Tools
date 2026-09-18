@@ -14,12 +14,15 @@ from tqdm import tqdm
 
 from config import get_config, ValhallaConfig
 from osrm_client import DistanceMatrix  # Използваме същия DistanceMatrix клас
+from routing_quality import VALHALLA, RoutingResponseError, error_reason, numeric, quality_code, quality_grid
 
 logger = logging.getLogger(__name__)
 
 FALLBACK_SPEED_KMH = 40.0
 FALLBACK_ROAD_FACTOR = 1.3
-VALHALLA_CLIENT_FIX_VERSION = "2026-05-14-null-cell-v2"
+VALHALLA_CLIENT_FIX_VERSION = "2026-09-13-route-recovery-v3"
+ROUTE_RECOVERY_BUDGET_SECONDS = 120.0
+ROUTE_RECOVERY_TIMEOUT_SECONDS = 10.0
 
 
 def build_valhalla_costing_options(valhalla_config) -> dict:
@@ -90,6 +93,56 @@ class ValhallaClient:
         
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self._reset_route_recovery()
+
+    def _reset_route_recovery(self):
+        # Cache only this calculation, including direction and exact options.
+        # Sequential requests bound concurrency to one and reuse the session.
+        self._route_recovery_cache = {}
+        self._route_recovery_seconds = 0.0
+
+    def _recover_matrix_cell(self, source, target, matrix_request):
+        request = {
+            "locations": [self._build_location(*source), self._build_location(*target)],
+            "costing": matrix_request["costing"],
+            "directions_options": {"units": "kilometers"},
+        }
+        for key in ("date_time", "costing_options"):
+            if key in matrix_request:
+                request[key] = matrix_request[key]
+        key = json.dumps(request, sort_keys=True)
+        if key in self._route_recovery_cache:
+            return self._route_recovery_cache[key]
+        remaining = ROUTE_RECOVERY_BUDGET_SECONDS - self._route_recovery_seconds
+        if remaining <= 0:
+            return None, "recovery_budget"
+        started = time.monotonic()
+        try:
+            response = self.session.post(
+                f"{self.config.base_url.rstrip('/')}/route", json=request,
+                timeout=min(ROUTE_RECOVERY_TIMEOUT_SECONDS, self.config.timeout_seconds, remaining),
+            )
+            response.raise_for_status()
+            data = response.json()
+            trip = data.get("trip") if isinstance(data, dict) else None
+            if not isinstance(trip, dict) or trip.get("status", 0) != 0:
+                raise RoutingResponseError("No usable Valhalla trip")
+            summary = trip.get("summary")
+            if not isinstance(summary, dict):
+                raise RoutingResponseError("No Valhalla route summary")
+            distance, duration = numeric(summary.get("length")), numeric(summary.get("time"))
+            if distance is None or duration is None or trip.get("units", "kilometers") != "kilometers":
+                raise RoutingResponseError("Invalid Valhalla route values or units")
+            distance_m = numeric(distance * 1000.0)
+            if distance_m is None:
+                raise RoutingResponseError("Valhalla route distance overflow")
+            result = ((distance_m, duration), "matrix_route_recovery")
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            result = (None, error_reason(exc))
+        finally:
+            self._route_recovery_seconds += time.monotonic() - started
+        self._route_recovery_cache[key] = result
+        return result
     
     def _build_date_time_param(self) -> dict:
         """Създава date_time параметър за time-dependent routing"""
@@ -137,11 +190,11 @@ class ValhallaClient:
     ) -> Tuple[float, float, bool]:
         fallback_distance_m, fallback_duration_s = self._fallback_cell_values(origin, destination)
 
-        if not cell:
+        if not isinstance(cell, dict):
             return fallback_distance_m, fallback_duration_s, True
 
-        distance_km = cell.get("distance")
-        duration_s = cell.get("time")
+        distance_km = numeric(cell.get("distance"))
+        duration_s = numeric(cell.get("time"))
         used_fallback = distance_km is None or duration_s is None
 
         try:
@@ -157,9 +210,50 @@ class ValhallaClient:
             used_fallback = True
 
         return max(0.0, distance_m), max(0.0, duration), used_fallback
+
+    def _matrix_values_with_quality(self, data, sources, targets, matrix_request=None):
+        if matrix_request is None:
+            matrix_request = {"costing": self.config.costing}
+            matrix_request.update(self._build_date_time_param())
+            matrix_request.update(self._build_costing_options())
+        distances = [[0.0] * len(targets) for _ in sources]
+        durations = [[0.0] * len(targets) for _ in sources]
+        quality = quality_grid(len(sources), len(targets), VALHALLA)
+        fallback_cells = 0
+        recovered_cells = 0
+        for i, source in enumerate(sources):
+            for j, target in enumerate(targets):
+                try:
+                    cell = data["sources_to_targets"][i][j]
+                except (KeyError, IndexError, TypeError):
+                    cell = None
+                distance, duration, fallback = self._normalise_matrix_cell(cell, source, target)
+                distances[i][j], durations[i][j] = distance, duration
+                if fallback:
+                    recovered, reason = self._recover_matrix_cell(source, target, matrix_request)
+                    if recovered is not None:
+                        distances[i][j], durations[i][j] = recovered
+                        quality[i][j] = quality_code("valhalla", "valhalla", reason)
+                        recovered_cells += 1
+                        continue
+                    fallback_cells += 1
+                    cell = cell if isinstance(cell, dict) else {}
+                    quality[i][j] = quality_code(
+                        "valhalla" if numeric(cell.get("distance")) is not None else "approx",
+                        "valhalla" if numeric(cell.get("time")) is not None else "approx",
+                        reason,
+                    )
+        if recovered_cells or fallback_cells:
+            logger.info(
+                "Valhalla: липсващи клетки %s; възстановени с реален път %s; "
+                "останали с приблизителни стойности %s.",
+                recovered_cells + fallback_cells, recovered_cells, fallback_cells,
+            )
+        return distances, durations, quality, fallback_cells
     
     def get_distance_matrix(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Получава матрица с разстояния и времена от Valhalla"""
+        self._reset_route_recovery()
         n_locations = len(locations)
         print(f"\n{'='*60}")
         print(f"🗺️  VALHALLA - Изчисляване на матрица")
@@ -230,32 +324,12 @@ class ValhallaClient:
             
             # Парсване на отговора
             print(f"📊 Парсване на матрицата...")
-            distances = [[0.0 for _ in range(n)] for _ in range(n)]
-            durations = [[0.0 for _ in range(n)] for _ in range(n)]
-            
-            # Valhalla връща sources_to_targets като list of lists
-            if "sources_to_targets" in data:
-                total_cells = 0
-                fallback_cells = 0
-                for i, row in enumerate(data["sources_to_targets"]):
-                    for j, cell in enumerate(row):
-                        distance_m, duration_s, used_fallback = self._normalise_matrix_cell(
-                            cell,
-                            locations[i],
-                            locations[j],
-                        )
-                        distances[i][j] = distance_m
-                        durations[i][j] = duration_s
-                        total_cells += 1
-                        if used_fallback:
-                            fallback_cells += 1
-                print(f"✅ Парсирани {total_cells} клетки от матрицата")
-                if fallback_cells:
-                    logger.warning(
-                        "Valhalla върна липсващи стойности за %s/%s клетки; използвам приблизителни стойности.",
-                        fallback_cells,
-                        total_cells,
-                    )
+            distances, durations, quality, fallback_cells = self._matrix_values_with_quality(data, locations, locations, request_body)
+            if fallback_cells:
+                logger.warning(
+                    "Valhalla върна липсващи стойности за %s/%s клетки; използвам приблизителни стойности.",
+                    fallback_cells, n * n,
+                )
             
             # Статистика
             max_dist = max(max(row) for row in distances) / 1000
@@ -270,6 +344,7 @@ class ValhallaClient:
             return DistanceMatrix(
                 distances=distances,
                 durations=durations,
+                quality=quality,
                 locations=locations,
                 sources=list(range(n)),
                 destinations=list(range(n))
@@ -300,6 +375,7 @@ class ValhallaClient:
         
         distances = [[0.0 for _ in range(n)] for _ in range(n)]
         durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n)
         
         start_time = time_module.time()
         successful_batches = 0
@@ -316,12 +392,14 @@ class ValhallaClient:
                     
                     try:
                         batch_matrix = self._get_submatrix(sources, targets)
+                        batch_quality = batch_matrix.get('quality') or quality_grid(len(sources), len(targets))
                         
                         # Копиране в главната матрица
                         for si, src_idx in enumerate(range(i, end_i)):
                             for ti, tgt_idx in enumerate(range(j, end_j)):
                                 distances[src_idx][tgt_idx] = batch_matrix['distances'][si][ti]
                                 durations[src_idx][tgt_idx] = batch_matrix['durations'][si][ti]
+                                quality[src_idx][tgt_idx] = batch_quality[si][ti]
                         
                         successful_batches += 1
                         
@@ -345,6 +423,7 @@ class ValhallaClient:
                                 )
                                 distances[src_idx][tgt_idx] = approx_distance
                                 durations[src_idx][tgt_idx] = approx_duration
+                                quality[src_idx][tgt_idx] = quality_code("approx", "approx", error_reason(e))
                     
                     pbar.update(1)
                     pbar.set_postfix({'✅': successful_batches, '❌': failed_batches})
@@ -371,6 +450,7 @@ class ValhallaClient:
         return DistanceMatrix(
             distances=distances,
             durations=durations,
+            quality=quality,
             locations=locations,
             sources=list(range(n)),
             destinations=list(range(n))
@@ -403,22 +483,7 @@ class ValhallaClient:
         
         ns = len(sources)
         nt = len(targets)
-        distances = [[0.0 for _ in range(nt)] for _ in range(ns)]
-        durations = [[0.0 for _ in range(nt)] for _ in range(ns)]
-        fallback_cells = 0
-        
-        if "sources_to_targets" in data:
-            for i, row in enumerate(data["sources_to_targets"]):
-                for j, cell in enumerate(row):
-                    distance_m, duration_s, used_fallback = self._normalise_matrix_cell(
-                        cell,
-                        sources[i],
-                        targets[j],
-                    )
-                    distances[i][j] = distance_m
-                    durations[i][j] = duration_s
-                    if used_fallback:
-                        fallback_cells += 1
+        distances, durations, quality, fallback_cells = self._matrix_values_with_quality(data, sources, targets, request_body)
 
         if fallback_cells:
             logger.warning(
@@ -426,7 +491,7 @@ class ValhallaClient:
                 fallback_cells,
             )
         
-        return {"distances": distances, "durations": durations}
+        return {"distances": distances, "durations": durations, "quality": quality}
     
     def get_route(self, origin: Tuple[float, float], 
                   destination: Tuple[float, float]) -> dict:

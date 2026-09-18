@@ -6,7 +6,9 @@
 from typing import List, Tuple, Dict, Optional, Any
 from dataclasses import dataclass
 import logging
+from service_time import minimum_service_seconds
 import math
+from display_units import volume_unit_label
 from config import (
     get_config,
     WarehouseConfig,
@@ -78,7 +80,7 @@ class WarehouseManager:
         logger.info("Започвам разпределение на клиенти по новата логика")
         
         # Изчисляване на общия капацитет
-        total_capacity = self._calculate_total_vehicle_capacity(len(input_data.customers))
+        total_capacity = self._calculate_total_vehicle_capacity(len(input_data.customers), input_data.customers)
         
         # Сортиране на клиентите по обем (от най-малък към най-голям)
         # и за клиенти с еднакъв обем - по разстояние (от най-далечен към най-близък)
@@ -94,6 +96,7 @@ class WarehouseManager:
         self,
         vehicle: VehicleConfig,
         customer_count: Optional[int] = None,
+        customers=None,
     ) -> int:
         """Returns a safe, finite upper bound on useful trips in one shift.
 
@@ -107,6 +110,10 @@ class WarehouseManager:
 
         shift_minutes = max(0, int(round(float(getattr(vehicle, "max_time_hours", 0) or 0) * 60)))
         service_minutes = max(0, int(getattr(vehicle, "service_time_minutes", 0) or 0))
+        if customers is not None:
+            service_minutes = minimum_service_seconds(customers, vehicle) / 60
+        elif getattr(vehicle, "service_time_mode", "fixed") == "formula":
+            service_minutes = 0  # Unknown quantities: a conservative bound, not an estimate.
         reload_minutes = max(0, int(getattr(vehicle, "reload_time_minutes", 0) or 0))
 
         if shift_minutes > 0 and service_minutes + reload_minutes > 0:
@@ -125,14 +132,14 @@ class WarehouseManager:
         # Direct callers without a customer count still get a finite bound.
         return max(1, min(candidates)) if candidates else 1
 
-    def _calculate_total_vehicle_capacity(self, customer_count: Optional[int] = None) -> int:
+    def _calculate_total_vehicle_capacity(self, customer_count: Optional[int] = None, customers=None) -> int:
         """Calculates theoretical daily volume capacity of enabled vehicles."""
         total_capacity = 0
         
         if self.vehicle_configs:
             for vehicle in self.vehicle_configs:
                 if vehicle.enabled:
-                    trip_bound = self._vehicle_trip_upper_bound(vehicle, customer_count)
+                    trip_bound = self._vehicle_trip_upper_bound(vehicle, customer_count, customers)
                     total_capacity += vehicle.capacity * vehicle.count * trip_bound
         
         return total_capacity
@@ -214,7 +221,7 @@ class WarehouseManager:
                 capacity_utilization=0
             )
         
-        logger.info(f"ℹ️ Капацитет на най-големия бус: {max_single_bus_capacity} ст.")
+        logger.info(f"ℹ️ Капацитет на най-големия бус: {max_single_bus_capacity} {volume_unit_label(short=True)}")
         
         vehicle_customers = []
         warehouse_customers = []
@@ -238,16 +245,16 @@ class WarehouseManager:
                         f"{customer.volume:.2f}, над капацитета на най-големия бус "
                         f"({max_single_bus_capacity}). Няма валидно решение."
                     )
-                logger.warning(f"⚠️ Клиент '{customer.name}' (обем: {customer.volume:.2f} ст.) е твърде голям "
-                              f"за най-големия бус (капацитет: {max_single_bus_capacity} ст.) и отива директно в склада")
+                logger.warning(f"⚠️ Клиент '{customer.name}' (обем: {customer.volume:.2f} {volume_unit_label(short=True)}) е твърде голям "
+                              f"за най-големия бус (капацитет: {max_single_bus_capacity} {volume_unit_label(short=True)}) и отива директно в склада")
                 warehouse_customers.append(customer)
                 continue
                 
             # ПРОВЕРКА 2: Дали клиентът е с обем по-голям от максималния за обслужване от бусове
             max_volume = self.config.max_bus_customer_volume
             if customer.volume > max_volume and not mandatory:
-                logger.info(f"🔍 Клиент '{customer.name}' (обем: {customer.volume:.2f} ст.) е над максималния обем "
-                           f"за бусове ({max_volume:.2f} ст.) и отива директно в склада")
+                logger.info(f"🔍 Клиент '{customer.name}' (обем: {customer.volume:.2f} {volume_unit_label(short=True)}) е над максималния обем "
+                           f"за бусове ({max_volume:.2f} {volume_unit_label(short=True)}) и отива директно в склада")
                 warehouse_customers.append(customer)
                 continue
             
@@ -369,7 +376,7 @@ class WarehouseManager:
 
         # 2. Определяме прага за "голяма" заявка
         large_request_threshold_volume = max_vehicle_capacity * self.config.large_request_threshold
-        logger.info(f"ДЕБЪГ: Праг за 'голяма' заявка (над {self.config.large_request_threshold:.0%}): {large_request_threshold_volume:.2f} ст.")
+        logger.info(f"ДЕБЪГ: Праг за 'голяма' заявка (над {self.config.large_request_threshold:.0%}): {large_request_threshold_volume:.2f} {volume_unit_label(short=True)}")
 
         vehicle_customers = []
         warehouse_customers = []
@@ -396,8 +403,8 @@ class WarehouseManager:
         
         # Логиране на резултата
         logger.info(f"Предварително разпределение завършено:")
-        logger.info(f"  🚛 Клиенти за Solver: {len(vehicle_customers)} ({vehicle_volume:.1f} ст.)")
-        logger.info(f"  🏭 Клиенти за Склад (твърде големи): {len(warehouse_customers)} ({warehouse_volume:.1f} ст.)")
+        logger.info(f"  🚛 Клиенти за Solver: {len(vehicle_customers)} ({vehicle_volume:.1f} {volume_unit_label(short=True)})")
+        logger.info(f"  🏭 Клиенти за Склад (твърде големи): {len(warehouse_customers)} ({warehouse_volume:.1f} {volume_unit_label(short=True)})")
         logger.info(f"  📊 Потенциално използване на капацитет: {actual_utilization:.1%}")
 
         # Проверка за валидност
@@ -463,7 +470,7 @@ class WarehouseManager:
     def can_fit_in_vehicles(self, customers: List[Customer]) -> bool:
         """Проверява дали клиентите могат да се поберат в превозните средства"""
         total_volume = sum(c.volume for c in customers)
-        total_capacity = self._calculate_total_vehicle_capacity(len(customers))
+        total_capacity = self._calculate_total_vehicle_capacity(len(customers), customers)
         
         return total_volume <= total_capacity
 

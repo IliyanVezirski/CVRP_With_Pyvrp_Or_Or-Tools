@@ -9,6 +9,7 @@ shared :class:`CVRPSolution` representation.
 from __future__ import annotations
 
 import logging
+from service_time import customer_service_seconds
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -149,14 +150,6 @@ class VROOMSolver(PyVRPSolver):
             for enabled_index in range(len(enabled_configs))
         }
 
-        service_per_type = {
-            type_names[index]: self._minutes_to_seconds(
-                getattr(vehicle, "service_time_minutes", 0),
-                f"service time for vehicle config {index + 1}",
-            )
-            for index, vehicle in enumerate(enabled_configs)
-        }
-
         priorities = self._customer_priorities()
         jobs: List[Dict[str, Any]] = []
         self._job_by_id = {}
@@ -181,7 +174,10 @@ class VROOMSolver(PyVRPSolver):
             override = self._customer_service_override(customer, job_id)
             if override is None:
                 job["service"] = 0
-                job["service_per_type"] = dict(service_per_type)
+                job["service_per_type"] = {
+                    type_names[index]: self._uint32(self._ceil_nonnegative_seconds(customer_service_seconds(customer, vehicle), "service duration"), "service duration")
+                    for index, vehicle in enumerate(enabled_configs)
+                }
             else:
                 job["service"] = override
 

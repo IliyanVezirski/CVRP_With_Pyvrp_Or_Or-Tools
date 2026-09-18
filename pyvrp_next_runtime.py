@@ -1,4 +1,4 @@
-"""Process-isolated bridge to the experimental PyVRP 0.14 runtime.
+"""Process-isolated bridge to the stable PyVRP 0.14 runtime.
 
 The production application deliberately keeps PyVRP 0.13 in its own Python
 environment.  This module starts a separately built worker that owns PyVRP
@@ -25,10 +25,14 @@ import tempfile
 import threading
 import unicodedata
 import uuid
+from customer_deferral import GEOGRAPHIC_CAPABILITY, geographic_enabled
+from service_time import SERVICE_FORMULA_CAPABILITY
 from collections import Counter, deque
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
+from pyvrp_next_version import PYVRP_NEXT_VERSION
+from pyvrp_backends import STABLE, ALPHA, backend_for
 
 
 PROTOCOL_VERSION = 1
@@ -317,6 +321,25 @@ def _dist_worker_candidates() -> list[Path]:
 
 def _resolve_worker_command(config: Any) -> list[str]:
     """Resolve the worker without ever falling back to the stable interpreter."""
+    if backend_for(config) == ALPHA:
+        explicit = _normalise_path(getattr(config, ALPHA.path_setting, ""))
+        if explicit is not None:
+            return _command_for_explicit_worker(explicit)
+        if not getattr(sys, "frozen", False):
+            python = PROJECT_DIR / ".venv-pyvrp-one" / "Scripts" / "python.exe"
+            script = PROJECT_DIR / ALPHA.script
+            if python.is_file() and script.is_file():
+                return [str(python), str(script)]
+        root = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                else PROJECT_DIR.parent / "dist")
+        for candidate in (root / ALPHA.directory / ALPHA.executable,
+                          root / ALPHA.directory / Path(ALPHA.executable).stem / ALPHA.executable):
+            if candidate.is_file():
+                return [str(candidate)]
+        raise PyVRPNextRuntimeError(
+            "PyVRP 1.x — тестова не е инсталирана. Изпълнете setup_pyvrp_one.py "
+            "и build_pyvrp_one_worker.py. Друг решител няма да бъде използван автоматично."
+        )
     explicit = _normalise_path(getattr(config, "pyvrp_next_worker_path", ""))
     if explicit is not None:
         return _command_for_explicit_worker(explicit)
@@ -337,7 +360,7 @@ def _resolve_worker_command(config: Any) -> list[str]:
     raise PyVRPNextRuntimeError(
         "Experimental PyVRP 0.14 worker is not installed. Checked: "
         + "; ".join(checked)
-        + ". Run setup_pyvrp_next.py with a compatible 0.14 wheel, then "
+        + ". Run setup_pyvrp_next.py to install stable 0.14.0, then "
           "build_pyvrp_next_worker.py, or configure pyvrp_next_worker_path."
     )
 
@@ -522,7 +545,7 @@ def _parse_self_check(stdout: str) -> Dict[str, Any]:
     )
 
 
-def _validate_worker_metadata(metadata: Any, *, context: str) -> str:
+def _validate_worker_metadata(metadata: Any, *, context: str, backend=STABLE) -> str:
     if not isinstance(metadata, dict):
         raise PyVRPNextRuntimeError(f"Invalid {context} metadata from experimental worker")
     if metadata.get("protocol_version") != PROTOCOL_VERSION:
@@ -530,7 +553,7 @@ def _validate_worker_metadata(metadata: Any, *, context: str) -> str:
             f"Experimental worker protocol mismatch during {context}: "
             f"expected {PROTOCOL_VERSION}, got {metadata.get('protocol_version')!r}"
         )
-    if metadata.get("solver_backend") != WORKER_PROTOCOL_BACKEND:
+    if metadata.get("solver_backend") != backend.protocol:
         raise PyVRPNextRuntimeError(
             f"Unexpected experimental worker backend during {context}: "
             f"{metadata.get('solver_backend')!r}"
@@ -552,11 +575,14 @@ def _validate_worker_metadata(metadata: Any, *, context: str) -> str:
         )
 
     version = str(metadata.get("solver_version") or "").strip()
-    if not version.startswith(REQUIRED_PYVRP_VERSION_PREFIX):
+    if version != backend.version:
         raise PyVRPNextRuntimeError(
-            "Experimental worker must use PyVRP 0.14.*, "
-            f"but reported {version or 'no version'} during {context}"
+            f"Worker must use pinned PyVRP {backend.version}, "
+            f"but reported {version or 'no version'} during {context}. "
+            "Run setup_pyvrp_next.py and rebuild the worker."
         )
+    if backend.source_commit and metadata.get("source_commit") != backend.source_commit:
+        raise PyVRPNextRuntimeError("PyVRP 1.x source commit mismatch")
     return version
 
 
@@ -622,15 +648,16 @@ def _annotate_solution(
     version: str,
     fallback_used: bool,
     fallback_reason: str = "",
+    backend=STABLE,
 ) -> Any:
     if solution is None:
         return None
 
     existing_used = str(getattr(solution, "solver_used", "") or "").strip()
-    if fallback_used and existing_used == PUBLIC_SOLVER_BACKEND:
+    if fallback_used and existing_used == backend.public:
         existing_used = "pyvrp"
     actual_backend = existing_used or (
-        "pyvrp" if fallback_used else PUBLIC_SOLVER_BACKEND
+        "pyvrp" if fallback_used else backend.public
     )
     existing_fallback = bool(getattr(solution, "solver_fallback_used", False))
     existing_reason = str(getattr(solution, "solver_fallback_reason", "") or "")
@@ -638,7 +665,9 @@ def _annotate_solution(
     # Preserve an exact OR-Tools fallback performed inside the adapter.  The
     # sidecar's PyVRP version is still useful as runtime provenance, but it is
     # not reported as the version of an OR-Tools-produced solution.
-    setattr(solution, "solver_requested", PUBLIC_SOLVER_BACKEND)
+    setattr(solution, "solver_requested", backend.public)
+    if backend.source_commit:
+        setattr(solution, "solver_source_commit", backend.source_commit)
     setattr(solution, "solver_used", actual_backend)
     setattr(solution, "solver_backend", actual_backend)
     setattr(solution, "solver_actual_backend", actual_backend)
@@ -699,6 +728,7 @@ def _solve_experimental(
     location_config: Any,
     vehicle_configs: Any,
 ) -> Any:
+    backend = backend_for(config)
     command = _resolve_worker_command(config)
     timeout = _worker_timeout_seconds(config)
     configured_timeout = float(
@@ -715,9 +745,15 @@ def _solve_experimental(
     request = {
         "protocol_version": PROTOCOL_VERSION,
         "kind": "solve_request",
-        "solver_backend": WORKER_PROTOCOL_BACKEND,
-        "required_version_prefix": REQUIRED_PYVRP_VERSION_PREFIX,
-        "required_capabilities": sorted(REQUIRED_WORKER_CAPABILITIES),
+        "solver_backend": backend.protocol,
+        "required_version_prefix": backend.prefix,
+        "required_version": backend.version,
+        "source_commit": backend.source_commit,
+        "required_capabilities": sorted(REQUIRED_WORKER_CAPABILITIES | (
+            {GEOGRAPHIC_CAPABILITY} if geographic_enabled(config) else set()
+        ) | (
+            {SERVICE_FORMULA_CAPABILITY} if any(getattr(v, "service_time_mode", "fixed") == "formula" for v in (vehicle_configs or [])) else set()
+        )),
         "payload": {
             "allocation": allocation,
             "depot_location": depot_location,
@@ -771,7 +807,11 @@ def _solve_experimental(
         # A separate pre-flight process would double every worker startup and,
         # with parallel one-file builds, could spend over a minute only
         # extracting files before the actual solve even begins.
-        result_version = _validate_worker_metadata(envelope, context="solve result")
+        result_version = _validate_worker_metadata(envelope, context="solve result", backend=backend)
+        if SERVICE_FORMULA_CAPABILITY in request["required_capabilities"] and envelope.get("capabilities", {}).get(SERVICE_FORMULA_CAPABILITY) is not True:
+            raise PyVRPNextRuntimeError("PyVRP worker не поддържа Формула за обслужване. Обнови и решителя с новия build.")
+        if geographic_enabled(config) and envelope.get("capabilities", {}).get(GEOGRAPHIC_CAPABILITY) is not True:
+            raise PyVRPNextRuntimeError("Worker lacks geographic_deferral_v1; rebuild the 0.14 worker.")
         if envelope.get("ok") is not True:
             raise PyVRPNextRuntimeError(
                 "Experimental PyVRP worker rejected the solve: "
@@ -790,6 +830,7 @@ def _solve_experimental(
             envelope["solution"],
             version=result_version,
             fallback_used=False,
+            backend=backend,
         )
 
 
@@ -817,7 +858,7 @@ def solve_cvrp_pyvrp_next(
             vehicle_configs,
         )
     except PyVRPNextRuntimeError as exc:
-        if not bool(getattr(config, "pyvrp_next_fallback_to_stable", False)):
+        if backend_for(config) == ALPHA or geographic_enabled(config) or not bool(getattr(config, "pyvrp_next_fallback_to_stable", False)):
             raise
         return _solve_with_stable_fallback(
             allocation,

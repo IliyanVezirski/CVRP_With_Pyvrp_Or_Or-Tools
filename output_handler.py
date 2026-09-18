@@ -10,10 +10,14 @@ import requests
 import json
 import html
 import math
+from display_units import total_volume_unit_label, customer_volume_unit_label
+from map_display_settings import mandatory_customer_comment, driver_total_volume_label, driver_customer_volume_label
+from driver_map_panel import MobileDriverPanel, driver_panel_css, driver_panel_js, customer_panel_visibility_js
 import re
 from typing import List, Dict, Tuple, Optional
 import os
 import logging
+from service_time import customer_service_seconds
 from datetime import datetime
 from urllib.parse import urlencode
 from config import (
@@ -32,6 +36,7 @@ from input_handler import (
     customer_time_windows_minutes,
     format_time_windows_minutes,
     time_windows_to_seconds,
+    is_mandatory_customer,
 )
 from osrm_client import get_distance_matrix_from_central_cache
 from vehicle_numbering import (
@@ -281,6 +286,20 @@ def _vehicle_config_for_route(route: Optional[Route]):
     return None
 
 
+def _route_capacity_for_display(route: Route) -> Optional[float]:
+    """Resolve a physical vehicle's capacity for maps and Excel, not optimisation."""
+    try:
+        capacity = float(getattr(_vehicle_config_for_route(route), "capacity", None))
+    except (TypeError, ValueError):
+        return None
+    return capacity if math.isfinite(capacity) and capacity > 0 else None
+
+
+def _route_load_text(route: Route, output_config) -> str:
+    volume = float(getattr(route, "total_volume", 0) or 0)
+    return f"{volume:g} {total_volume_unit_label(output_config)}"
+
+
 def _route_planned_time_minutes(route: Route, attribute: str) -> Optional[int]:
     """Normalise solver-provided planned times (minutes or HH:MM) for reports."""
     minute_attribute = attribute if attribute.endswith("_minutes") else f"{attribute}_minutes"
@@ -486,6 +505,21 @@ def _has_multiple_courses(routes: Optional[List[Route]]) -> bool:
     return bool(routes) and count_physical_vehicles(routes) < len(routes)
 
 
+def _report_customer_service_minutes(customer: Customer, default_minutes: float, vehicle_config=None) -> float:
+    """Respect HTTP service overrides (including zero) in fallback reports."""
+    if vehicle_config is not None:
+        return customer_service_seconds(customer, vehicle_config) / 60
+    override = getattr(customer, "service_time_minutes", None)
+    if override is not None:
+        try:
+            value = float(override)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return float(default_minutes or 0)
+
+
 def _total_elapsed_route_minutes(routes: Optional[List[Route]]) -> float:
     """Sum physical-vehicle work spans, including gaps used for reloads.
 
@@ -565,6 +599,7 @@ class SingleRouteCustomerPanel(MacroElement):
         """
         {% macro script(this, kwargs) %}
         (function() {
+            {{ this.visibility_js|safe }}
             const map = {{ this._parent.get_name() }};
             const panelHtml = {{ this.panel_html|safe }};
             const clients = {{ this.clients|safe }};
@@ -581,22 +616,14 @@ class SingleRouteCustomerPanel(MacroElement):
             panel.onAdd = function() {
                 const container = L.DomUtil.create("div", "route-client-control");
                 container.innerHTML = `
-                    <button type="button" class="route-client-toggle">Клиенти</button>
-                    <div class="route-client-panel route-client-panel-hidden">${panelHtml}</div>
+                    <div class="route-client-panel">${panelHtml}</div>
                 `;
                 L.DomEvent.disableClickPropagation(container);
                 L.DomEvent.disableScrollPropagation(container);
                 return container;
             };
             panel.addTo(map);
-
-            function setPanelOpen(isOpen) {
-                const panelEl = document.querySelector(".route-client-panel");
-                const buttonEl = document.querySelector(".route-client-toggle");
-                if (!panelEl || !buttonEl) return;
-                panelEl.classList.toggle("route-client-panel-hidden", !isOpen);
-                buttonEl.classList.toggle("route-client-toggle-hidden", isOpen);
-            }
+            initialiseCustomerPanel(document.querySelector('.route-client-control'));
 
             function openClient(index) {
                 const item = clients[index];
@@ -608,20 +635,6 @@ class SingleRouteCustomerPanel(MacroElement):
             }
 
             setTimeout(function() {
-                const toggle = document.querySelector(".route-client-toggle");
-                const closeButton = document.querySelector(".route-client-close");
-                if (toggle) {
-                    toggle.addEventListener("click", function() {
-                        setPanelOpen(true);
-                    });
-                }
-                if (closeButton) {
-                    closeButton.addEventListener("click", function(event) {
-                        event.preventDefault();
-                        setPanelOpen(false);
-                    });
-                }
-
                 document.querySelectorAll(".route-client-card").forEach(function(row) {
                     row.addEventListener("click", function(event) {
                         if (event.target.closest("a")) return;
@@ -643,9 +656,173 @@ class SingleRouteCustomerPanel(MacroElement):
     def __init__(self, panel_html: str, clients: List[Dict[str, object]], css: str):
         super().__init__()
         self._name = "SingleRouteCustomerPanel"
+        self.visibility_js = customer_panel_visibility_js()
         self.panel_html = json.dumps(panel_html, ensure_ascii=False)
         self.clients = json.dumps(clients, ensure_ascii=False)
         self.css = json.dumps(css, ensure_ascii=False)
+
+
+def _compact_map_controls_css() -> str:
+    """Shared Leaflet/Google controls; leaves map tiles and attribution intact."""
+    return """
+      .route-client-panel[hidden], .multi-course-panel[hidden], #route-filter .client-panel[hidden], .driver-panel-toggle[hidden] {display:none !important;}
+      .driver-panel-toggle {border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#172b4d; padding:10px 14px; min-height:44px; font:600 14px Arial,sans-serif; cursor:pointer; box-shadow:0 2px 10px #172b4d22;}
+      .driver-panel-close {border:0; border-radius:6px; background:#f1f5f9; color:#172b4d; min-width:44px; min-height:44px; font-size:22px; cursor:pointer; flex-shrink:0;}
+      .driver-panel-toggle:focus-visible, .driver-panel-close:focus-visible {outline:2px solid #2563eb; outline-offset:2px;}
+      .route-client-panel, .multi-course-panel, #route-filter .client-panel {
+        box-sizing:border-box; height:85vh !important; height:85dvh !important;
+        max-height:85vh !important; max-height:85dvh !important;
+        overflow:auto; overscroll-behavior:contain;
+      }
+      .coordinate-search-control, #coordinate-search, #route-filter,
+      .leaflet-control-layers, .unserved-customer-control {font-family: Arial, sans-serif; color:#172b4d;}
+      .leaflet-control-layers, #route-filter {
+        border:1px solid #dce3ed; border-radius:12px;
+        background:#fff; box-shadow:0 4px 18px #12264718;
+      }
+      .leaflet-control-layers-toggle {
+        background-image:none; width:116px; height:38px; text-decoration:none;
+      }
+      .leaflet-control-layers-toggle:before {
+        content:'☷  Маршрути'; display:block; text-align:center;
+        line-height:38px; color:#263e63; font-size:13px; font-weight:700;
+      }
+      .leaflet-control-layers-expanded {padding:8px; min-width:210px; width:max-content; max-width:calc(100vw - 48px);}
+      .leaflet-control-layers-list, .leaflet-control-layers-scrollbar {
+        height:auto !important; max-height:none !important; overflow:visible !important; padding-right:0;
+      }
+      .leaflet-control-layers label {white-space:normal; overflow-wrap:anywhere;}
+      .leaflet-control-layers label, #route-filter .route-row {
+        font-size:12px; line-height:1.35; margin:0; padding:5px 6px;
+        border-radius:7px; cursor:pointer; border-bottom:1px solid #f0f3f8;
+      }
+      .leaflet-control-layers label:hover, #route-filter .route-row:hover {background:#f0f5ff;}
+      .leaflet-control-layers input, #route-filter input {accent-color:#2563eb; cursor:pointer;}
+      .leaflet-control-layers-selector {margin-top:0; top:1px;}
+      .route-load {display:inline; margin-left:7px; font-size:11px; font-weight:500; color:#54657e; white-space:nowrap;}
+      .route-load::before {content:'·'; margin-right:7px; color:#a3aec0;}
+      .route-filter-copy {min-width:0; overflow-wrap:anywhere;}
+      #route-filter {padding:8px; min-width:180px; max-width:310px;}
+      #route-filter.overview-filter-control {width:max-content; max-width:calc(100vw - 48px);}
+      #route-filter .route-row {gap:8px; align-items:flex-start;}
+      #route-filter .swatch {width:9px; height:9px; border-radius:50%; flex-shrink:0; margin-top:3px;}
+      .overview-filter summary {cursor:pointer; font-size:13px; font-weight:700; padding:3px 4px;}
+      .filter-count {background:#eef3fb; color:#526987; border-radius:12px; padding:2px 7px; margin-left:6px; font-size:11px;}
+      .overview-filter-list {margin-top:7px; max-height:none; overflow:visible;}
+      #route-filter.overview-filter-control {max-height:none; overflow:visible;}
+      .mandatory-customer-note {display:block; color:#b91c1c; font-weight:700;
+        font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; margin-top:4px;}
+      .route-client-card-mandatory, .multi-course-client-card-mandatory, #route-filter .course-client-row-mandatory {
+        background:#ffe4e4; border:1px solid #dc2626; border-radius:6px; margin-top:5px;
+      }
+      .route-client-card-mandatory:hover, .multi-course-client-card-mandatory:hover,
+      #route-filter .course-client-row-mandatory:hover {background:#ffdada;}
+      .google-stop-list {list-style:none; padding:0; margin:4px 0 0;}
+      .google-stop-list li {display:block; margin:0 0 3px; overflow-wrap:anywhere;}
+      .driver-google-routes {margin:8px 0; padding:8px; border:1px solid #dce5ef; border-radius:10px; background:#f8fafd;}
+      .driver-google-routes > summary {cursor:pointer; min-height:36px; display:flex; align-items:center; font-weight:700; list-style:none;}
+      .driver-google-routes > summary::-webkit-details-marker {display:none;}
+      .driver-google-routes > summary::before {content:'▸'; margin-right:7px;}
+      .driver-google-routes[open] > summary::before {content:'▾';}
+      .driver-google-routes > summary:focus-visible {outline:2px solid #2563eb; outline-offset:2px;}
+      .leaflet-control-zoom a, .leaflet-control-zoom a:hover, .leaflet-control-zoom a:focus,
+      .leaflet-control-zoom a span {text-decoration:none !important; color:#172b4d !important;}
+      .leaflet-control-zoom a:hover {background:#eef4fb;}
+      .leaflet-control-zoom a:focus-visible {outline:2px solid #2563eb; outline-offset:2px;}
+      .coordinate-search-toggle {
+        width:auto; min-width:132px; height:38px; padding:0 13px; border:1px solid #dce3ed;
+        border-radius:12px; background:#fff; color:#263e63; font-size:13px;
+        font-weight:700; box-shadow:0 4px 18px #12264718;
+      }
+      .coordinate-search-toggle:hover {background:#eff5ff; border-color:#a9c3f1;}
+      .coordinate-search-panel {
+        box-sizing:border-box; width:320px; max-width:calc(100vw - 28px);
+        border:1px solid #dce3ed; border-radius:14px; padding:13px;
+        background:#fff; box-shadow:0 8px 28px #12264724;
+      }
+      .coordinate-search-header {margin-bottom:5px;}
+      .coordinate-search-header b {font-size:14px; color:#172b4d;}
+      .coordinate-search-close {border-radius:8px; width:26px; height:26px; background:#f1f4f9;}
+      .coordinate-search-hint {font-size:11px; line-height:1.45; color:#61738d; margin:0 0 9px;}
+      .coordinate-search-input {
+        box-sizing:border-box; min-height:100px; max-height:30vh; padding:10px;
+        border:1px solid #dce3ed; border-radius:9px; background:#f8fafd;
+        font:12px/1.5 Arial,sans-serif; color:#172b4d;
+      }
+      .coordinate-search-input:focus {background:#fff; outline:2px solid #d8e7ff; border-color:#82aef0;}
+      .coordinate-search-actions {gap:7px; margin-top:9px;}
+      .coordinate-search-actions button {border-radius:8px; min-height:32px; padding:7px 11px;}
+      .coordinate-search-show {background:#2563eb; flex:1;}
+      .coordinate-search-show:hover {background:#1d4ed8;}
+      .coordinate-search-clear {background:#eff3f8; color:#526987;}
+      .coordinate-search-status {font-size:11px; line-height:1.4; margin-top:7px;}
+      .coordinate-search-toggle:focus-visible, .overview-filter summary:focus-visible,
+      .coordinate-search-actions button:focus-visible {outline:2px solid #2563eb; outline-offset:2px;}
+      .unserved-customer-control {background:#fff; padding:6px; border:1px solid #dce3ed;
+        border-radius:12px; box-shadow:0 4px 18px #12264718; max-width:calc(100vw - 30px);}
+      .unserved-customer-control button {padding:7px 10px; border:0; border-radius:8px;
+        background:#eef4ff; color:#245bb6; font-size:12px; font-weight:700; cursor:pointer;}
+      .unserved-customer-control button:disabled {opacity:.65; cursor:default;}
+      @media(max-width:600px) {
+        #route-filter {max-width:230px; min-width:0;}
+        .leaflet-control-layers-expanded {min-width:170px; max-width:calc(100vw - 48px);}
+      }
+    """
+
+
+class UnservedCustomerControl(MacroElement):
+    """Overview-only toggle: unserved markers are never visible on initial load."""
+
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        (function() {
+            const map = {{ this._parent.get_name() }};
+            const layer = {{ this.layer_name }};
+            const total = {{ this.total }};
+            const missing = {{ this.missing }};
+            const control = L.control({position: "bottomright"});
+            control.onAdd = function() {
+                const box = L.DomUtil.create("div", "unserved-customer-control");
+                const button = document.createElement("button");
+                button.type = "button";
+                button.textContent = "Покажи необслужените (" + total + ")";
+                button.setAttribute("aria-pressed", "false");
+                button.disabled = total === missing;
+                box.appendChild(button);
+                if (missing) {
+                    const note = document.createElement("div");
+                    note.textContent = "Без валиден GPS: " + missing + " — не могат да се покажат";
+                    note.style.cssText = "margin-top:5px;color:#92400e";
+                    box.appendChild(note);
+                }
+                L.DomEvent.disableClickPropagation(box);
+                L.DomEvent.disableScrollPropagation(box);
+                button.addEventListener("click", function() {
+                    const visible = !map.hasLayer(layer);
+                    if (visible) {
+                        layer.addTo(map);
+                        const bounds = layer.getBounds();
+                        if (bounds.isValid()) map.fitBounds(bounds, {padding: [40, 40], maxZoom: 15});
+                    } else {
+                        map.removeLayer(layer);
+                    }
+                    button.setAttribute("aria-pressed", String(visible));
+                    button.textContent = (visible ? "Скрий необслужените (" : "Покажи необслужените (") + total + ")";
+                    button.style.background = visible ? "#dbeafe" : "white";
+                });
+                return box;
+            };
+            control.addTo(map);
+        })();
+        {% endmacro %}
+    """)
+
+    def __init__(self, layer, total, missing):
+        super().__init__()
+        self._name = "UnservedCustomerControl"
+        self.layer_name = layer.get_name()
+        self.total = total
+        self.missing = missing
 
 
 class MultiCourseCustomerPanel(MacroElement):
@@ -655,6 +832,7 @@ class MultiCourseCustomerPanel(MacroElement):
         """
         {% macro script(this, kwargs) %}
         (function() {
+            {{ this.visibility_js|safe }}
             const map = {{ this._parent.get_name() }};
             const courses = {{ this.courses|safe }};
             const css = {{ this.css|safe }};
@@ -680,11 +858,9 @@ class MultiCourseCustomerPanel(MacroElement):
                     `;
                 }).join("");
                 container.innerHTML = `
-                    <button type="button" class="multi-course-toggle multi-course-hidden">Курсове / Клиенти</button>
                     <div class="multi-course-panel">
                         <div class="multi-course-header">
                             <b>Курсове и клиенти</b>
-                            <button type="button" class="multi-course-close" title="Затвори">×</button>
                         </div>
                         <div class="multi-course-selector">${selectorRows}</div>
                         <div class="multi-course-detail"></div>
@@ -695,19 +871,12 @@ class MultiCourseCustomerPanel(MacroElement):
                 return container;
             };
             control.addTo(map);
+            initialiseCustomerPanel(container);
 
             const detail = container.querySelector(".multi-course-detail");
-            const panel = container.querySelector(".multi-course-panel");
-            const toggle = container.querySelector(".multi-course-toggle");
-            const close = container.querySelector(".multi-course-close");
 
             function courseLayer(course) {
                 return window[course.layerName];
-            }
-
-            function setOpen(isOpen) {
-                panel.classList.toggle("multi-course-hidden", !isOpen);
-                toggle.classList.toggle("multi-course-hidden", isOpen);
             }
 
             function openClient(course, index) {
@@ -759,11 +928,6 @@ class MultiCourseCustomerPanel(MacroElement):
                     activateCourse(Number(radio.value), true);
                 });
             });
-            toggle.addEventListener("click", function() { setOpen(true); });
-            close.addEventListener("click", function(event) {
-                event.preventDefault();
-                setOpen(false);
-            });
             if (courses.length) activateCourse(0, true);
         })();
         {% endmacro %}
@@ -773,6 +937,7 @@ class MultiCourseCustomerPanel(MacroElement):
     def __init__(self, courses: List[Dict[str, object]], css: str):
         super().__init__()
         self._name = "MultiCourseCustomerPanel"
+        self.visibility_js = customer_panel_visibility_js()
         self.courses = json.dumps(courses, ensure_ascii=False)
         self.css = json.dumps(css, ensure_ascii=False)
 
@@ -936,6 +1101,7 @@ class CoordinatePinSearch(MacroElement):
         (function() {
             const map = {{ this._parent.get_name() }};
             const css = {{ this.css|safe }};
+            const unitLabel = {{ this.unit_label|safe }};
 
             if (!document.getElementById("coordinate-pin-search-style")) {
                 const style = document.createElement("style");
@@ -950,19 +1116,20 @@ class CoordinatePinSearch(MacroElement):
             control.onAdd = function() {
                 const container = L.DomUtil.create("div", "coordinate-search-control");
                 container.innerHTML = `
-                    <button type="button" class="coordinate-search-toggle" title="Покажи GPS пинове">GPS</button>
+                    <button type="button" class="coordinate-search-toggle" title="Добави временни клиенти по GPS">＋ Клиенти по GPS</button>
                     <div class="coordinate-search-panel coordinate-search-hidden">
                         <div class="coordinate-search-header">
-                            <b>GPS пинове</b>
+                            <b>Клиенти на картата</b>
                             <button type="button" class="coordinate-search-close" title="Затвори">×</button>
                         </div>
-                        <textarea class="coordinate-search-input" spellcheck="false"
-                            placeholder="42.6629,23.37682&#10;КУИК 2 ООД&#9;42.70939227145172,23.313702419400215&#9;8"></textarea>
+                        <p class="coordinate-search-hint">Постави редове от Excel: име, GPS и количество. Добавят се само временни пинове, без промяна на маршрутите.</p>
+                        <textarea class="coordinate-search-input" spellcheck="false" aria-label="Клиенти с GPS координати"
+                            placeholder="Клиент 1&#9;42.7094,23.3137&#9;8&#10;Клиент 2&#9;42.6629,23.3768&#9;12"></textarea>
                         <div class="coordinate-search-actions">
                             <button type="button" class="coordinate-search-show">Покажи</button>
                             <button type="button" class="coordinate-search-clear">Изчисти</button>
                         </div>
-                        <div class="coordinate-search-status"></div>
+                        <div class="coordinate-search-status" role="status" aria-live="polite"></div>
                     </div>
                 `;
                 L.DomEvent.disableClickPropagation(container);
@@ -1065,7 +1232,7 @@ class CoordinatePinSearch(MacroElement):
                     let popupHtml = "<b>" + popupTitle + "</b><br>" +
                         "Координати: " + escapeHtml(point.lat.toFixed(6) + ", " + point.lon.toFixed(6));
                     if (point.stacks) {
-                        popupHtml += "<br>Стекове: " + escapeHtml(point.stacks);
+                        popupHtml += "<br>" + escapeHtml(unitLabel) + ": " + escapeHtml(point.stacks);
                     }
 
                     const marker = L.marker([point.lat, point.lon], {
@@ -1129,10 +1296,11 @@ class CoordinatePinSearch(MacroElement):
         """
     )
 
-    def __init__(self, css: str):
+    def __init__(self, css: str, unit_label: str = "стекове"):
         super().__init__()
         self._name = "CoordinatePinSearch"
         self.css = json.dumps(css, ensure_ascii=False)
+        self.unit_label = json.dumps(unit_label, ensure_ascii=False).replace("</", "<\\/")
 
 
 class InteractiveMapGenerator:
@@ -1222,13 +1390,15 @@ class InteractiveMapGenerator:
                 overlay=False,
                 control=True,
             ).add_to(route_map)
-            return route_map
-        return folium.Map(
-            location=location,
-            zoom_start=self.config.map_zoom_level,
-            tiles=tiles,
-            control_scale=True,
-        )
+        else:
+            route_map = folium.Map(
+                location=location,
+                zoom_start=self.config.map_zoom_level,
+                tiles=tiles,
+                control_scale=True,
+            )
+        route_map.get_root().header.add_child(folium.Element('<style>' + _compact_map_controls_css() + '</style>'))
+        return route_map
 
     def _segment_distance_m(self, start: Tuple[float, float], end: Tuple[float, float]) -> float:
         lat1, lon1 = math.radians(start[0]), math.radians(start[1])
@@ -1504,7 +1674,7 @@ class InteractiveMapGenerator:
 
         start_time_minutes = _route_start_time_minutes(route)
         vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
-        service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
+        default_service_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
         cumulative_distance = 0.0
@@ -1513,6 +1683,7 @@ class InteractiveMapGenerator:
         previous_stop_name = "Депо"
 
         for stop_index, customer in enumerate(route.customers, start=1):
+            service_time_minutes = _report_customer_service_minutes(customer, default_service_minutes, vehicle_config)
             distance_from_previous = (
                 self._calculate_distance_between_points(previous_customer_coords, customer.coordinates)
                 if customer.coordinates
@@ -1526,7 +1697,10 @@ class InteractiveMapGenerator:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            windows = (
+                time_windows_to_seconds(customer_time_windows_minutes(customer))
+                if self._customer_time_windows_enabled() else []
+            )
             _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
             wait_minutes = wait_seconds / 60
             if time_window_status and len(windows) > 1 and window_index >= 0:
@@ -1821,7 +1995,7 @@ class InteractiveMapGenerator:
                     f"<b>Клиент:</b> {html.escape(str(customer.name))}",
                     f"<b>ID:</b> {html.escape(str(customer.id))}",
                     f"<b>Ред в маршрута:</b> #{client_number}",
-                    f"<b>Обем:</b> {customer.volume:.2f} ст.",
+                    f"<b>Обем:</b> {customer.volume:.2f} {html.escape(customer_volume_unit_label(self.config, short=True))}",
                     f"<b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}",
                     *self._schedule_popup_lines(
                         schedule_entry,
@@ -1831,6 +2005,8 @@ class InteractiveMapGenerator:
                 ]
                 if show_bus_ids:
                     popup_lines.insert(0, f"<b>ID бус:</b> {html.escape(str(bus_number))}")
+                    if is_mandatory_customer(customer):
+                        popup_lines.insert(1, self._mandatory_customer_note_html())
                 popup_html = self._html_popup(
                     customer_popup_title,
                     popup_lines,
@@ -1854,6 +2030,7 @@ class InteractiveMapGenerator:
                     "quantity": _optional_finite_float(getattr(customer, "quantity", None)),
                     "turnover": _optional_finite_float(getattr(customer, "turnover", None)),
                     "hasTimeWindow": has_time_window,
+                    "mandatory": is_mandatory_customer(customer),
                     "hasComment": has_comment,
                 })
 
@@ -1862,7 +2039,7 @@ class InteractiveMapGenerator:
                 f"<b>Клиенти:</b> {len(route.customers)}",
                 f"<b>Разстояние:</b> {route.total_distance_km:.1f} км",
                 f"<b>Време:</b> {route.total_time_minutes:.0f} мин",
-                f"<b>Обем:</b> {route.total_volume:.1f} ст.",
+                f"<b>Обем:</b> {route.total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}",
                 f"<b>Геометрия:</b> {len(geometry)} точки",
             ]
             if course_suffix:
@@ -1917,6 +2094,7 @@ class InteractiveMapGenerator:
                 "distanceKm": route.total_distance_km,
                 "timeMin": route.total_time_minutes,
                 "volume": route.total_volume,
+                "loadText": _route_load_text(route, self.config),
                 "googleSegments": self._build_google_route_segments(route),
                 "googleMissingCoords": len(route.customers) - len(markers),
             }
@@ -1968,6 +2146,7 @@ class InteractiveMapGenerator:
         all_routes: Optional[List[Route]] = None,
         route_numbers: Optional[List[int]] = None,
         course_filter: bool = False,
+        unserved_data: Optional[Dict] = None,
     ) -> GoogleMapDocument:
         api_key = self._get_google_maps_api_key()
         if not api_key:
@@ -1983,6 +2162,13 @@ class InteractiveMapGenerator:
         route_start = single_route_number or 1
         map_data = {
             "title": title,
+            "volumeUnit": customer_volume_unit_label(self.config),
+            "volumeUnitShort": total_volume_unit_label(self.config, short=True),
+            "driverTotalUnit": driver_total_volume_label(self.config),
+            "driverCustomerUnit": driver_customer_volume_label(self.config),
+            "driverCustomerUnitShort": driver_customer_volume_label(self.config, short=True),
+            "mandatoryCustomerComment": mandatory_customer_comment(self.config),
+            "mobileDriverPanel": bool(getattr(self.config, "mobile_driver_panel", False)),
             "center": self._json_coords(center),
             "zoom": self.config.map_zoom_level,
             "depots": [
@@ -2007,6 +2193,7 @@ class InteractiveMapGenerator:
             ),
             "singleRouteNumber": single_route_number,
             "courseFilter": course_filter,
+            "unserved": unserved_data,
             "totals": {
                 "distanceKm": sum(route.total_distance_km for route in routes),
                 "timeMin": _total_elapsed_route_minutes(routes),
@@ -2020,7 +2207,7 @@ class InteractiveMapGenerator:
         if _visible_center_zones(cfg.locations):
             map_data["centerZone"] = self._center_zone_map_data(cfg.locations)
 
-        data_json = json.dumps(map_data, ensure_ascii=False)
+        data_json = json.dumps(map_data, ensure_ascii=False).replace("</", "<\\/")
         key_attr = html.escape(api_key, quote=True)
         html_content = f"""<!doctype html>
 <html>
@@ -2046,19 +2233,9 @@ class InteractiveMapGenerator:
     #coordinate-search {{
       position: absolute; bottom: 18px; left: 10px; z-index: 5; font-size: 13px;
     }}
-    #route-filter.collapsed {{
-      background: transparent; border: 0; box-shadow: none; padding: 0; overflow: visible;
-    }}
     #coordinate-search.collapsed {{
       background: transparent; border: 0; box-shadow: none; padding: 0; overflow: visible;
     }}
-    .client-toggle {{
-      border: 1px solid rgba(35,35,35,.35); border-radius: 6px; background: #fff;
-      box-shadow: 0 2px 10px rgba(0,0,0,.22); color: #222; cursor: pointer;
-      font-size: 13px; font-weight: 700; padding: 8px 11px;
-    }}
-    .client-toggle:hover {{ background: #f4f7fb; }}
-    .client-panel.hidden, .client-toggle.hidden {{ display: none; }}
     .client-panel {{
       width: 340px; max-height: calc(100vh - 90px); overflow: auto;
       background: #fff; border: 1px solid rgba(35,35,35,.35); border-radius: 6px;
@@ -2066,11 +2243,6 @@ class InteractiveMapGenerator:
     }}
     .client-panel-header {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
     .client-panel-header b {{ font-size: 15px; }}
-    .client-close {{
-      width: 26px; height: 26px; border: 0; border-radius: 4px; background: #f1f3f4;
-      color: #333; cursor: pointer; font-size: 18px; line-height: 1; font-weight: 700;
-    }}
-    .client-close:hover {{ background: #e4e7eb; }}
     .client-route-stats {{
       display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
       margin: 8px 0 10px; padding: 8px; background: #f8fafc;
@@ -2112,7 +2284,8 @@ class InteractiveMapGenerator:
     }}
     .route-row {{ display: flex; align-items: center; gap: 6px; margin: 4px 0; }}
     .swatch {{ width: 14px; height: 14px; display: inline-block; border-radius: 2px; }}
-    #route-filter.course-filter-control {{ width: 390px; max-width: calc(100vw - 42px); }}
+    #route-filter.driver-customer-control {{ max-width:calc(100vw - 42px); max-height:none; overflow:visible; padding:0; border:0; background:transparent; box-shadow:none; }}
+    #route-filter .client-panel.course-filter-control {{ width: 390px; max-width: calc(100vw - 42px); }}
     .course-filter-title {{ font-size: 15px; font-weight: 700; margin-bottom: 7px; }}
     .course-selector {{ padding-bottom: 7px; border-bottom: 1px solid #e1e6ee; }}
     .course-selector-row {{ cursor: pointer; padding: 4px 2px; }}
@@ -2192,16 +2365,21 @@ class InteractiveMapGenerator:
       min-height: 16px; margin-top: 7px; font-size: 12px; color: #3c4043; line-height: 1.3;
     }}
     .coordinate-search-error {{ color: #b3261e; }}
+    {_compact_map_controls_css()}
+    {driver_panel_css() if getattr(self.config, "mobile_driver_panel", False) else ""}
   </style>
 </head>
 <body>
   <div id="map"></div>
   <div id="legend"></div>
   <div id="route-filter"></div>
-  <div id="coordinate-search"></div>
+  {'<div id="coordinate-search"></div>' if single_route_number is None and not course_filter else ''}
   <script>
     const MAP_DATA = {data_json};
     let infoWindow;
+
+    {driver_panel_js() if getattr(self.config, "mobile_driver_panel", False) else ""}
+    {customer_panel_visibility_js()}
 
     function initMap() {{
         const map = new google.maps.Map(document.getElementById("map"), {{
@@ -2342,9 +2520,9 @@ class InteractiveMapGenerator:
         }}
 
         const markerObjects = route.markers.map((point) => {{
-          const hasRouteAttention = Boolean((MAP_DATA.singleRouteNumber || MAP_DATA.courseFilter) && (point.hasTimeWindow || point.hasComment));
+          const hasRouteAttention = Boolean((MAP_DATA.singleRouteNumber || MAP_DATA.courseFilter) && (point.mandatory || point.hasTimeWindow || point.hasComment));
           const markerStrokeColor = hasRouteAttention
-            ? (point.hasTimeWindow ? "#dc2626" : "#f59e0b")
+            ? (point.mandatory || point.hasTimeWindow ? "#dc2626" : "#f59e0b")
             : "#ffffff";
           const marker = new google.maps.Marker({{
             position: point.position,
@@ -2379,9 +2557,57 @@ class InteractiveMapGenerator:
       }}
       renderLegend();
       renderFilter(routeObjects, map);
-      if (!MAP_DATA.singleRouteNumber) {{
+      if (MAP_DATA.mobileDriverPanel && (MAP_DATA.singleRouteNumber || MAP_DATA.courseFilter)) enableMobileDriverPanel();
+      if (MAP_DATA.unserved && MAP_DATA.unserved.total > 0 && !MAP_DATA.singleRouteNumber && !MAP_DATA.courseFilter) {{
+        renderUnservedControl(map);
+      }}
+      if (!MAP_DATA.singleRouteNumber && !MAP_DATA.courseFilter) {{
         renderCoordinateSearch(map);
       }}
+    }}
+
+    function renderUnservedControl(map) {{
+      const data = MAP_DATA.unserved;
+      if (!data || data.total <= 0) return;
+      const box = document.createElement("div");
+      box.className = "unserved-customer-control";
+      box.style.margin = "10px";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Покажи необслужените (" + data.total + ")";
+      button.setAttribute("aria-pressed", "false");
+      button.disabled = data.markers.length === 0;
+      box.appendChild(button);
+      if (data.missingCoordinates) {{
+        const note = document.createElement("div");
+        note.textContent = "Без валиден GPS: " + data.missingCoordinates + " — не могат да се покажат";
+        note.style.cssText = "margin-top:5px;color:#92400e";
+        box.appendChild(note);
+      }}
+      const markers = data.markers.map(point => {{
+        const marker = new google.maps.Marker({{
+          position: point.position, map: null, title: point.title,
+          icon: {{path: google.maps.SymbolPath.CIRCLE, scale: 10, fillColor: "#2563eb", fillOpacity: 1, strokeColor: "white", strokeWeight: 2}}
+        }});
+        marker.addListener("click", () => infoWindow.setContent(point.popup) || infoWindow.open(map, marker));
+        return marker;
+      }});
+      let visible = false;
+      button.addEventListener("click", () => {{
+        visible = !visible;
+        markers.forEach(marker => marker.setMap(visible ? map : null));
+        button.setAttribute("aria-pressed", String(visible));
+        button.textContent = (visible ? "Скрий необслужените (" : "Покажи необслужените (") + data.total + ")";
+        button.style.background = visible ? "#dbeafe" : "white";
+        if (visible) {{
+          const bounds = new google.maps.LatLngBounds();
+          data.markers.forEach(point => bounds.extend(point.position));
+          map.fitBounds(bounds, 40);
+        }} else {{
+          infoWindow.close();
+        }}
+      }});
+      map.controls[google.maps.ControlPosition.RIGHT_BOTTOM].push(box);
     }}
 
     function renderLegend() {{
@@ -2393,7 +2619,7 @@ class InteractiveMapGenerator:
         <div><b>Статистики:</b></div>
         <div>Общо разстояние: ${{totals.distanceKm.toFixed(1)}} км</div>
         <div>Общо време: ${{totals.timeMin.toFixed(0)}} мин</div>
-        <div>Общ обем: ${{totals.volume.toFixed(1)}} ст.</div>
+        <div>Общ обем: ${{totals.volume.toFixed(1)}} ${{escapeHtml(MAP_DATA.volumeUnitShort)}}</div>
         <div>Маршрути: ${{totals.routeCount}}</div>
         ${{totals.vehicleCount < totals.courseCount
           ? `<div>Физически бусове: ${{totals.vehicleCount}}</div><div>Курсове: ${{totals.courseCount}}</div>`
@@ -2411,18 +2637,18 @@ class InteractiveMapGenerator:
         renderCourseCustomerPanel(container, routeObjects, map);
         return;
       }}
-      container.innerHTML = MAP_DATA.courseFilter
-        ? "<b>Филтър на курсове</b>"
-        : "<b>Филтър на автобуси</b>";
+      container.classList.add('overview-filter-control');
+      container.innerHTML = `<details class="overview-filter"><summary>Маршрути <span class="filter-count">${{MAP_DATA.routes.length}}</span></summary><div class="overview-filter-list"></div></details>`;
+      const list = container.querySelector(".overview-filter-list");
       MAP_DATA.routes.forEach((route) => {{
         const row = document.createElement("label");
         row.className = "route-row";
         row.innerHTML = `
           <input type="checkbox" checked data-route="${{route.id}}">
           <span class="swatch" style="background:${{route.color}}"></span>
-          <span style="color:${{route.color}};font-weight:700">${{route.name}}</span>
+          <span class="route-filter-copy"><span style="color:${{route.color}};font-weight:700">${{escapeHtml(route.name)}}</span><span class="route-load">${{escapeHtml(route.loadText)}}</span></span>
         `;
-        container.appendChild(row);
+        list.appendChild(row);
       }});
       Object.values(routeObjects).forEach((objects) => {{
         const map = objects.line.getMap();
@@ -2440,13 +2666,18 @@ class InteractiveMapGenerator:
     }}
 
     function renderCourseCustomerPanel(container, routeObjects, map) {{
-      container.classList.add("course-filter-control");
+      container.classList.add("driver-customer-control");
       container.innerHTML = `
-        <div class="course-filter-title">Курсове и клиенти</div>
-        <div class="course-selector"></div>
-        <div class="course-client-detail"></div>
+        <div class="client-panel course-filter-control">
+          <div class="client-panel-header">
+            <b>Курсове и клиенти</b>
+          </div>
+          <div class="course-selector"></div>
+          <div class="course-client-detail"></div>
+        </div>
       `;
       const selector = container.querySelector(".course-selector");
+      initialiseCustomerPanel(container);
       const detail = container.querySelector(".course-client-detail");
 
       function setObjectsVisible(objects, visible) {{
@@ -2471,7 +2702,7 @@ class InteractiveMapGenerator:
           <div class="course-output-number">ID бус/курс: <b>${{escapeHtml(route.outputNumber)}}</b></div>
           <div class="client-route-stats">
             <div class="client-route-stat"><span>Общо:</span><b>${{route.customerCount}} клиента</b></div>
-            <div class="client-route-stat"><span>Стекове:</span><b>${{formatStackNumber(route.volume)}}</b></div>
+            <div class="client-route-stat"><span>${{escapeHtml(MAP_DATA.driverTotalUnit)}}:</span><b>${{formatStackNumber(route.volume)}}</b></div>
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
             ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
@@ -2485,6 +2716,9 @@ class InteractiveMapGenerator:
         route.markers.forEach((point, index) => {{
           const row = document.createElement("div");
           row.className = "route-row course-client-row" + (point.hasTimeWindow ? " course-client-row-window" : "");
+          row.dataset.driverVolume = formatStackNumber(point.volume) + ' ' + MAP_DATA.driverCustomerUnit;
+          row.dataset.driverArrival = point.arrivalTime || '';
+          if (point.mandatory) row.classList.add('course-client-row-mandatory');
           row.tabIndex = 0;
           const quantityLine = point.quantity !== null && point.quantity !== undefined && point.quantity !== ""
             ? `<span class="course-client-secondary">Количество: ${{Number(point.quantity).toFixed(2)}}</span>`
@@ -2508,8 +2742,9 @@ class InteractiveMapGenerator:
             <span class="swatch course-client-number" style="background:${{route.color}}">${{point.number}}</span>
             <span class="course-client-main">
               <span class="course-client-name">${{escapeHtml(point.customerName)}}</span>
-              <span class="course-client-secondary">ID: ${{escapeHtml(point.customerId)}} · ${{Number(point.volume).toFixed(2)}} ст.</span>
+              <span class="course-client-secondary">ID: ${{escapeHtml(point.customerId)}} · ${{Number(point.volume).toFixed(2)}} ${{escapeHtml(MAP_DATA.driverCustomerUnitShort)}}</span>
               ${{quantityLine}}${{turnoverLine}}${{arrivalLine}}${{departureLine}}${{windowLine}}${{commentLine}}
+              ${{point.mandatory ? '<span class="mandatory-customer-note">' + escapeHtml(MAP_DATA.mandatoryCustomerComment) + '</span>' : ''}}
             </span>
             <span class="client-actions">
               <a class="client-action client-nav" href="${{escapeHtml(point.navigationUrl)}}" target="_blank" rel="noopener">Навигация</a>
@@ -2576,19 +2811,20 @@ class InteractiveMapGenerator:
 
       container.classList.add("collapsed");
       container.innerHTML = `
-        <button type="button" class="coordinate-search-toggle" title="Покажи GPS пинове">GPS</button>
+        <button type="button" class="coordinate-search-toggle" title="Добави временни клиенти по GPS">＋ Клиенти по GPS</button>
         <div class="coordinate-search-panel coordinate-search-hidden">
           <div class="coordinate-search-header">
-            <b>GPS пинове</b>
+            <b>Клиенти на картата</b>
             <button type="button" class="coordinate-search-close" title="Затвори">×</button>
           </div>
-          <textarea class="coordinate-search-input" spellcheck="false"
-            placeholder="42.6629,23.37682&#10;КУИК 2 ООД&#9;42.70939227145172,23.313702419400215&#9;8"></textarea>
+          <p class="coordinate-search-hint">Постави редове от Excel: име, GPS и количество. Добавят се само временни пинове, без промяна на маршрутите.</p>
+          <textarea class="coordinate-search-input" spellcheck="false" aria-label="Клиенти с GPS координати"
+            placeholder="Клиент 1&#9;42.7094,23.3137&#9;8&#10;Клиент 2&#9;42.6629,23.3768&#9;12"></textarea>
           <div class="coordinate-search-actions">
             <button type="button" class="coordinate-search-show">Покажи</button>
             <button type="button" class="coordinate-search-clear">Изчисти</button>
           </div>
-          <div class="coordinate-search-status"></div>
+          <div class="coordinate-search-status" role="status" aria-live="polite"></div>
         </div>
       `;
 
@@ -2682,7 +2918,7 @@ class InteractiveMapGenerator:
             let popupHtml = "<b>" + escapeHtml(point.title || ("GPS пин " + (index + 1))) + "</b><br>" +
               "Координати: " + escapeHtml(point.lat.toFixed(6) + ", " + point.lng.toFixed(6));
             if (point.stacks) {{
-              popupHtml += "<br>Стекове: " + escapeHtml(point.stacks);
+              popupHtml += "<br>" + escapeHtml(MAP_DATA.volumeUnit) + ": " + escapeHtml(point.stacks);
             }}
             infoWindow.setContent(popupHtml);
             infoWindow.open(map, marker);
@@ -2756,9 +2992,6 @@ class InteractiveMapGenerator:
     function renderGoogleSegments(route) {{
       const segments = route.googleSegments || [];
       if (!segments.length) return "";
-      const splitNote = segments.length > 1
-        ? "Маршрутът е разделен на части, за да се спази лимитът на Google Maps за спирки."
-        : "Маршрутът е готов като един Google Maps линк.";
       const rows = segments.map((segment) => {{
         const rowClass = segment.isReturn ? "google-segment-row google-segment-return" : "google-segment-row";
         return `
@@ -2766,7 +2999,7 @@ class InteractiveMapGenerator:
             <div>
               <div class="google-segment-label">${{escapeHtml(segment.label)}}</div>
               <div class="google-segment-description">${{escapeHtml(segment.description)}}</div>
-              <div class="google-segment-stops">${{escapeHtml(segment.stopsText)}}</div>
+              <ul class="google-stop-list">${{(segment.stopLabels || []).map(label => '<li>' + escapeHtml(label) + '</li>').join('')}}</ul>
             </div>
             <a class="google-segment-open" href="${{escapeHtml(segment.url)}}" target="_blank" rel="noopener">Отвори</a>
           </div>
@@ -2776,14 +3009,13 @@ class InteractiveMapGenerator:
       const warning = missing > 0
         ? `<div class="google-segments-warning">${{missing}} клиент(а) без GPS не са включени в Google Maps линковете.</div>`
         : "";
-      return `
+      const content = `
         <div class="google-segments">
-          <div class="google-segments-title">Google Maps на части</div>
-          <div class="google-segments-note">${{splitNote}}</div>
           ${{rows}}
           ${{warning}}
         </div>
       `;
+      return '<details class="driver-google-routes"><summary>Google Maps · части на маршрута</summary>' + content + '</details>';
     }}
 
     function renderCustomerPanel(container, routeObjects, map) {{
@@ -2792,17 +3024,15 @@ class InteractiveMapGenerator:
       const routeTimeText = formatRouteDuration(route.timeMin);
       const routeStartText = route.routeStartTime || (route.markers[0] && route.markers[0].routeStartTime) || "";
       const routeEndText = route.routeEndTime || "";
-      container.classList.add("collapsed");
+      container.classList.add("driver-customer-control");
       container.innerHTML = `
-        <button type="button" class="client-toggle">Клиенти / Google Maps</button>
-        <div class="client-panel hidden">
+        <div class="client-panel">
           <div class="client-panel-header">
             <b>Клиенти - маршрут ${{MAP_DATA.singleRouteNumber}}</b>
-            <button type="button" class="client-close" title="Затвори">×</button>
           </div>
           <div class="client-route-stats">
             <div class="client-route-stat"><span>Общо:</span><b>${{route.markers.length}} клиента</b></div>
-            <div class="client-route-stat"><span>Стекове:</span><b>${{formatStackNumber(route.volume)}}</b></div>
+            <div class="client-route-stat"><span>${{escapeHtml(MAP_DATA.driverTotalUnit)}}:</span><b>${{formatStackNumber(route.volume)}}</b></div>
             <div class="client-route-stat"><span>Време:</span><b>${{routeTimeText}}</b></div>
             <div class="client-route-stat"><span>Км:</span><b>${{formatRouteNumber(route.distanceKm)}}</b></div>
             ${{routeStartText ? '<div class="client-route-stat"><span>Старт:</span><b>' + escapeHtml(routeStartText) + '</b></div>' : ''}}
@@ -2812,32 +3042,30 @@ class InteractiveMapGenerator:
           <div class="client-list"></div>
         </div>
       `;
-      const toggle = container.querySelector(".client-toggle");
-      const panel = container.querySelector(".client-panel");
-      const close = container.querySelector(".client-close");
       const list = container.querySelector(".client-list");
-      function setOpen(isOpen) {{
-        container.classList.toggle("collapsed", !isOpen);
-        panel.classList.toggle("hidden", !isOpen);
-        toggle.classList.toggle("hidden", isOpen);
-      }}
-      toggle.addEventListener("click", () => setOpen(true));
-      close.addEventListener("click", () => setOpen(false));
+      initialiseCustomerPanel(container);
       route.markers.forEach((point, index) => {{
         const timeLine = point.arrivalTime
-          ? `<span style="display:block;color:#188038;font-size:11px">Пристигане: ${{escapeHtml(point.arrivalTime)}}</span>`
+          ? `<span class="single-client-detail" style="display:block;color:#188038;font-size:11px">Пристигане: ${{escapeHtml(point.arrivalTime)}}</span>`
           : "";
         const row = document.createElement("div");
         row.className = "route-row";
+        row.dataset.driverVolume = formatStackNumber(point.volume) + ' ' + MAP_DATA.driverCustomerUnit;
+        row.dataset.driverArrival = point.arrivalTime || '';
+        if (point.hasTimeWindow) row.classList.add('course-client-row-window');
+        if (point.mandatory) row.classList.add('course-client-row-mandatory');
         row.style.cursor = "pointer";
         row.style.borderTop = "1px solid #ececec";
         row.style.padding = "7px 0";
         row.innerHTML = `
           <span class="swatch" style="background:${{route.color}};border-radius:50%;color:#fff;text-align:center;line-height:14px;font-size:10px;font-weight:bold">${{point.number}}</span>
-          <span style="flex:1;min-width:0">
-            <span style="display:block;font-weight:bold;font-size:12px;overflow-wrap:anywhere">${{point.customerName}}</span>
-            <span style="display:block;color:#666;font-size:11px">ID: ${{point.customerId}} · ${{Number(point.volume).toFixed(2)}} ст.</span>
+          <span class="single-client-main" style="flex:1;min-width:0">
+            <span style="display:block;font-weight:bold;font-size:12px;overflow-wrap:anywhere">${{escapeHtml(point.customerName)}}</span>
+            <span class="single-client-detail" style="display:block;color:#666;font-size:11px">ID: ${{escapeHtml(point.customerId)}} · ${{Number(point.volume).toFixed(2)}} ${{escapeHtml(MAP_DATA.driverCustomerUnitShort)}}</span>
             ${{timeLine}}
+            ${{point.hasTimeWindow && point.timeWindowText ? '<span class="course-client-attention">Работно време: ' + escapeHtml(point.timeWindowText) + '</span>' : ''}}
+            ${{point.deliveryComment ? '<span class="course-client-attention">Коментар: ' + escapeHtml(point.deliveryComment) + '</span>' : ''}}
+            ${{point.mandatory ? '<span class="mandatory-customer-note">' + escapeHtml(MAP_DATA.mandatoryCustomerComment) + '</span>' : ''}}
           </span>
           <span class="client-actions">
             <a class="client-action client-nav" href="${{point.navigationUrl}}" target="_blank" rel="noopener"
@@ -2881,6 +3109,7 @@ class InteractiveMapGenerator:
             
         # Взимаме всички уникални депа от маршрутите
         display_routes = order_routes_for_output(solution.routes)
+        unserved_data = self._unserved_map_data(solution, warehouse_allocation)
         unique_depots = {depot_location}  # Добавяме основното депо
         
         # Добавяме депата от маршрутите
@@ -2897,6 +3126,7 @@ class InteractiveMapGenerator:
                 depot_location,
                 display_routes,
                 list(unique_depots),
+                unserved_data=unserved_data,
             )
         
         # Инициализация на картата с основното депо като център
@@ -2917,6 +3147,8 @@ class InteractiveMapGenerator:
         if self.config.show_route_colors:
             self._add_routes_to_map(route_map, display_routes)
 
+        self._add_unserved_control(route_map, unserved_data)
+
         # GPS търсачка за временни пинове в общата карта
         self._add_coordinate_pin_search(route_map)
 
@@ -2924,6 +3156,81 @@ class InteractiveMapGenerator:
         self._add_legend(route_map, display_routes)
 
         return route_map
+
+    def _unserved_map_data(self, solution, warehouse_allocation) -> Dict:
+        """Union both unserved sources, deduplicate visits and exclude served ones."""
+        def coordinates(customer):
+            try:
+                lat, lon = map(float, customer.coordinates)
+                if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                    return lat, lon
+            except (TypeError, ValueError, AttributeError):
+                pass
+            return None
+
+        def key(customer):
+            coords = coordinates(customer)
+            customer_id = str(getattr(customer, "id", "") or "").strip().lower()
+            # With document grouping disabled, the same customer/GPS can have
+            # one served order and another unserved order. Keep them distinct.
+            documents = tuple(sorted({
+                str(doc.get("document", "") or "").strip()
+                for doc in (getattr(customer, "grouped_documents", []) or [])
+                if isinstance(doc, dict) and doc.get("document")
+            })) or (str(getattr(customer, "document", "") or "").strip(),)
+            # Do not collapse different anonymous visits at the same location.
+            return (customer_id or id(customer), tuple(round(v, 6) for v in coords) if coords else None,
+                    documents, str(getattr(customer, "source_id_skld", "") or ""))
+
+        seen = {key(c) for route in solution.routes for c in route.customers}
+        result = {"total": 0, "missingCoordinates": 0, "markers": []}
+        customers = list(getattr(warehouse_allocation, "warehouse_customers", []) or [])
+        customers += list(getattr(solution, "dropped_customers", []) or [])
+        for customer in customers:
+            visit_key = key(customer)
+            if visit_key in seen:
+                continue
+            seen.add(visit_key)
+            result["total"] += 1
+            coords = coordinates(customer)
+            if coords is None:
+                result["missingCoordinates"] += 1
+                continue
+            customer_id = str(getattr(customer, "id", "") or "")
+            name = str(getattr(customer, "name", "") or customer_id or "Клиент")
+            lines = [
+                "<b>Статус:</b> Необслужен",
+                "<b>ID:</b> " + html.escape(customer_id),
+                "<b>Обем:</b> " + html.escape(str(getattr(customer, "volume", ""))),
+            ]
+            for label, value in (
+                ("Работно време", self._format_customer_time_window(customer)),
+                ("Коментар", getattr(customer, "delivery_comment", "")),
+                ("Документи", getattr(customer, "document", "")),
+            ):
+                if value:
+                    lines.append("<b>" + label + ":</b> " + html.escape(str(value)))
+            result["markers"].append({
+                "position": self._json_coords(coords),
+                "title": "Необслужен: " + name,
+                "customerId": customer_id,
+                "popup": self._html_popup(name, lines, "#2563eb"),
+            })
+        return result
+
+    def _add_unserved_control(self, route_map, data) -> None:
+        if not data or data.get("total", 0) <= 0:
+            return
+        layer = folium.FeatureGroup(name="Необслужени клиенти", show=False, control=False)
+        for point in data["markers"]:
+            folium.Marker(
+                location=[point["position"]["lat"], point["position"]["lng"]],
+                tooltip=html.escape(point["title"]),
+                popup=folium.Popup(point["popup"], max_width=350),
+                icon=folium.Icon(color="blue", icon="info-sign"),
+            ).add_to(layer)
+        layer.add_to(route_map)
+        UnservedCustomerControl(layer, data["total"], data["missingCoordinates"]).add_to(route_map)
     
     def _add_depot_markers(self, route_map: folium.Map, depot_locations: List[Tuple[float, float]]):
         """Добавя маркери за всички депа"""
@@ -3400,6 +3707,7 @@ class InteractiveMapGenerator:
             bus_layer_name = (
                 f'<span style="color:{safe_bus_color};font-weight:700;">'
                 f'{layer_label}</span>'
+                f'<span class="route-load">{html.escape(_route_load_text(route, self.config))}</span>'
             )
             bus_layer = folium.FeatureGroup(name=bus_layer_name)
             bus_layers[bus_id] = bus_layer
@@ -3415,12 +3723,18 @@ class InteractiveMapGenerator:
                     street_view_url = self._street_view_url(customer.coordinates)
                     schedule_entry = schedule_by_index.get(client_number)
                     schedule_lines = self._schedule_popup_lines(schedule_entry)
+                    mandatory = is_mandatory_customer(customer)
+                    individual_attention = bool(route_numbers) and (
+                        mandatory or self._customer_has_declared_time_window(customer)
+                    )
+                    if route_numbers and mandatory:
+                        schedule_lines.append(self._mandatory_customer_note_html())
                     
                     # HTML за номерирано пинче с уникален цвят на автобуса
                     icon_html = f'''
                     <div style="
                         background-color: {bus_color};
-                        border: 3px solid white;
+                        border: 3px solid {'#dc2626' if individual_attention else 'white'};
                         border-radius: 50%;
                         width: 30px;
                         height: 30px;
@@ -3443,7 +3757,7 @@ class InteractiveMapGenerator:
                         <b>Клиент:</b> {customer.name}<br>
                         <b>ID:</b> {customer.id}<br>
                         <b>Ред в маршрута:</b> #{client_number}<br>
-                        <b>Обем:</b> {customer.volume:.2f} ст.<br>
+                        <b>Обем:</b> {customer.volume:.2f} {html.escape(customer_volume_unit_label(self.config, short=True))}<br>
                         <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
                         {"<br>".join(schedule_lines)}{"<br>" if schedule_lines else ""}
                         {self._popup_action_buttons(navigation_url, street_view_url)}
@@ -3479,6 +3793,7 @@ class InteractiveMapGenerator:
                             schedule_entry.get("time_window_text", "") if schedule_entry else ""
                         ).strip(),
                         "has_time_window": self._customer_has_declared_time_window(customer),
+                        "mandatory": mandatory,
                         "delivery_comment": str(getattr(customer, "delivery_comment", "") or "").strip(),
                         "quantity": _optional_finite_float(getattr(customer, "quantity", None)),
                         "turnover": _optional_finite_float(getattr(customer, "turnover", None)),
@@ -3520,7 +3835,7 @@ class InteractiveMapGenerator:
                             <b>Клиенти:</b> {len(route.customers)}<br>
                             <b>Разстояние:</b> {route.total_distance_km:.1f} км<br>
                             <b>Време:</b> {route.total_time_minutes:.0f} мин<br>
-                            <b>Обем:</b> {route.total_volume:.1f} ст.<br>
+                            <b>Обем:</b> {route.total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}<br>
                             <b>Геометрия:</b> {len(route_geometry)} точки
                         </div>
                         """
@@ -3548,7 +3863,7 @@ class InteractiveMapGenerator:
                             <b>Клиенти:</b> {len(route.customers)}<br>
                             <b>Разстояние:</b> {route.total_distance_km:.1f} км<br>
                             <b>Време:</b> {route.total_time_minutes:.0f} мин<br>
-                            <b>Обем:</b> {route.total_volume:.1f} ст.
+                            <b>Обем:</b> {route.total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}
                         </div>
                         """
                         
@@ -3585,7 +3900,7 @@ class InteractiveMapGenerator:
                         <b>Клиенти:</b> {len(route.customers)}<br>
                         <b>Разстояние:</b> {route.total_distance_km:.1f} км<br>
                         <b>Време:</b> {route.total_time_minutes:.0f} мин<br>
-                        <b>Обем:</b> {route.total_volume:.1f} ст.
+                        <b>Обем:</b> {route.total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}
                     </div>
                     """
                     
@@ -3667,7 +3982,7 @@ class InteractiveMapGenerator:
         routed_count = sum(1 for route in routes if self.use_routing)
         
         legend_html = f'''
-        <div style="position: fixed; 
+        <div class="route-map-legend" style="position: fixed;
                     top: 10px; left: 10px; width: 280px; height: auto; 
                     background-color: white; border:2px solid grey; z-index:9999; 
                     font-size:14px; padding: 10px; border-radius: 5px;
@@ -3722,7 +4037,7 @@ class InteractiveMapGenerator:
         <p style="margin: 3px 0; font-size: 11px; color: #555;">
             • Общо разстояние: {total_distance:.1f} км<br>
             • Общо време: {total_time:.0f} мин<br>
-            • Общ обем: {total_volume:.1f} ст.<br>
+            • Общ обем: {total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}<br>
             {course_totals_html}
             • Маршрути с геометрия: {routed_count}/{len(routes)}
         </p>
@@ -3849,7 +4164,7 @@ class InteractiveMapGenerator:
                 color: #b3261e;
             }
         """
-        route_map.add_child(CoordinatePinSearch(css))
+        route_map.add_child(CoordinatePinSearch(css, customer_volume_unit_label(self.config)))
 
     def _navigation_url(self, coords: Tuple[float, float]) -> str:
         return (
@@ -3921,11 +4236,15 @@ class InteractiveMapGenerator:
         def stops_summary(part_stops: List[Dict[str, object]]) -> str:
             return ", ".join(f'{int(stop["number"])}. {stop["name"]}' for stop in part_stops)
 
+        def stop_labels(part_stops):
+            return [f'{int(stop["number"])}. {stop["name"]}' for stop in part_stops]
+
         if len(stops) <= max_waypoints:
             segments.append({
                 "label": "Целият маршрут",
                 "description": f"Депо -> {stop_range_text(stops)} -> {end_label}",
                 "stopsText": stops_summary(stops),
+                "stopLabels": stop_labels(stops),
                 "stopCount": len(stops),
                 "url": self._google_maps_route_url(
                     depot,
@@ -3949,6 +4268,7 @@ class InteractiveMapGenerator:
                 "label": f"Част {part_idx}: {range_text}",
                 "description": f"{current_origin_label} -> {range_text}",
                 "stopsText": stops_summary(part_stops),
+                "stopLabels": stop_labels(part_stops),
                 "stopCount": len(part_stops),
                 "url": self._google_maps_route_url(current_origin, destination, waypoints),
                 "isReturn": False,
@@ -3962,12 +4282,37 @@ class InteractiveMapGenerator:
                 "label": "Финал към крайна точка" if end_point != depot else "Връщане към депо",
                 "description": f'{current_origin_label} -> {end_label}',
                 "stopsText": f'{int(previous_stop["number"])}. {previous_stop["name"]}',
+                "stopLabels": stop_labels([previous_stop]),
                 "stopCount": 0,
                 "url": self._google_maps_route_url(current_origin, end_point),
                 "isReturn": True,
             })
 
         return segments
+
+    def _mandatory_customer_note_html(self) -> str:
+        return '<div class="mandatory-customer-note">' + html.escape(mandatory_customer_comment(self.config)) + '</div>'
+
+    @staticmethod
+    def _google_segment_stops_html(segment) -> str:
+        return '<ul class="google-stop-list">' + ''.join(
+            '<li>' + html.escape(str(label)) + '</li>' for label in segment.get("stopLabels", [])
+        ) + '</ul>'
+
+    def _driver_google_parts_html(self, route: Route) -> str:
+        segments = self._build_google_route_segments(route)
+        if not segments:
+            return ""
+        rows = ''.join(
+            '<div class="driver-google-part"><b>' + html.escape(str(segment["label"])) + '</b>'
+            + self._google_segment_stops_html(segment)
+            + '<a href="' + html.escape(str(segment["url"]), quote=True)
+            + '" target="_blank" rel="noopener">Отвори в Google Maps</a></div>'
+            for segment in segments
+        )
+        missing = len(route.customers) - len(self._route_customer_stops(route))
+        warning = f'<p>{missing} клиент(а) без GPS не са включени в линковете.</p>' if missing else ''
+        return '<details class="driver-google-routes"><summary>Google Maps · части на маршрута</summary>' + rows + warning + '</details>'
 
     def _format_route_duration(self, minutes: float) -> str:
         total_minutes = max(0, int(round(minutes or 0)))
@@ -4016,7 +4361,7 @@ class InteractiveMapGenerator:
         return f'''
             <div class="route-client-stats">
                 <div class="route-client-stat"><span>Общо:</span><b>{len(route.customers)} клиента</b></div>
-                <div class="route-client-stat"><span>Стекове:</span><b>{self._format_stack_number(route.total_volume)}</b></div>
+                <div class="route-client-stat"><span>{html.escape(driver_total_volume_label(self.config))}:</span><b>{self._format_stack_number(route.total_volume)}</b></div>
                 <div class="route-client-stat"><span>Време:</span><b>{self._format_route_duration(route.total_time_minutes)}</b></div>
                 <div class="route-client-stat"><span>Км:</span><b>{self._format_route_number(route.total_distance_km)}</b></div>
                 {turnover_html}
@@ -4114,7 +4459,7 @@ class InteractiveMapGenerator:
                     <div class="route-client-number" style="background:{html.escape(bus_color, quote=True)}">{number}</div>
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
-                        <div class="route-client-meta">ID: {customer_id} · {volume:.2f} ст.</div>
+                        <div class="route-client-meta">ID: {customer_id} · {volume:.2f} {html.escape(customer_volume_unit_label(self.config, short=True))}</div>
                     </div>
                     <div class="route-client-actions">
                         <a class="route-client-nav" href="{nav_url}" target="_blank" rel="noopener">Навигация</a>
@@ -4359,6 +4704,8 @@ class InteractiveMapGenerator:
                 turnover_text = ""
             has_time_window = bool(entry.get("has_time_window"))
             card_extra_class = " route-client-card-time-window" if has_time_window else ""
+            if entry.get("mandatory"):
+                card_extra_class += " route-client-card-mandatory"
             time_html = ""
             if arrival_time:
                 time_html = f'<div class="route-client-time">Пристигане: {arrival_time}</div>'
@@ -4374,15 +4721,17 @@ class InteractiveMapGenerator:
             )
             rows.append(
                 f'''
-                <div class="route-client-card{card_extra_class}" role="button" tabindex="0" data-client-index="{idx}">
+                <div class="route-client-card{card_extra_class}" role="button" tabindex="0" data-client-index="{idx}"
+                     data-driver-volume="{volume:g} {html.escape(driver_customer_volume_label(self.config), quote=True)}" data-driver-arrival="{arrival_time}">
                     <div class="route-client-number" style="background:{safe_color}">{number}</div>
                     <div class="route-client-main">
                         <div class="route-client-name">{name}</div>
-                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} ст.{quantity_text}</div>
+                        <div class="route-client-meta">ID: {customer_id} &middot; {volume:.2f} {html.escape(driver_customer_volume_label(self.config, short=True))}{quantity_text}</div>
                         {time_html}
                         {turnover_text}
                         {time_window_html}
                         {comment_html}
+                        {self._mandatory_customer_note_html() if entry.get("mandatory") else ""}
                     </div>
                     <div class="route-client-actions">
                         <a class="route-client-nav" href="{nav_url}" target="_blank" rel="noopener">Навигация</a>
@@ -4403,32 +4752,14 @@ class InteractiveMapGenerator:
         panel_html = f'''
             <div class="route-client-header">
                 <h4>Клиенти - маршрут {route_number}</h4>
-                <button type="button" class="route-client-close" title="Затвори">×</button>
             </div>
             {route_stats_html}
+            {self._driver_google_parts_html(route) if getattr(self.config, "mobile_driver_panel", False) else ""}
             {''.join(rows)}
         '''
         panel_css = '''
             .route-client-control {
                 font-family: Arial, sans-serif;
-            }
-            .route-client-toggle {
-                border: 1px solid rgba(35, 35, 35, 0.35);
-                border-radius: 6px;
-                background: #ffffff;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.22);
-                color: #222;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 700;
-                padding: 8px 11px;
-            }
-            .route-client-toggle:hover {
-                background: #f4f7fb;
-            }
-            .route-client-toggle-hidden,
-            .route-client-panel-hidden {
-                display: none;
             }
             .route-client-panel {
                 width: 340px;
@@ -4452,21 +4783,6 @@ class InteractiveMapGenerator:
             .route-client-header h4 {
                 margin: 0;
                 font-size: 15px;
-            }
-            .route-client-close {
-                width: 26px;
-                height: 26px;
-                border: 0;
-                border-radius: 4px;
-                background: #f1f3f4;
-                color: #333;
-                cursor: pointer;
-                font-size: 18px;
-                line-height: 1;
-                font-weight: 700;
-            }
-            .route-client-close:hover {
-                background: #e4e7eb;
             }
             .route-client-summary {
                 margin: 0 0 8px;
@@ -4650,7 +4966,7 @@ class InteractiveMapGenerator:
                 comment = html.escape(str(entry.get("delivery_comment", "") or ""))
                 quantity = _optional_finite_float(entry.get("quantity"))
                 turnover = _optional_finite_float(entry.get("turnover"))
-                secondary = [f'ID: {customer_id} · {float(entry["volume"]):.2f} ст.']
+                secondary = [f'ID: {customer_id} · {float(entry["volume"]):.2f} {html.escape(driver_customer_volume_label(self.config, short=True))}']
                 if quantity is not None:
                     secondary.append(f"Количество: {quantity:.2f}")
                 detail_lines = []
@@ -4665,8 +4981,12 @@ class InteractiveMapGenerator:
                 if comment:
                     detail_lines.append(f'<span class="multi-course-client-attention">Коментар: {comment}</span>')
                 attention_class = " multi-course-client-card-window" if entry.get("has_time_window") else ""
+                if entry.get("mandatory"):
+                    attention_class += " multi-course-client-card-mandatory"
+                    detail_lines.append(self._mandatory_customer_note_html())
                 rows.append(f'''
-                    <div class="multi-course-client-card{attention_class}" role="button" tabindex="0" data-client-index="{client_index}">
+                    <div class="multi-course-client-card{attention_class}" role="button" tabindex="0" data-client-index="{client_index}"
+                         data-driver-volume="{float(entry['volume']):g} {html.escape(driver_customer_volume_label(self.config), quote=True)}" data-driver-arrival="{arrival}">
                         <span class="multi-course-client-number" style="background:{safe_color}">{int(entry["number"])}</span>
                         <span class="multi-course-client-main">
                             <span class="multi-course-client-name">{name}</span>
@@ -4692,17 +5012,20 @@ class InteractiveMapGenerator:
                 segment_rows.append(
                     '<div class="multi-course-google-row">'
                     f'<span><b>{html.escape(str(segment["label"]))}</b><br>'
-                    f'<small>{html.escape(str(segment.get("description", "")))}</small></span>'
+                    f'<small>{html.escape(str(segment.get("description", "")))}</small>'
+                    f'{self._google_segment_stops_html(segment)}</span>'
                     f'<a href="{html.escape(str(segment["url"]), quote=True)}" target="_blank" rel="noopener">Отвори</a>'
                     '</div>'
                 )
             google_html = (
-                '<div class="multi-course-google"><b>Google Maps</b>'
+                '<details class="driver-google-routes"><summary>Google Maps · части на маршрута</summary><div class="multi-course-google">'
                 + ''.join(segment_rows)
-                + '</div>'
+                + '</div></details>'
                 if segment_rows
                 else ""
             )
+            if getattr(self.config, "mobile_driver_panel", False):
+                google_html = self._driver_google_parts_html(route)
             missing = int(course.get("missing_coordinates", 0) or 0)
             missing_html = (
                 f'<div class="multi-course-missing">{missing} клиент(а) без GPS не могат да се покажат като пин.</div>'
@@ -4735,11 +5058,8 @@ class InteractiveMapGenerator:
 
         panel_css = """
             .multi-course-client-control { font-family: Arial, sans-serif; }
-            .multi-course-hidden { display: none !important; }
-            .multi-course-toggle { border:1px solid rgba(35,35,35,.35);border-radius:6px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.22);font-weight:700;padding:8px 11px;cursor:pointer; }
             .multi-course-panel { width:390px;max-width:calc(100vw - 42px);max-height:calc(100vh - 45px);overflow:auto;background:#fff;border:1px solid rgba(35,35,35,.35);border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.22);padding:10px;color:#222; }
             .multi-course-header { display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;font-size:15px; }
-            .multi-course-close { width:26px;height:26px;border:0;border-radius:4px;background:#f1f3f4;font-size:18px;font-weight:700;cursor:pointer; }
             .multi-course-selector { padding-bottom:7px;border-bottom:1px solid #e1e6ee; }
             .multi-course-selector-row { display:flex;align-items:center;gap:6px;padding:4px 2px;cursor:pointer;font-size:12px;font-weight:700; }
             .multi-course-swatch { width:14px;height:14px;border-radius:2px;display:inline-block; }
@@ -4790,7 +5110,7 @@ class InteractiveMapGenerator:
             row_class = "google-route-part google-route-return" if segment.get("isReturn") else "google-route-part"
             label = html.escape(str(segment["label"]))
             description = html.escape(str(segment["description"]))
-            stops_text = html.escape(str(segment.get("stopsText", "")))
+            stops_html = self._google_segment_stops_html(segment)
             url = html.escape(str(segment["url"]), quote=True)
             rows.append(
                 f'''
@@ -4798,18 +5118,13 @@ class InteractiveMapGenerator:
                     <div class="google-route-part-main">
                         <div class="google-route-part-title">{label}</div>
                         <div class="google-route-part-description">{description}</div>
-                        <div class="google-route-part-stops">{stops_text}</div>
+                        <div class="google-route-part-stops">{stops_html}</div>
                     </div>
                     <a class="google-route-open" href="{url}" target="_blank" rel="noopener">Отвори</a>
                 </div>
                 '''
             )
 
-        split_note = (
-            "Маршрутът е разделен на части, за да се спази лимитът на Google Maps за спирки."
-            if len(segments) > 1
-            else "Маршрутът е готов като един Google Maps линк."
-        )
         missing_note = ""
         if missing_coords > 0:
             missing_note = (
@@ -4822,7 +5137,6 @@ class InteractiveMapGenerator:
                 <h4>Google Maps - маршрут {route_number}</h4>
                 <button type="button" class="google-route-close" title="Затвори">×</button>
             </div>
-            <div class="google-route-note">{html.escape(split_note)}</div>
             {''.join(rows)}
             {missing_note}
         '''
@@ -5029,8 +5343,9 @@ class InteractiveMapGenerator:
             add_layer_control=False,
         )
         self._add_multi_course_customer_control(route_map, course_panel_routes)
-        self._add_coordinate_pin_search(route_map)
         self._add_legend(route_map, routes, course_filter=True)
+        if getattr(self.config, "mobile_driver_panel", False):
+            route_map.add_child(MobileDriverPanel())
         setattr(route_map, "_cvrp_top_html_comment", top_comment)
         return route_map
 
@@ -5128,6 +5443,9 @@ class InteractiveMapGenerator:
                 time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
                 has_time_window = self._customer_has_declared_time_window(customer)
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
+                mandatory = is_mandatory_customer(customer)
+                if mandatory:
+                    schedule_lines.append(self._mandatory_customer_note_html())
                 has_comment = bool(delivery_comment)
                 quantity_value = getattr(customer, "quantity", None)
                 turnover_value = getattr(customer, "turnover", None)
@@ -5145,16 +5463,16 @@ class InteractiveMapGenerator:
                     if turnover_float is not None and turnover_float != 0
                     else ""
                 )
-                marker_has_attention = has_time_window or has_comment
-                marker_border_color = "#dc2626" if has_time_window else "#f59e0b" if has_comment else "#ffffff"
+                marker_has_attention = mandatory or has_time_window or has_comment
+                marker_border_color = "#dc2626" if mandatory or has_time_window else "#f59e0b" if has_comment else "#ffffff"
                 marker_shadow = (
                     "0 0 0 3px rgba(220,38,38,0.16), 0 2px 7px rgba(0,0,0,0.28)"
-                    if has_time_window
+                    if mandatory or has_time_window
                     else "0 0 0 3px rgba(245,158,11,0.18), 0 2px 7px rgba(0,0,0,0.28)"
                     if has_comment
                     else "0 1px 4px rgba(0,0,0,0.24)"
                 )
-                marker_badge_color = "#f59e0b" if has_time_window and has_comment else marker_border_color
+                marker_badge_color = "#f59e0b" if has_time_window and has_comment and not mandatory else marker_border_color
                 marker_badge_html = (
                     f'<span style="position:absolute;top:-4px;right:-4px;width:10px;height:10px;'
                     f'border-radius:50%;background:{marker_badge_color};border:2px solid #fff;'
@@ -5190,7 +5508,7 @@ class InteractiveMapGenerator:
                     <b>Клиент:</b> {customer.name}<br>
                     <b>ID:</b> {customer.id}<br>
                     <b>Ред в маршрута:</b> #{client_number}<br>
-                    <b>Обем:</b> {customer.volume:.2f} ст.<br>
+                    <b>Обем:</b> {customer.volume:.2f} {html.escape(customer_volume_unit_label(self.config, short=True))}<br>
                     {quantity_line}
                     {turnover_line}
                     <b>Координати:</b> {customer.coordinates[0]:.6f}, {customer.coordinates[1]:.6f}<br>
@@ -5226,6 +5544,7 @@ class InteractiveMapGenerator:
                     "time_window_text": time_window_text,
                     "has_time_window": has_time_window,
                     "delivery_comment": delivery_comment,
+                    "mandatory": mandatory,
                     "quantity": quantity_value,
                     "turnover": turnover_value,
                 })
@@ -5269,12 +5588,15 @@ class InteractiveMapGenerator:
 
         bus_layer.add_to(route_map)
         self._add_single_route_customer_control(route_map, route, route_number, bus_color, marker_entries)
-        self._add_google_route_segments_control(route_map, route, route_number, bus_color, route_depot)
+        if getattr(self.config, "mobile_driver_panel", False):
+            route_map.add_child(MobileDriverPanel())
+        else:
+            self._add_google_route_segments_control(route_map, route, route_number, bus_color, route_depot)
         route_end_time_text = self._route_end_time_text(route)
 
         # Легенда с информация за маршрута
         legend_html = f'''
-        <div style="position: fixed;
+        <div class="route-map-legend" style="position: fixed;
                     top: 10px; left: 10px; width: 260px; height: auto;
                     background-color: white; border:2px solid grey; z-index:9999;
                     font-size:14px; padding: 10px; border-radius: 5px;
@@ -5286,7 +5608,7 @@ class InteractiveMapGenerator:
         <p style="margin: 3px 0; font-size: 12px;">ID бус: {html.escape(str(bus_number))}</p>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4cf Разстояние: {route.total_distance_km:.1f} км</p>
         <p style="margin: 3px 0; font-size: 12px;">\u23f1 Време: {route.total_time_minutes:.0f} мин</p>
-        <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} ст.</p>
+        <p style="margin: 3px 0; font-size: 12px;">\U0001f4e6 Обем: {route.total_volume:.1f} {html.escape(total_volume_unit_label(self.config, short=True))}</p>
         {f'<p style="margin: 3px 0; font-size: 12px;">Старт: {html.escape(route_start_time_text)}</p>' if route_start_time_text else ''}
         {f'<p style="margin: 3px 0; font-size: 12px;">Край: {html.escape(route_end_time_text)}</p>' if route_end_time_text else ''}
         </div>
@@ -5334,7 +5656,8 @@ class ExcelExporter:
             or datetime.now().strftime("%Y-%m-%d")
         )
     
-    def export_all_to_single_excel(self, solution: CVRPSolution, warehouse_customers: List[Customer]) -> str:
+    def export_all_to_single_excel(self, solution: CVRPSolution, warehouse_customers: List[Customer],
+                                   distance_matrix=None, matrix_customers=None) -> str:
         """Експортира всички данни в един Excel файл с отделни sheets"""
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -5364,11 +5687,77 @@ class ExcelExporter:
         # 4. SHEET: Статистики по автобуси (Vehicle Statistics)
         if solution.routes:
             self._create_vehicle_stats_sheet(wb, solution)
+
+        if getattr(self.config, "enable_routing_quality_report", False):
+            self._add_routing_quality_report(wb, solution, distance_matrix, matrix_customers)
         
         # Записваме файла
         wb.save(file_path)
         logger.info(f"Общ Excel отчет записан в {file_path}")
         return file_path
+
+    def _add_routing_quality_report(self, wb, solution, distance_matrix, matrix_customers):
+        from collections import Counter
+        from routing_quality import (
+            REASON_LABELS, SOURCE_LABELS, matrix_quality_counts, quality_kind,
+            quality_parts, route_quality_edges,
+        )
+
+        edges = list(route_quality_edges(solution, distance_matrix, matrix_customers))
+        counts = Counter(quality_kind(edge["quality"]) for edge in edges)
+        matrix_counts = matrix_quality_counts(distance_matrix)
+        summary = wb["Обобщение"]
+        row = summary.max_row + 3
+        summary.cell(row, 1, "ПРОВЕРКА НА ПЪТНИТЕ ДАННИ").font = Font(bold=True)
+        for offset, (label, value) in enumerate([
+            ("Отсечки в избраните маршрути", len(edges)),
+            ("Отсечки с пътни данни", counts["road"]),
+            ("Отсечки с приблизителни данни", counts["approximate"]),
+            ("Отсечки с неизвестен произход", counts["unknown"]),
+            ("Проверени връзки в цялата матрица", matrix_counts["total"] if distance_matrix is not None else None),
+            ("Приблизителни връзки в цялата матрица", matrix_counts["approximate"] if distance_matrix is not None else None),
+            ("Връзки с неизвестен произход в матрицата", matrix_counts["unknown"] if distance_matrix is not None else None),
+        ], 1):
+            self._write_report_value(summary, row + offset, 1, label)
+            self._write_report_value(summary, row + offset, 2, value)
+        summary.column_dimensions["A"].width = max(summary.column_dimensions["A"].width or 0, 52)
+
+        problem_edges = [edge for edge in edges if quality_kind(edge["quality"]) != "road"]
+        if not problem_edges:
+            return
+        ws = wb.create_sheet("Приблизителни отсечки")
+        headers = [
+            "ID бус", "Маршрут", "Курс", "Отсечка", "ID от клиент", "От", "ID до клиент", "До",
+            "GPS от", "GPS до", "Разстояние по матрица (км)", "Пътуване по матрица (мин)",
+            "Източник разстояние", "Източник време", "Причина",
+        ]
+        for column, header in enumerate(headers, 1):
+            cell = ws.cell(1, column, header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="9C6500", end_color="9C6500", fill_type="solid")
+        for row, edge in enumerate(problem_edges, 2):
+            distance_source, duration_source, reason = quality_parts(edge["quality"])
+            index, route = edge["route_index"], edge["route"]
+            values = [
+                self._format_report_bus_number(index, route, solution.routes), index + 1,
+                route_trip_number(route), edge["position"], edge["from_id"], edge["from_name"],
+                edge["to_id"], edge["to_name"], self._format_coords_for_report(edge["from_coords"]),
+                self._format_coords_for_report(edge["to_coords"]), edge["distance_km"], edge["duration_minutes"],
+                SOURCE_LABELS[distance_source], SOURCE_LABELS[duration_source],
+                REASON_LABELS.get(reason, REASON_LABELS["unknown"]),
+            ]
+            for column, value in enumerate(values, 1):
+                self._write_report_value(ws, row, column, value)
+        self._prepare_report_table(ws)
+        self._apply_decimal_format_by_header(ws, ["Пътуване по матрица (мин)"], "0.00")
+        self._apply_decimal_format_by_header(ws, ["ID от клиент", "ID до клиент"], "@")
+        for cells in ws.columns:
+            dimension = ws.column_dimensions[cells[0].column_letter]
+            dimension.width = max(dimension.width, min(60, max(len(str(cell.value or "")) for cell in cells) + 2))
+        logger.warning(
+            "Проверка на маршрутите: %s отсечки с приблизителни данни; %s с неизвестен произход. Подробности в Excel.",
+            counts["approximate"], counts["unknown"],
+        )
 
     def _format_movement_direction(self, from_stop: str, to_stop: str) -> str:
         return f"{from_stop} -> {to_stop}"
@@ -5391,6 +5780,69 @@ class ExcelExporter:
         if not coords:
             return ""
         return f"{float(coords[0]):.6f}, {float(coords[1]):.6f}"
+
+    @staticmethod
+    def _write_report_value(ws, row: int, column: int, value):
+        cell = ws.cell(row=row, column=column, value=value)
+        # Customer names, comments and IDs are data, never Excel formulas.
+        if isinstance(value, str):
+            cell.data_type = "s"
+        return cell
+
+    def _prepare_report_table(self, ws):
+        """Make the existing report usable without changing its column layout."""
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.print_title_rows = "1:1"
+        ws.row_dimensions[1].height = 26
+        # Keep one compact line per record. Wrapped names/comments caused Excel
+        # to auto-expand only some rows when the report was opened.
+        for cells in ws.iter_rows(min_row=2):
+            ws.row_dimensions[cells[0].row].height = 15
+            for cell in cells:
+                cell.alignment = Alignment(vertical="center", wrap_text=False)
+        for header in ws[1]:
+            header.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            text = str(header.value or "")
+            # Reserve room for bold headings AND Excel's filter arrow. Data-only
+            # sizing made short columns such as "Маршрут" wrap their last letter.
+            dimension = ws.column_dimensions[header.column_letter]
+            dimension.width = min(255, max(dimension.width or 0, len(text) * 1.15 + 5))
+            if "(км)" in text or "(ч)" in text or text == "Час на отпътуване (десетичен)":
+                self._apply_decimal_format_by_header(ws, [text], number_format="0.00")
+            if text in {"ID", "ID бус", "ID клиент", "Номер поръчка"}:
+                self._apply_decimal_format_by_header(ws, [text], number_format="@")
+
+    def _route_capacity_for_report(self, route: Route) -> Optional[float]:
+        """Use the same vehicle capacity in the summary and per-course stats."""
+        return _route_capacity_for_display(route)
+
+    def _total_vehicle_capacity_for_report(self, routes: List[Route]) -> Optional[float]:
+        """Count each active physical vehicle once, even when it reloads."""
+        capacities = {}
+        # A partial denominator would overstate utilisation: don't invent a
+        # fleet percentage when even one used vehicle has unknown capacity.
+        for index, route in enumerate(routes):
+            if not route.customers:
+                continue
+            capacity = self._route_capacity_for_report(route)
+            key = route_vehicle_key(route, index)
+            if capacity is None or (key in capacities and capacities[key] != capacity):
+                return None
+            capacities[key] = capacity
+        return sum(capacities.values())
+
+    @staticmethod
+    def _served_order_count_for_report(routes: List[Route]) -> int:
+        """Count source orders, including documents grouped into one visit.
+
+        Legacy inputs without document details count as one request per visit;
+        never guess a document count by splitting arbitrary display strings.
+        """
+        return sum(
+            max(1, len(getattr(customer, "grouped_documents", None) or []))
+            for route in routes for customer in route.customers
+        )
 
     def _apply_decimal_format_by_header(
         self,
@@ -5442,12 +5894,12 @@ class ExcelExporter:
         # Заглавни редове
         headers = [
             'ID бус', 'Маршрут', 'Превозно средство', 'Ред в маршрута',
-            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', 'Обем (ст.)', 'GPS координати',
-            'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
-            'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
-            'Време от предишен (ч)', 'Накоплено време (ч)',
-            'Стартово време (чч:мм)', 'Време с натрупване (ч)', 'Време с натрупване (чч:мм)',
-            'Работно време клиент', 'ETA пристигане', 'Чакане (мин)', 'TW статус'
+            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', f'Обем ({customer_volume_unit_label(self.config, short=True)})', 'GPS координати',
+            'Депо стартова точка', 'Крайна точка',
+            'Разстояние от предишен (км)', 'Натрупано разстояние (км)',
+            'Пътуване + обслужване + чакане (ч)', 'Натрупано време (ч)',
+            'Стартово време (чч:мм)', 'Час на отпътуване (десетичен)', 'Отпътуване от клиента (чч:мм)',
+            'Работно време клиент', 'Начало обслужване (ETA)', 'Чакане (мин)', 'TW статус'
         ]
         if _has_multiple_courses(solution.routes):
             headers[2:2] = ['Курс']
@@ -5465,7 +5917,6 @@ class ExcelExporter:
         
         # Данни за маршрутите
         row = 2
-        center_location = get_config().locations.center_location
         
         for i, route in enumerate(solution.routes):
             vehicle_name = self._get_report_vehicle_name(route)
@@ -5474,9 +5925,6 @@ class ExcelExporter:
             for entry in schedule_entries:
                 customer = entry["customer"]
                 j = entry["index"]
-                # Изчисляваме разстоянието до центъра
-                distance_to_center = self._calculate_distance_to_center(customer.coordinates, center_location) if customer.coordinates else 0.0
-                
                 data = [
                     self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
                     i + 1,  # Номер маршрут
@@ -5489,18 +5937,17 @@ class ExcelExporter:
                     getattr(customer, "delivery_comment", ""),  # Коментар доставка
                     customer.volume,  # Обем
                     customer.original_gps_data,  # GPS
-                    round(distance_to_center, 2),  # Разстояние до центъра
                     self._format_coords_for_report(self._route_start_location(route)),  # Депо
                     self._format_coords_for_report(self._route_end_location(route)),  # Край
-                    round(entry["distance_from_previous"], 2),  # Разстояние от предишен
-                    round(entry["cumulative_distance"], 2),  # Накоплено разстояние
+                    entry["distance_from_previous"],  # Разстояние от предишен
+                    entry["cumulative_distance"],  # Накоплено разстояние
                     self._minutes_to_hours(entry["total_time_for_step"]),  # Време от предишен + service + wait
                     self._minutes_to_hours(entry["cumulative_time"]),  # Накоплено време
                     self._format_time_hh_mm(entry["start_time_minutes"]),  # Стартово време
                     self._minutes_to_hours(entry["total_time_with_start"]),  # Време с натрупване
-                    self._format_time_hh_mm(int(entry["total_time_with_start"])),  # Време с натрупване (чч:мм)
+                    self._format_time_hh_mm(entry["total_time_with_start"]),
                     entry["time_window_text"],
-                    self._format_time_hh_mm(int(entry["arrival_time_minutes"])),
+                    self._format_time_hh_mm(entry["arrival_time_minutes"]),
                     round(entry["wait_minutes"], 1),
                     entry["time_window_status"],
                 ]
@@ -5508,12 +5955,12 @@ class ExcelExporter:
                     data[2:2] = [route_trip_number(route)]
 
                 for col, value in enumerate(data, 1):
-                    ws.cell(row=row, column=col, value=value)
+                    self._write_report_value(ws, row, col, value)
                 
                 row += 1
         
         # Автоматично разширяване на колоните
-        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
+        self._apply_decimal_format_by_header(ws, [f"Обем ({customer_volume_unit_label(self.config, short=True)})"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -5525,14 +5972,14 @@ class ExcelExporter:
                     pass
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
+        self._prepare_report_table(ws)
     
     def _create_unserved_sheet(self, wb, warehouse_customers: List[Customer]):
         """Създава sheet с необслужените клиенти"""
         ws = wb.create_sheet("Необслужени клиенти")
         
         headers = [
-            'ID', 'Име', 'Обем (ст.)', 'GPS координати', 
-            'Latitude', 'Longitude', 'Разстояние до центъра (км)'
+            'ID', 'Име', f'Обем ({customer_volume_unit_label(self.config, short=True)})', 'GPS координати'
         ]
         
         # Стилове за заглавния ред
@@ -5548,29 +5995,23 @@ class ExcelExporter:
             cell.alignment = header_alignment
         
         # Данни
-        center_location = get_config().locations.center_location
         row = 2
         
         for customer in warehouse_customers:
-            distance_to_center = self._calculate_distance_to_center(customer.coordinates, center_location)
-            
             data = [
                 customer.id,
                 customer.name,
                 customer.volume,
-                customer.original_gps_data,
-                customer.coordinates[0] if customer.coordinates else '',
-                customer.coordinates[1] if customer.coordinates else '',
-                round(distance_to_center, 2)
+                customer.original_gps_data
             ]
             
             for col, value in enumerate(data, 1):
-                ws.cell(row=row, column=col, value=value)
+                self._write_report_value(ws, row, col, value)
             
             row += 1
         
         # Автоматично разширяване на колоните
-        self._apply_decimal_format_by_header(ws, ["Обем (ст.)"])
+        self._apply_decimal_format_by_header(ws, [f"Обем ({customer_volume_unit_label(self.config, short=True)})"])
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -5582,6 +6023,7 @@ class ExcelExporter:
                     pass
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
+        self._prepare_report_table(ws)
     
     def _create_summary_sheet(self, wb, solution: CVRPSolution, warehouse_customers: List[Customer]):
         """Създава sheet с обобщение"""
@@ -5598,14 +6040,23 @@ class ExcelExporter:
         
         # Основни статистики
         row = 3
+        served_count = sum(len(route.customers) for route in solution.routes)
+        active_routes = [route for route in solution.routes if route.customers]
+        vehicle_count = count_physical_vehicles(active_routes)
+        total_vehicle_capacity = self._total_vehicle_capacity_for_report(solution.routes)
         stats = [
-            ("Общо клиенти", len(solution.routes) + len(warehouse_customers)),
-            ("Обслужени клиенти", sum(len(route.customers) for route in solution.routes)),
+            ("Общо клиенти", served_count + len(warehouse_customers)),
+            ("Обслужени клиенти", served_count),
             ("Необслужени клиенти", len(warehouse_customers)),
             ("Брой маршрути", len(solution.routes)),
-            ("Общо разстояние (км)", round(solution.total_distance_km, 2)),
-            ("Общо време (ч)", self._minutes_to_hours(solution.total_time_minutes)),
-            ("Общ обем (ст.)", round(sum(route.total_volume for route in solution.routes), 2))
+            ("Брой физически бусове", vehicle_count),
+            ("Обслужени заявки", self._served_order_count_for_report(solution.routes)),
+            ("Среден брой заявки на бус", None),
+            ("Общо разстояние (км)", solution.total_distance_km),
+            ("Общо време (ч)", self._minutes_to_hours(_total_elapsed_route_minutes(solution.routes))),
+            (f"Обслужен обем ({total_volume_unit_label(self.config, short=True)})", sum(route.total_volume for route in active_routes)),
+            (f"Капацитет на активните бусове ({total_volume_unit_label(self.config, short=True)})", total_vehicle_capacity),
+            ("Обща натовареност на бусовете (%)", None),
         ]
         if _has_multiple_courses(solution.routes):
             route_count_index = next(
@@ -5613,16 +6064,30 @@ class ExcelExporter:
                 3,
             )
             stats[route_count_index + 1:route_count_index + 1] = [
-                ("Брой физически бусове", count_physical_vehicles(solution.routes)),
                 ("Брой курсове", len(solution.routes)),
             ]
         
+        stat_rows = {}
         for stat_name, stat_value in stats:
+            stat_rows[stat_name] = row
             ws[f'A{row}'] = stat_name
             ws[f'A{row}'].font = header_font
             ws[f'B{row}'] = stat_value
             row += 1
-        self._apply_decimal_format_by_label(ws, ["Общ обем (ст.)"])
+        if vehicle_count:
+            orders_row = stat_rows["Обслужени заявки"]
+            vehicles_row = stat_rows["Брой физически бусове"]
+            average_row = stat_rows["Среден брой заявки на бус"]
+            ws[f'B{average_row}'] = f"=B{orders_row}/B{vehicles_row}"
+        self._apply_decimal_format_by_label(ws, ["Среден брой заявки на бус"], number_format="0.0")
+        if total_vehicle_capacity is not None and total_vehicle_capacity > 0:
+            volume_row = stat_rows[f"Обслужен обем ({total_volume_unit_label(self.config, short=True)})"]
+            capacity_row = stat_rows[f"Капацитет на активните бусове ({total_volume_unit_label(self.config, short=True)})"]
+            utilisation_row = stat_rows["Обща натовареност на бусовете (%)"]
+            ws[f'B{utilisation_row}'] = f"=B{volume_row}/B{capacity_row}"
+        self._apply_decimal_format_by_label(ws, [f"Обслужен обем ({total_volume_unit_label(self.config, short=True)})", f"Капацитет на активните бусове ({total_volume_unit_label(self.config, short=True)})"])
+        self._apply_decimal_format_by_label(ws, ["Обща натовареност на бусовете (%)"], number_format="0.0%")
+        self._apply_decimal_format_by_label(ws, ["Общо разстояние (км)", "Общо време (ч)"], number_format="0.00")
         
         # Информация за стартови времена
         row += 2
@@ -5652,7 +6117,7 @@ class ExcelExporter:
                     self._format_time_hh_mm(start_time_minutes)
                 ]
                 for col, value in enumerate(data, 1):
-                    ws.cell(row=row, column=col, value=value)
+                    self._write_report_value(ws, row, col, value)
                 row += 1
         
         # Статистики по тип бус
@@ -5674,7 +6139,7 @@ class ExcelExporter:
             vehicle_stats[vehicle_name]['customers'] += len(route.customers)
         
         # Заглавни редове за статистики
-        headers = ['Бус / тип', 'Брой маршрути', 'Общо разстояние (км)', 'Общ обем (ст.)', 'Общо клиенти']
+        headers = ['Бус / тип', 'Брой маршрути', 'Общо разстояние (км)', f'Общ обем ({total_volume_unit_label(self.config, short=True)})', 'Общо клиенти']
         summary_header_row = row
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
@@ -5687,16 +6152,17 @@ class ExcelExporter:
             data = [
                 vehicle_name,
                 stats['count'],
-                round(stats['distance'], 2),
-                round(stats['volume'], 2),
+                stats['distance'],
+                stats['volume'],
                 stats['customers']
             ]
             for col, value in enumerate(data, 1):
-                ws.cell(row=row, column=col, value=value)
+                self._write_report_value(ws, row, col, value)
             row += 1
         
         # Автоматично разширяване на колоните
-        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"], header_row=summary_header_row)
+        self._apply_decimal_format_by_header(ws, [f"Общ обем ({total_volume_unit_label(self.config, short=True)})"], header_row=summary_header_row)
+        self._apply_decimal_format_by_header(ws, ["Общо разстояние (км)"], number_format="0.00", header_row=summary_header_row)
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -5713,9 +6179,9 @@ class ExcelExporter:
         """Създава sheet със статистики по отделни бусове"""
         ws = wb.create_sheet("Статистики по бусове")
         headers = [
-            'ID бус', 'Маршрут', 'Тип бус', 'Брой клиенти', 'Общ обем (ст.)',
+            'ID бус', 'Маршрут', 'Тип бус', 'Брой клиенти', f'Общ обем ({total_volume_unit_label(self.config, short=True)})',
             'Разстояние (км)', 'Време (ч)', 'Капацитет използване (%)',
-            'Средно разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка', 'Стартово време (чч:мм)'
+            'Депо стартова точка', 'Крайна точка', 'Стартово време (чч:мм)'
         ]
         if _has_multiple_courses(solution.routes):
             headers[2:2] = ['Курс']
@@ -5732,24 +6198,14 @@ class ExcelExporter:
             cell.alignment = header_alignment
         
         # Данни
-        center_location = get_config().locations.center_location
         row = 2
         
         for i, route in enumerate(solution.routes):
             vehicle_name = self._get_report_vehicle_name(route)
             
-            # Изчисляваме средното разстояние до центъра
-            distances_to_center = []
-            for customer in route.customers:
-                distance = self._calculate_distance_to_center(customer.coordinates, center_location)
-                distances_to_center.append(distance)
-            avg_distance_to_center = sum(distances_to_center) / len(distances_to_center) if distances_to_center else 0
-            
             # Капацитет използване (трябва да вземем capacity от config)
-            vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
-            capacity_usage = 0
-            if vehicle_config and vehicle_config.capacity > 0:
-                capacity_usage = (route.total_volume / vehicle_config.capacity * 100)
+            capacity = self._route_capacity_for_report(route)
+            capacity_usage = route.total_volume / capacity if capacity is not None else None
             
             # Изчисляваме стартово време за този тип превозно средство
             start_time_minutes = _route_start_time_minutes(route)
@@ -5759,11 +6215,10 @@ class ExcelExporter:
                 i + 1,  # Номер маршрут
                 vehicle_name,  # Тип бус
                 len(route.customers),  # Брой клиенти
-                round(route.total_volume, 2),  # Общ обем
-                round(route.total_distance_km, 2),  # Разстояние
+                route.total_volume,  # Общ обем
+                route.total_distance_km,  # Разстояние
                 self._minutes_to_hours(route.total_time_minutes),  # Време
-                round(capacity_usage, 1),  # Капацитет използване
-                round(avg_distance_to_center, 2),  # Средно разстояние до центъра
+                capacity_usage,  # Числова дроб с Excel формат за процент.
                 self._format_coords_for_report(self._route_start_location(route)),  # Депо
                 self._format_coords_for_report(self._route_end_location(route)),  # Край
                 self._format_time_hh_mm(start_time_minutes) # Стартово време (чч:мм)
@@ -5772,12 +6227,13 @@ class ExcelExporter:
                 data[2:2] = [route_trip_number(route)]
 
             for col, value in enumerate(data, 1):
-                ws.cell(row=row, column=col, value=value)
+                self._write_report_value(ws, row, col, value)
             
             row += 1
         
         # Автоматично разширяване на колоните
-        self._apply_decimal_format_by_header(ws, ["Общ обем (ст.)"])
+        self._apply_decimal_format_by_header(ws, [f"Общ обем ({total_volume_unit_label(self.config, short=True)})"])
+        self._apply_decimal_format_by_header(ws, ["Капацитет използване (%)"], number_format="0.0%")
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -5789,6 +6245,7 @@ class ExcelExporter:
                     pass
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
+        self._prepare_report_table(ws)
 
     def _customer_time_windows_enabled(self) -> bool:
         return bool(getattr(get_config().cvrp, "enable_customer_time_windows", False))
@@ -5816,7 +6273,7 @@ class ExcelExporter:
 
         start_time_minutes = _route_start_time_minutes(route)
         vehicle_config = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
-        service_time_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
+        default_service_minutes = vehicle_config.service_time_minutes if vehicle_config else 15
 
         entries = []
         cumulative_distance = 0.0
@@ -5825,6 +6282,7 @@ class ExcelExporter:
         previous_stop_name = "Депо"
 
         for stop_index, customer in enumerate(route.customers, start=1):
+            service_time_minutes = _report_customer_service_minutes(customer, default_service_minutes, vehicle_config)
             distance_from_previous = (
                 self._calculate_distance_between_points(previous_customer_coords, customer.coordinates)
                 if customer.coordinates
@@ -5838,7 +6296,10 @@ class ExcelExporter:
                 else 0.0
             )
             raw_arrival = start_time_minutes + cumulative_time + travel_time
-            windows = time_windows_to_seconds(customer_time_windows_minutes(customer))
+            windows = (
+                time_windows_to_seconds(customer_time_windows_minutes(customer))
+                if self._customer_time_windows_enabled() else []
+            )
             _, wait_seconds, window_index, time_window_status = choose_time_window_for_arrival(raw_arrival * 60, windows)
             wait_minutes = wait_seconds / 60
             if time_window_status and len(windows) > 1 and window_index >= 0:
@@ -5872,25 +6333,6 @@ class ExcelExporter:
             previous_stop_name = customer.name
 
         return entries
-    
-    def _calculate_distance_to_center(self, coordinates: Optional[Tuple[float, float]], center_location: Tuple[float, float]) -> float:
-        """Изчислява разстоянието до центъра в км"""
-        if not coordinates or not center_location:
-            return 0.0
-        
-        from math import radians, sin, cos, sqrt, atan2
-        R = 6371  # Earth radius in km
-        
-        lat1, lon1 = radians(coordinates[0]), radians(coordinates[1])
-        lat2, lon2 = radians(center_location[0]), radians(center_location[1])
-        
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        
-        a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-        c = 2 * atan2(sqrt(a), sqrt(1-a))
-        
-        return R * c
     
     def _calculate_distance_between_points(self, point1: Optional[Tuple[float, float]], point2: Optional[Tuple[float, float]]) -> float:
         """Изчислява разстоянието между две точки в км"""
@@ -5952,7 +6394,8 @@ class ExcelExporter:
 
     def _minutes_to_hours(self, total_minutes) -> float:
         """Връща продължителност в часове за CVRP отчета."""
-        return round(float(total_minutes or 0) / 60, 2)
+        # Round only the display: sums must retain the underlying precision.
+        return float(total_minutes or 0) / 60
 
     def _format_report_bus_number(
         self,
@@ -5984,7 +6427,7 @@ class ExcelExporter:
             data.append({
                 'ID': customer.id,
                 'Име': customer.name,
-                'Обем (ст.)': customer.volume,
+                f'Обем ({customer_volume_unit_label(self.config, short=True)})': customer.volume,
                 'GPS координати': customer.original_gps_data,
                 'Latitude': customer.coordinates[0] if customer.coordinates else '',
                 'Longitude': customer.coordinates[1] if customer.coordinates else ''
@@ -5992,7 +6435,7 @@ class ExcelExporter:
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False)
-        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
+        self._apply_decimal_format_to_excel_file(file_path, [f"Обем ({customer_volume_unit_label(self.config, short=True)})"])
         
         logger.info(f"Складови заявки експортирани в {file_path}")
         return file_path
@@ -6019,14 +6462,14 @@ class ExcelExporter:
                     'Номер поръчка': customer.document,
                     'Коментар доставка': getattr(customer, "delivery_comment", ""),
                     'Работно време': self._format_customer_time_window(customer),
-                    'Обем (ст.)': customer.volume,
+                    f'Обем ({customer_volume_unit_label(self.config, short=True)})': customer.volume,
                     'GPS': customer.original_gps_data
                 })
                 previous_stop_name = customer.name
         
         df = pd.DataFrame(data)
         df.to_excel(file_path, index=False, engine='openpyxl')
-        self._apply_decimal_format_to_excel_file(file_path, ["Обем (ст.)"])
+        self._apply_decimal_format_to_excel_file(file_path, [f"Обем ({customer_volume_unit_label(self.config, short=True)})"])
         
         logger.info(f"Маршрути експортирани в {file_path}")
         return file_path
@@ -6041,8 +6484,8 @@ class ExcelExporter:
         
         headers = [
             'Маршрут', 'Превозно средство', 'Ред в маршрута',
-            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', 'Обем (ст.)', 'GPS координати',
-            'Разстояние до центъра (км)', 'Депо стартова точка', 'Крайна точка',
+            'Посока на движение', 'ID клиент', 'Име клиент', 'Номер поръчка', 'Коментар доставка', f'Обем ({customer_volume_unit_label(self.config, short=True)})', 'GPS координати',
+            'Депо стартова точка', 'Крайна точка',
             'Разстояние от предишен (км)', 'Накоплено разстояние (км)',
             'Време от предишен (мин)', 'Накоплено време (мин)',
             'Стартово време (мин)', 'Време с натрупване (мин)', 'Време с натрупване (чч:мм)',
@@ -6050,8 +6493,6 @@ class ExcelExporter:
         ]
         if multi_trip:
             headers[1:1] = ['ID бус', 'Курс', 'ID курс', 'Ключ бус']
-        
-        center_location = get_config().locations.center_location
         
         with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f, delimiter=',')
@@ -6063,9 +6504,6 @@ class ExcelExporter:
 
                 for entry in schedule_entries:
                     customer = entry["customer"]
-                    distance_to_center = self._calculate_distance_to_center(
-                        customer.coordinates, center_location) if customer.coordinates else 0.0
-                    
                     row = [
                         i + 1,
                         vehicle_name,
@@ -6077,7 +6515,6 @@ class ExcelExporter:
                         getattr(customer, "delivery_comment", ""),
                         customer.volume,
                         customer.original_gps_data,
-                        round(distance_to_center, 2),
                         self._format_coords_for_report(self._route_start_location(route)),
                         self._format_coords_for_report(self._route_end_location(route)),
                         round(entry["distance_from_previous"], 2),
@@ -6191,7 +6628,7 @@ class ChartGenerator:
         total_dist = solution.total_distance_km
         total_time = solution.total_time_minutes
         total_vol = solution.total_served_volume
-        cats = ['Разстояние\n(км)', 'Време\n(мин)', 'Обем\n(ст.)']
+        cats = ['Разстояние\n(км)', 'Време\n(мин)', f'Обем\n({total_volume_unit_label(self.config, short=True)})']
         vals = [total_dist, total_time, total_vol]
         bar_colors = ['#3498db', '#e67e22', '#9b59b6']
         bars3 = ax3.bar(cats, vals, color=bar_colors, edgecolor='white')
@@ -6244,8 +6681,8 @@ class ChartGenerator:
         # Обем
         ax = axes[1, 0]
         ax.bar(labels, volumes, color=colors, edgecolor='white')
-        ax.set_title('Обем (ст.)')
-        ax.set_ylabel('ст.')
+        ax.set_title(f'Обем ({total_volume_unit_label(self.config, short=True)})')
+        ax.set_ylabel(total_volume_unit_label(self.config, short=True))
         for i, v in enumerate(volumes):
             ax.text(i, v + 0.3, f'{v:.1f}', ha='center', fontsize=8)
 
@@ -6288,7 +6725,7 @@ class ChartGenerator:
         ax1 = axes[0]
         ax1.hist(all_volumes, bins=min(20, len(set(all_volumes))), color='#3498db',
                  edgecolor='white', alpha=0.85)
-        ax1.set_xlabel('Обем (ст.)')
+        ax1.set_xlabel(f'Обем ({customer_volume_unit_label(self.config, short=True)})')
         ax1.set_ylabel('Брой клиенти')
         ax1.set_title('Разпределение на обемите')
         mean_vol = sum(all_volumes) / len(all_volumes)
@@ -6298,12 +6735,14 @@ class ChartGenerator:
         # 2. Box plot по маршрут
         ax2 = axes[1]
         if route_volumes and any(route_volumes):
-            bp = ax2.boxplot(route_volumes, labels=route_labels, patch_artist=True)
+            bp = ax2.boxplot(route_volumes, patch_artist=True)
+            ax2.set_xticks(range(1, len(route_labels) + 1))
+            ax2.set_xticklabels(route_labels)
             for i, box in enumerate(bp['boxes']):
                 box.set_facecolor(BUS_COLORS[i % len(BUS_COLORS)])
                 box.set_alpha(0.7)
         ax2.set_xlabel('Маршрут')
-        ax2.set_ylabel('Обем (ст.)')
+        ax2.set_ylabel(f'Обем ({customer_volume_unit_label(self.config, short=True)})')
         ax2.set_title('Обеми по маршрут')
 
         plt.tight_layout(rect=[0, 0, 1, 0.93])
@@ -6451,7 +6890,7 @@ class OutputHandler:
     
     def generate_all_outputs(self, solution: CVRPSolution, 
                            warehouse_allocation: WarehouseAllocation,
-                           depot_location: Tuple[float, float]) -> Dict[str, str]:
+                           depot_location: Tuple[float, float], distance_matrix=None) -> Dict[str, str]:
         """Генерира всички изходни файлове и връща речник с пътищата до тях"""
         logger.info("Започвам генериране на изходни файлове")
         solution.routes = order_routes_for_output(solution.routes)
@@ -6565,7 +7004,10 @@ class OutputHandler:
         if getattr(self.config, "enable_excel_output", True):
             if solution.routes or all_unserviced_customers:
                 try:
-                    excel_file = self.excel_exporter.export_all_to_single_excel(solution, all_unserviced_customers)
+                    excel_file = self.excel_exporter.export_all_to_single_excel(
+                        solution, all_unserviced_customers, distance_matrix=distance_matrix,
+                        matrix_customers=getattr(warehouse_allocation, "vehicle_customers", None),
+                    )
                     if excel_file:
                         output_files['excel_report'] = excel_file
                 except Exception as e:

@@ -1,6 +1,9 @@
 import unittest
+from dataclasses import asdict
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from config import CVRPConfig, VehicleConfig, VehicleType
+from config import CVRPConfig, LocationConfig, VehicleConfig, VehicleType
 from cvrp_solver import ORTOOLS_AVAILABLE, ORToolsSolver
 from input_handler import Customer
 from osrm_client import DistanceMatrix
@@ -171,6 +174,7 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(0, result.second_trips_count)
         self.assertEqual(1, len(result.dropped_customers))
         self.assertEqual(1, len(result.routes[0].customers))
+        self.assertTrue(result.is_feasible)
 
     def test_mandatory_customer_cannot_be_dropped_when_optional_skipping_is_enabled(self):
         config = make_config(
@@ -193,6 +197,7 @@ class ORToolsMultiTripTests(unittest.TestCase):
         served_ids = [customer.id for route in result.routes for customer in route.customers]
         self.assertIn(customers[1].id, served_ids)
         self.assertNotIn(customers[1].id, [customer.id for customer in result.dropped_customers])
+        self.assertTrue(result.is_feasible)
 
     def test_customer_limit_is_cumulative_for_the_physical_vehicle_day(self):
         config = make_config(allow_customer_skipping=True)
@@ -209,6 +214,7 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(2, served)
         self.assertEqual(1, len(result.dropped_customers))
         self.assertEqual(2, result.total_trips)
+        self.assertTrue(result.is_feasible)
 
     def test_daily_customer_limit_also_applies_when_multi_trip_is_disabled(self):
         config = make_config(
@@ -223,6 +229,7 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(1, result.total_trips)
         self.assertEqual(2, sum(len(route.customers) for route in result.routes))
         self.assertEqual(1, len(result.dropped_customers))
+        self.assertTrue(result.is_feasible)
 
     def test_reload_time_counts_against_the_cumulative_work_time(self):
         config = make_config(allow_customer_skipping=True)
@@ -235,6 +242,7 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(1, len(result.dropped_customers))
         self.assertLessEqual(result.total_time_minutes, 90)
         self.assertAlmostEqual(80, result.total_time_minutes)
+        self.assertTrue(result.is_feasible)
 
     def test_distance_limit_is_cumulative_across_courses(self):
         config = make_config(allow_customer_skipping=True)
@@ -247,6 +255,135 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(1, len(result.dropped_customers))
         self.assertLessEqual(result.total_distance_km, 4)
         self.assertAlmostEqual(4, result.total_distance_km)
+        self.assertTrue(result.is_feasible)
+
+    def test_optional_drop_survives_real_parallel_worker_acceptance(self):
+        import main
+
+        for multiple_trips in (False, True):
+            with self.subTest(multiple_trips=multiple_trips):
+                customers = make_customers(2)
+                customers[0].mandatory = True
+                depots = [START_DEPOT, FIXED_END]
+                allocation = SimpleNamespace(
+                    vehicle_customers=customers,
+                    warehouse_customers=[],
+                    center_zone_customers=[],
+                )
+                config = make_config(
+                    enable_multiple_trips=multiple_trips,
+                    allow_customer_skipping=True,
+                    solver_type="or_tools",
+                    use_simple_solver=False,
+                )
+                location_config = LocationConfig(
+                    depot_location=START_DEPOT,
+                    enable_center_zone_restrictions=False,
+                )
+                vehicle = make_vehicle(max_customers_per_day=1)
+
+                result = main.solve_cvrp_worker((
+                    allocation,
+                    asdict(config),
+                    asdict(location_config),
+                    make_matrix(depots, customers),
+                    [asdict(vehicle)],
+                    1,
+                ))
+
+                self.assertIsNotNone(result)
+                self.assertTrue(result.is_feasible)
+                self.assertTrue(all(route.is_feasible for route in result.routes))
+                self.assertEqual([customers[1]], result.dropped_customers)
+                self.assertEqual([customers[0]], result.routes[0].customers)
+
+    def test_optional_drop_does_not_hide_invalid_extracted_route(self):
+        # Force a tighter limit only during extraction: this simulates a
+        # model/extraction disagreement without weakening the native model.
+        for multiple_trips in (False, True):
+            for limit, value in (
+                ("capacity", 1),
+                ("max_time_hours", 0.1),
+                ("max_distance_km", 0.1),
+            ):
+                with self.subTest(multiple_trips=multiple_trips, limit=limit):
+                    vehicle = make_vehicle(max_customers_per_day=1)
+                    solver = self.make_solver(
+                        2,
+                        config=make_config(
+                            enable_multiple_trips=multiple_trips,
+                            allow_customer_skipping=True,
+                        ),
+                        vehicle=vehicle,
+                    )
+                    extract = solver._extract_solution
+
+                    def extract_with_invalid_limit(*args):
+                        with patch.object(vehicle, limit, value):
+                            return extract(*args)
+
+                    with patch.object(solver, "_extract_solution", side_effect=extract_with_invalid_limit):
+                        result = solver.solve()
+
+                    self.assertEqual(1, len(result.dropped_customers))
+                    self.assertEqual(1, len(result.routes))
+                    self.assertFalse(result.routes[0].is_feasible)
+                    self.assertFalse(result.is_feasible)
+
+    def test_impossible_optional_time_window_can_be_dropped(self):
+        for multiple_trips in (False, True):
+            with self.subTest(multiple_trips=multiple_trips):
+                customers = make_customers(2)
+                customers[0].mandatory = True
+                customers[1].time_windows = [(0, 1)]  # Before the 08:00 start.
+                depots = [START_DEPOT, FIXED_END]
+                solver = ORToolsSolver(
+                    make_config(
+                        enable_multiple_trips=multiple_trips,
+                        allow_customer_skipping=True,
+                        enable_customer_time_windows=True,
+                    ),
+                    [make_vehicle()],
+                    customers,
+                    make_matrix(depots, customers),
+                    depots,
+                )
+
+                result = solver.solve()
+
+                self.assertEqual([customers[1]], result.dropped_customers)
+                self.assertTrue(result.is_feasible)
+
+    def test_impossible_mandatory_time_window_is_still_rejected(self):
+        for multiple_trips in (False, True):
+            with self.subTest(multiple_trips=multiple_trips):
+                solver = self.make_solver(
+                    1,
+                    config=make_config(
+                        enable_multiple_trips=multiple_trips,
+                        allow_customer_skipping=True,
+                        enable_customer_time_windows=True,
+                    ),
+                )
+                solver.customers[0].mandatory = True
+                solver.customers[0].time_windows = [(0, 1)]
+
+                result = solver.solve()
+
+                self.assertFalse(result.is_feasible)
+
+    def test_disabling_skipping_keeps_incomplete_problem_infeasible(self):
+        for multiple_trips in (False, True):
+            with self.subTest(multiple_trips=multiple_trips):
+                solver = self.make_solver(
+                    2,
+                    config=make_config(enable_multiple_trips=multiple_trips),
+                    vehicle=make_vehicle(max_customers_per_day=1),
+                )
+
+                result = solver.solve()
+
+                self.assertFalse(result.is_feasible)
 
     def test_distinct_reload_location_splits_courses_without_changing_fixed_end(self):
         customers = make_customers(2)
@@ -271,6 +408,60 @@ class ORToolsMultiTripTests(unittest.TestCase):
         self.assertEqual(RELOAD_DEPOT, result.routes[0].end_location)
         self.assertEqual(RELOAD_DEPOT, result.routes[1].depot_location)
         self.assertEqual(FIXED_END, result.routes[1].end_location)
+
+
+class ORToolsExtractedFeasibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.solver = ORToolsSolver(
+            make_config(allow_customer_skipping=True),
+            [],
+            [],
+            make_matrix([START_DEPOT], []),
+            [START_DEPOT],
+        )
+        self.routes = [SimpleNamespace(is_feasible=True)]
+        self.optional = make_customers(1)[0]
+
+    def test_allowed_optional_omission_is_valid_and_logged(self):
+        with self.assertLogs("cvrp_solver", level="INFO") as logs:
+            self.assertTrue(
+                self.solver._extracted_solution_is_feasible(self.routes, [self.optional])
+            )
+        self.assertIn("необслужени клиенти=1", logs.output[0])
+        self.assertIn("от тях задължителни=0", logs.output[0])
+        self.assertIn("допустимо=True", logs.output[0])
+
+    def test_mandatory_omission_is_rejected_even_with_skipping_enabled(self):
+        self.optional.mandatory = True
+        with self.assertLogs("cvrp_solver", level="ERROR") as logs:
+            self.assertFalse(
+                self.solver._extracted_solution_is_feasible(self.routes, [self.optional])
+            )
+        self.assertIn("задължителни клиента не са обслужени", logs.output[0])
+
+    def test_omission_is_rejected_when_skipping_is_disabled(self):
+        self.solver.config.allow_customer_skipping = False
+        with self.assertLogs("cvrp_solver", level="ERROR") as logs:
+            self.assertFalse(
+                self.solver._extracted_solution_is_feasible(self.routes, [self.optional])
+            )
+        self.assertIn("пропускането е изключено", logs.output[0])
+
+    def test_existing_invalid_route_flag_is_never_overridden(self):
+        self.routes[0].is_feasible = False
+        for dropped in ([], [self.optional]):
+            with self.subTest(dropped=bool(dropped)):
+                with self.assertLogs("cvrp_solver", level="ERROR") as logs:
+                    self.assertFalse(
+                        self.solver._extracted_solution_is_feasible(self.routes, dropped)
+                    )
+                self.assertIn("нарушават твърди ограничения", logs.output[0])
+
+    def test_complete_valid_solution_works_with_either_skipping_setting(self):
+        for allowed in (False, True):
+            with self.subTest(allowed=allowed):
+                self.solver.config.allow_customer_skipping = allowed
+                self.assertTrue(self.solver._extracted_solution_is_feasible(self.routes, []))
 
 
 if __name__ == "__main__":

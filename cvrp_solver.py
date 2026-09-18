@@ -5,10 +5,12 @@ CVRP Solver - основен модул за решаване на Vehicle Routi
 
 import random
 import math
+from display_units import volume_unit_label
 import time
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import logging
+from service_time import customer_service_seconds, minimum_service_seconds, service_description
  
 
 # OR-Tools импорти
@@ -208,6 +210,41 @@ class ORToolsSolver:
             penalty *= self._time_objective_cost_weight()
         return max(0, int(round(penalty)))
 
+    def _extracted_solution_is_feasible(
+        self, routes: List[Route], dropped_customers: List[Customer]
+    ) -> bool:
+        """Optional omissions are valid only when skipping is enabled.
+
+        Keep every route-level hard-constraint result. The common acceptance
+        boundary additionally checks mandatory visit completeness/uniqueness.
+        """
+        invalid_routes = sum(not route.is_feasible for route in routes)
+        dropped_mandatory = sum(is_mandatory_customer(customer) for customer in dropped_customers)
+        skipping_allowed = bool(self.config.allow_customer_skipping)
+        is_feasible = (
+            not invalid_routes
+            and not dropped_mandatory
+            and (skipping_allowed or not dropped_customers)
+        )
+
+        logger.info(
+            "OR-Tools проверка: допустимо=%s, маршрути=%d, невалидни маршрути=%d, "
+            "необслужени клиенти=%d, от тях задължителни=%d, пропускане разрешено=%s",
+            is_feasible,
+            len(routes),
+            invalid_routes,
+            len(dropped_customers),
+            dropped_mandatory,
+            skipping_allowed,
+        )
+        if invalid_routes:
+            logger.error("OR-Tools: %d маршрута нарушават твърди ограничения.", invalid_routes)
+        if dropped_mandatory:
+            logger.error("OR-Tools: %d задължителни клиента не са обслужени.", dropped_mandatory)
+        if dropped_customers and not skipping_allowed:
+            logger.error("OR-Tools: има необслужени клиенти, а пропускането е изключено.")
+        return is_feasible
+
     def solve(self) -> CVRPSolution:
         """
         Стартира OR-Tools търсенето и връща извлеченото решение.
@@ -361,6 +398,8 @@ class ORToolsSolver:
                 if node_kind == "customer":
                     customer_index = data['customer_index_by_node'].get(node)
                     if customer_index is not None:
+                        if isinstance(customer_service_time_seconds, (tuple, list)):
+                            return customer_service_time_seconds[int(customer_index)]
                         override = getattr(
                             self.customers[int(customer_index)],
                             "service_time_minutes",
@@ -428,8 +467,12 @@ class ORToolsSolver:
 
             vehicle_time_matrices = []
             vehicle_objective_cost_matrices = []
+            service_by_vehicle = {
+                vehicle_id: tuple(int(round(customer_service_seconds(c, self._get_vehicle_config_for_id(vehicle_id)))) for c in self.customers)
+                for vehicle_id in range(data['num_vehicles'])
+            }
             for vehicle_id in range(data['num_vehicles']):
-                service_time_seconds = int(vehicle_service_times.get(vehicle_id, 15 * 60))
+                service_time_seconds = service_by_vehicle[vehicle_id]
                 vehicle_config = self._get_vehicle_config_for_id(vehicle_id)
                 vehicle_type_value = getattr(vehicle_config.vehicle_type, "value", str(vehicle_config.vehicle_type))
                 time_matrix = []
@@ -490,7 +533,7 @@ class ORToolsSolver:
                         make_vehicle_time_callback(vehicle_id, service_time_seconds)
                     )
                 )
-                logger.info(f"  - vehicle {vehicle_id}: service time {service_time_seconds / 60:.1f} мин/клиент")
+                logger.info("  - vehicle %s: %s", vehicle_id, service_description(self._get_vehicle_config_for_id(vehicle_id)))
 
             routing.AddDimensionWithVehicleTransitAndCapacity(
                 time_callback_indices,
@@ -918,7 +961,7 @@ class ORToolsSolver:
         except (TypeError, ValueError, OverflowError):
             work_minutes = 0.0
         try:
-            service_minutes = max(0.0, float(vehicle_config.service_time_minutes or 0))
+            service_minutes = minimum_service_seconds(self.customers, vehicle_config) / 60
         except (TypeError, ValueError, OverflowError):
             service_minutes = 0.0
         try:
@@ -1053,11 +1096,8 @@ class ORToolsSolver:
         enabled_vehicles = [v for v in self.vehicle_configs if v.enabled]
         if enabled_vehicles:
             logger.info(f"📊 Vehicle-specific service times:")
-            logger.info(f"  - INTERNAL_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.INTERNAL_BUS), 8)} мин")
-            logger.info(f"  - CENTER_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.CENTER_BUS), 9)} мин")
-            logger.info(f"  - EXTERNAL_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.EXTERNAL_BUS), 6)} мин")
-            logger.info(f"  - SPECIAL_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.SPECIAL_BUS), 6)} мин")
-            logger.info(f"  - VRATZA_BUS: {next((v.service_time_minutes for v in enabled_vehicles if v.vehicle_type == VehicleType.VRATZA_BUS), 7)} мин")
+            for vehicle in enabled_vehicles:
+                logger.info("  - %s: %s", vehicle.vehicle_type.value, service_description(vehicle))
         
         # За клиентите използваме 0 - service time ще се изчислява в callback-а
         data['service_times'] = [0] * len(node_kinds)
@@ -1270,11 +1310,6 @@ class ORToolsSolver:
 
         depot_index = self._get_depot_index_for_location(depot_location, 0)
         end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
-        default_service_time_seconds = (
-            float(vehicle_config.service_time_minutes) * 60
-            if vehicle_config
-            else 15 * 60
-        )
         start_time_seconds = (
             float(start_time_seconds_override)
             if start_time_seconds_override is not None
@@ -1300,21 +1335,7 @@ class ORToolsSolver:
                 float(self.distance_matrix.distances[current_node][customer_index]),
             )
             travel_time_seconds = self._travel_time_seconds(current_node, customer_index, location_coords)
-            service_override = getattr(customer, "service_time_minutes", None)
-            if service_override is None or (
-                isinstance(service_override, str) and not service_override.strip()
-            ):
-                service_time_seconds = default_service_time_seconds
-            else:
-                try:
-                    service_time_seconds = max(0.0, float(service_override) * 60)
-                except (TypeError, ValueError, OverflowError):
-                    logger.warning(
-                        "Invalid service_time_minutes=%r for customer %s; using vehicle default.",
-                        service_override,
-                        customer.id,
-                    )
-                    service_time_seconds = default_service_time_seconds
+            service_time_seconds = customer_service_seconds(customer, vehicle_config)
             cumulative_distance_m += distance_m
 
             raw_arrival_seconds = current_clock_seconds + travel_time_seconds
@@ -1445,6 +1466,7 @@ class ORToolsSolver:
                 )
             
             # Service time за клиента (само за клиенти, не за депо)
+            service_time_seconds = customer_service_seconds(customer, vehicle_config)
             total_time += service_time_seconds
             current_clock_seconds += service_time_seconds
             
@@ -1463,7 +1485,7 @@ class ORToolsSolver:
         total_time += travel_time_back
         
         logger.debug(f"🕐 {vehicle_config.vehicle_type.value} accurate time: "
-                    f"{len(customers)} клиента × {vehicle_config.service_time_minutes}мин + travel = "
+                    f"{len(customers)} клиента ({service_description(vehicle_config)}) + travel = "
                     f"{total_time/60:.1f} минути")
         
         return total_time
@@ -1573,7 +1595,7 @@ class ORToolsSolver:
                 if time_diff > 60:  # Повече от 1 минута разлика
                     logger.info(f"🕐 Vehicle {vehicle_id} ({vehicle_config.vehicle_type.value}) time comparison:")
                     logger.info(f"  - OR-Tools time: {ortools_time_seconds/60:.1f} мин (средни service times)")
-                    logger.info(f"  - Accurate time: {accurate_time_seconds/60:.1f} мин (specific service time: {vehicle_config.service_time_minutes} мин/клиент)")
+                    logger.info(f"  - Accurate time: {accurate_time_seconds/60:.1f} мин ({service_description(vehicle_config)})")
                     logger.info(f"  - Разлика: {time_diff/60:.1f} минути")
 
                 route = Route(
@@ -1652,7 +1674,7 @@ class ORToolsSolver:
             # Сортираме по обем за по-ясно представяне
             dropped_customers.sort(key=lambda c: c.volume, reverse=True)
             for cust in dropped_customers[:10]: # показваме първите 10
-                logger.warning(f"   - Пропуснат: {cust.name} (обем: {cust.volume:.1f} ст.)")
+                logger.warning(f"   - Пропуснат: {cust.name} (обем: {cust.volume:.1f} {volume_unit_label(short=True)})")
             if len(dropped_customers) > 10:
                 logger.warning(f"   - ... и още {len(dropped_customers) - 10}")
         
@@ -1674,16 +1696,11 @@ class ORToolsSolver:
                 if self._objective_metric() == "time"
                 else float(solution.ObjectiveValue())
             ),
-            is_feasible=True, # Ще се обнови по-долу
+            is_feasible=self._extracted_solution_is_feasible(routes, dropped_customers),
             total_served_volume=total_served_volume,
             total_trips=len(routes),
             second_trips_count=0,
         )
-        
-        # Проверка на общата валидност на решението
-        invalid_routes = [r for r in routes if not r.is_feasible]
-        is_solution_feasible = not invalid_routes and not dropped_customers
-        cvrp_solution.is_feasible = is_solution_feasible
         
         logger.info(f"--- РЕШЕНИЕТО ИЗВЛЕЧЕНО ({time.time() - start_time:.2f} сек.) ---")
         return cvrp_solution
@@ -1810,6 +1827,14 @@ class ORToolsSolver:
                 )
                 total_volume = sum(float(customer.volume or 0) for customer in customers)
                 trip_is_feasible = total_volume <= float(vehicle_config.capacity or 0) + 1e-9
+                if not trip_is_feasible:
+                    logger.warning(
+                        "Vehicle %s trip %s violates capacity: %.3f > %.3f",
+                        vehicle_key,
+                        trip_number,
+                        total_volume,
+                        float(vehicle_config.capacity or 0),
+                    )
 
                 route = Route(
                     vehicle_type=vehicle_config.vehicle_type,
@@ -1876,8 +1901,6 @@ class ORToolsSolver:
         total_trips = len(routes)
         total_vehicles_used = len(used_vehicle_ids)
         second_trips_count = max(0, total_trips - total_vehicles_used)
-        invalid_routes = [route for route in routes if not route.is_feasible]
-
         return CVRPSolution(
             routes=routes,
             dropped_customers=dropped_customers,
@@ -1889,7 +1912,7 @@ class ORToolsSolver:
                 if self._objective_metric() == "time"
                 else float(solution.ObjectiveValue())
             ),
-            is_feasible=not invalid_routes and not dropped_customers,
+            is_feasible=self._extracted_solution_is_feasible(routes, dropped_customers),
             total_served_volume=total_served_volume,
             total_trips=total_trips,
             second_trips_count=second_trips_count,
@@ -2243,7 +2266,7 @@ class ORToolsSolver:
         # Service time - използваме vehicle-specific ако е зададен
         if vehicle_config:
             service_time_seconds = vehicle_config.service_time_minutes * 60
-            logger.debug(f"🕐 Използвам {vehicle_config.vehicle_type.value} service time: {vehicle_config.service_time_minutes} мин/клиент")
+            logger.debug("Обслужване: %s", service_description(vehicle_config))
         else:
             service_time_seconds = 15 * 60  # Fallback only when vehicle type is unknown.
         
@@ -2261,6 +2284,7 @@ class ORToolsSolver:
             total_time += duration
             
             # Време за обслужване на клиента (само за клиенти, не за депо)
+            service_time_seconds = customer_service_seconds(customer, vehicle_config)
             total_time += service_time_seconds
             
             current_node = customer_index
@@ -2272,7 +2296,7 @@ class ORToolsSolver:
         total_distance += distance
         total_time += duration
         
-        logger.debug(f"  - Изчислено от депо {depot_index}: {total_distance/1000:.1f}км, {total_time/60:.1f}мин (service time: {service_time_seconds/60:.1f}мин/клиент)")
+        logger.debug(f"  - Изчислено от депо {depot_index}: {total_distance/1000:.1f}км, {total_time/60:.1f}мин ({service_description(vehicle_config)})")
         return total_distance / 1000, total_time / 60  # в км и минути
     
     def _validate_reconfigured_route(self, route: Route, vehicle_config: VehicleConfig) -> bool:
@@ -2730,7 +2754,7 @@ class ORToolsSolver:
                 else:
                     service_time = 10  # По подразбиране - 10 минути за клиент
                 
-                route_time_minutes += len(route_customers) * service_time
+                route_time_minutes += sum(customer_service_seconds(c, vehicle_config, default_minutes=10) for c in route_customers) / 60
                 
                 # Създаваме обект за маршрут
                 if vehicle_config:
@@ -2790,7 +2814,7 @@ class ORToolsSolver:
                 
                 logger.info(f"🚌 Маршрут {len(routes)} (ID: {vehicle_id}, Тип: {vehicle_type.value}):")
                 logger.info(f"  - Клиенти: {len(route_customers)} бр.")
-                logger.info(f"  - Обем: {total_volume:.2f} стекове")
+                logger.info(f"  - Обем: {total_volume:.2f} {volume_unit_label()}")
                 logger.info(f"  - Разстояние: {route_distance_km:.2f} км")
                 logger.info(f"  - Време: {route_time_minutes:.2f} минути")
                 
@@ -2825,7 +2849,7 @@ class ORToolsSolver:
         total_time_minutes = sum(r.total_time_minutes for r in routes)
         
         logger.info("📊 Общи показатели на решението:")
-        logger.info(f"  - Обслужен обем: {total_served_volume:.2f} стекове")
+        logger.info(f"  - Обслужен обем: {total_served_volume:.2f} {volume_unit_label()}")
         logger.info(f"  - Общо разстояние: {total_distance_km:.2f} км")
         logger.info(f"  - Общо време: {total_time_minutes:.2f} минути")
         logger.info(f"  - Създадени маршрути: {len(routes)}")
@@ -2842,7 +2866,7 @@ class ORToolsSolver:
                 if self._objective_metric() == "time"
                 else float(solution.ObjectiveValue())
             ),
-            is_feasible=True,
+            is_feasible=self._extracted_solution_is_feasible(routes, dropped_customers),
             total_served_volume=total_served_volume,
             total_trips=len(routes),
             second_trips_count=0,

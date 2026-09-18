@@ -1,12 +1,14 @@
-"""Create the isolated ``.venv-pyvrp-next`` PyVRP 0.14 environment.
+"""Install pinned stable PyVRP 0.14.0 in the isolated ``.venv-pyvrp-next``.
 
 Examples::
 
-    python setup_pyvrp_next.py --wheel wheels\\pyvrp-0.14.0a0-cp314-win_amd64.whl
+    python setup_pyvrp_next.py
+    python setup_pyvrp_next.py --wheel wheels\\pyvrp-0.14.0-cp314-cp314-win_amd64.whl
     python setup_pyvrp_next.py --source-url https://github.com/PyVRP/PyVRP.git \
         --source-commit 0123456789abcdef0123456789abcdef01234567
 
-Wheel installation is preferred.  Source installation is never implicit and
+The default installs the pinned release wheel from PyPI, never a prerelease.
+Source installation is never implicit and
 requires an exact commit hash.  This script creates/updates only
 ``.venv-pyvrp-next`` and never installs anything into the production ``.venv``.
 """
@@ -21,11 +23,11 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
+from pyvrp_next_version import PYVRP_NEXT_VERSION
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 NEXT_VENV_DIR = PROJECT_DIR / ".venv-pyvrp-next"
-REQUIRED_VERSION_PREFIX = "0.14"
 PYVRP_REQUIREMENT = re.compile(r"^\s*pyvrp(?:\[|\s|[<>=!~@])", re.IGNORECASE)
 COMMIT_HASH = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -47,25 +49,6 @@ def _default_base_python() -> str:
     return base or sys.executable
 
 
-def _find_local_wheel() -> Path | None:
-    candidates: list[Path] = []
-    for directory in (PROJECT_DIR / "wheels", PROJECT_DIR):
-        if not directory.is_dir():
-            continue
-        candidates.extend(directory.glob("pyvrp-0.14*.whl"))
-        candidates.extend(directory.glob("PyVRP-0.14*.whl"))
-    files = sorted({candidate.resolve() for candidate in candidates if candidate.is_file()})
-    if not files:
-        return None
-    if len(files) > 1:
-        choices = "\n  - ".join(str(path) for path in files)
-        raise SystemExit(
-            "Several PyVRP 0.14 wheels were found; select one with --wheel:\n  - "
-            + choices
-        )
-    return files[0]
-
-
 def _write_filtered_requirements(destination: Path) -> None:
     source = PROJECT_DIR / "requirements.txt"
     if not source.is_file():
@@ -85,7 +68,7 @@ def _verify_environment(python_exe: Path) -> str:
     code = (
         "import importlib.metadata, pyvrp; "
         "v=importlib.metadata.version('pyvrp'); "
-        "assert v.startswith('0.14'), f'expected PyVRP 0.14.*, got {v}'; "
+        f"assert v == {PYVRP_NEXT_VERSION!r}, f'expected stable PyVRP {PYVRP_NEXT_VERSION}, got {{v}}'; "
         "print(v)"
     )
     completed = subprocess.run(
@@ -102,10 +85,10 @@ def _verify_environment(python_exe: Path) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Install an isolated experimental PyVRP 0.14 runtime."
+        description=f"Install isolated stable PyVRP {PYVRP_NEXT_VERSION} (pinned)."
     )
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--wheel", help="Path to a compatible PyVRP 0.14 Windows wheel.")
+    source.add_argument("--wheel", help=f"Optional local PyVRP {PYVRP_NEXT_VERSION} wheel.")
     source.add_argument(
         "--source-url",
         help="Explicit Git repository URL. Requires --source-commit.",
@@ -131,24 +114,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     wheel = Path(args.wheel).expanduser().resolve() if args.wheel else None
-    if wheel is None and not args.source_url:
-        wheel = _find_local_wheel()
-        if wheel is None:
-            raise SystemExit(
-                "No local PyVRP 0.14 wheel was found. Provide --wheel PATH. "
-                "For an explicit source build, provide both --source-url and "
-                "--source-commit; source builds on Windows may require an "
-                "external compiler toolchain."
-            )
+    if args.source_commit and not args.source_url:
+        raise SystemExit("--source-commit is valid only with --source-url")
 
     if wheel is not None:
-        if args.source_commit:
-            raise SystemExit("--source-commit is valid only with --source-url")
         if not wheel.is_file() or wheel.suffix.lower() != ".whl":
             raise SystemExit(f"Wheel does not exist or is not a .whl file: {wheel}")
+        if not wheel.name.lower().startswith(f"pyvrp-{PYVRP_NEXT_VERSION}-"):
+            raise SystemExit(f"Only stable PyVRP {PYVRP_NEXT_VERSION} wheels are supported: {wheel.name}")
         install_target = str(wheel)
         install_description = f"wheel {wheel.name}"
-    else:
+    elif args.source_url:
         commit = str(args.source_commit or "").strip()
         if not COMMIT_HASH.fullmatch(commit):
             raise SystemExit(
@@ -161,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
         git_url = source_url if source_url.startswith("git+") else f"git+{source_url}"
         install_target = f"{git_url}@{commit}"
         install_description = f"source commit {commit}"
+    else:
+        install_target = f"pyvrp=={PYVRP_NEXT_VERSION}"
+        install_description = f"PyPI release {PYVRP_NEXT_VERSION}"
 
     base_python = Path(args.python).expanduser().resolve()
     if not base_python.is_file():
@@ -187,12 +166,18 @@ def main(argv: list[str] | None = None) -> int:
             if filtered.read_text(encoding="utf-8").strip():
                 _run([str(python_exe), "-m", "pip", "install", "-r", str(filtered)])
 
-    print(f"Installing experimental PyVRP from {install_description}")
-    _run([str(python_exe), "-m", "pip", "install", "--upgrade", install_target])
+    print(f"Installing stable PyVRP from {install_description}")
+    install = [str(python_exe), "-m", "pip", "install", "--upgrade"]
+    if not args.source_url:
+        install.append("--only-binary=pyvrp")
+    # The extra requirement constrains metadata too, including explicit source
+    # builds/local wheels. A conflicting alpha is rejected by pip's resolver.
+    install.extend(dict.fromkeys([install_target, f"pyvrp=={PYVRP_NEXT_VERSION}"]))
+    _run(install)
     _run([str(python_exe), "-m", "pip", "install", "--upgrade", "pyinstaller"])
 
     version = _verify_environment(python_exe)
-    print(f"Experimental environment ready: PyVRP {version}")
+    print(f"Stable 0.14 environment ready: PyVRP {version}")
     print(f"Python: {python_exe}")
     print(
         "Next: run \""

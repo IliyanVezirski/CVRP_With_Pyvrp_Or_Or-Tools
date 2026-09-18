@@ -105,7 +105,7 @@ Batch файловете първо търсят `Bizant.exe`. Ако той л�
 |---|---|---|
 | `or_tools` | OR-Tools | основната `.venv`/главният EXE |
 | `pyvrp` | PyVRP 0.13 | основната `.venv`/главният EXE |
-| `pyvrp_experimental` | PyVRP 0.14 | `.venv-pyvrp-next` или отделен EXE worker |
+| `pyvrp_experimental` | стабилен PyVRP 0.14.0 | `.venv-pyvrp-next` или отделен EXE worker |
 | `vroom` | official pyvroom 1.15 | `.venv-vroom` или отделен EXE worker |
 | `vrp` | VRP-Rust/`vrp-cli` 1.24 | `.venv-vrp-rust` или отделен EXE worker |
 
@@ -116,13 +116,25 @@ Worker path настройките (`pyvrp_next_worker_path`, `vroom_worker_path
 
 ### 4.1. PyVRP 0.14
 
-Необходим е PyVRP 0.14 wheel, съвместим с Python и Windows архитектурата на
-`.venv-pyvrp-next`. Подготовка:
+Инсталира се точно стабилният `pyvrp==0.14.0` от PyPI, с wheel за Python и
+архитектурата на `.venv-pyvrp-next`. Alpha версията 0.14.0a0 вече не се допуска.
+Основната `.venv` с PyVRP 0.13 не се променя. Подготовка/обновяване:
 
 ```powershell
-.\.venv\Scripts\python.exe setup_pyvrp_next.py --wheel "D:\wheels\pyvrp-0.14.0a0-cp314-cp314-win_amd64.whl"
+.\.venv\Scripts\python.exe setup_pyvrp_next.py
 .\.venv-pyvrp-next\Scripts\python.exe pyvrp_next_worker.py --self-check
 ```
+
+За офлайн инсталация може да се подаде `--wheel` с локален **0.14.0** wheel.
+Версията е фиксирана в `pyvrp_next_version.py`; setup, worker, главната програма
+и build проверките използват една и съща стойност. `--self-check` проверява и
+импорта на адаптера, не само наличието на библиотеката.
+
+В GUI продължава да се избира **PyVRP 0.14**. Ключът `pyvrp_experimental` е
+запазен за съвместимост на съществуващите конфигурации и API заявки, но вече
+означава стабилния 0.14.0 backend. Настройките, формулите и ограниченията не се
+мигрират/нулират. Обновяването на source средата не подменя готови EXE файлове;
+за тях е необходим нов build на главната програма и worker-а.
 
 Самостоятелен build на worker-а:
 
@@ -646,7 +658,7 @@ config рестартирайте API server-а или използвайте We
 
 Rebuild-нете companion worker-а със съответния source код и фиксираната версия:
 
-- PyVRP `0.14.*`;
+- точно стабилен PyVRP `0.14.0` (не alpha/RC);
 - pyvroom `1.15.*`;
 - vrp-cli `1.24.*`.
 

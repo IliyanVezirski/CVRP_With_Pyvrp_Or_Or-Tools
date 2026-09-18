@@ -4,8 +4,10 @@
 """
 
 import tkinter as tk
+from service_time import SERVICE_FIELDS, service_settings, validate_service_settings, formula_seconds
 from tkinter import ttk, messagebox
 import copy
+from types import SimpleNamespace
 import sys
 import os
 import importlib
@@ -28,6 +30,8 @@ else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _base_dir)
 import config
+from display_units import volume_unit_label, validate_volume_unit_label, total_volume_unit_label, customer_volume_unit_label
+from map_display_settings import mandatory_customer_comment, validate_mandatory_customer_comment, validate_driver_volume_label
 from web_gui_auth import CredentialStore, CredentialStoreError, CredentialValidationError
 
 
@@ -420,6 +424,9 @@ class ConfigGUI:
         dependency_keys = (
             "input.input_source",
             "cvrp.solver_type",
+            "cvrp.customer_dropping_strategy",
+            "cvrp.enable_priority_dropping",
+            "cvrp.allow_customer_skipping",
             "routing.engine",
             "output.route_maps_upload_mode",
             "output.map_provider",
@@ -501,6 +508,24 @@ class ConfigGUI:
             self._set_control_enabled(key, tsp_windows_enabled)
 
         self._show_solver_fine_settings(current("cvrp.solver_type", "pyvrp"))
+        from customer_deferral import DEFERRAL_FIELDS, DEFERRAL_LABELS
+        selected = current("cvrp.customer_dropping_strategy", DEFERRAL_LABELS["legacy"])
+        geographic = selected in {"geographic", DEFERRAL_LABELS["geographic"]}
+        skipping = bool(current("cvrp.allow_customer_skipping", True))
+        priority = bool(current("cvrp.enable_priority_dropping", True))
+        for mode, panel in getattr(self, "deferral_panels", {}).items():
+            if (mode == "geographic") == geographic:
+                panel.grid()
+            else:
+                panel.grid_remove()
+        self._set_control_enabled("cvrp.customer_dropping_strategy", skipping)
+        self._set_control_enabled("cvrp.distance_penalty_disjunction", skipping and (geographic or not priority))
+        for field in DEFERRAL_FIELDS - {"customer_dropping_strategy"}:
+            self._set_control_enabled("cvrp." + field, skipping and geographic)
+        self._set_control_enabled("cvrp.enable_priority_dropping", skipping and not geographic)
+        for field in ("drop_volume_weight", "drop_closeness_weight",
+                      "min_customer_drop_penalty", "max_customer_drop_penalty"):
+            self._set_control_enabled("cvrp." + field, skipping and not geographic and priority)
 
     def _show_solver_fine_settings(self, solver_value=None):
         """Shows only the fine-tuning groups used by the selected solver."""
@@ -621,6 +646,43 @@ class ConfigGUI:
     def _validate_values(self, values):
         errors = []
         warnings = []
+        if "output.mandatory_customer_comment" in values:
+            try:
+                validate_mandatory_customer_comment(values["output.mandatory_customer_comment"])
+            except ValueError as exc:
+                errors.append(("output.mandatory_customer_comment", str(exc)))
+        for field in ("output.driver_total_volume_label", "output.driver_customer_volume_label"):
+            if field in values:
+                try:
+                    validate_driver_volume_label(values[field])
+                except ValueError as exc:
+                    errors.append((field, str(exc)))
+        if "output.volume_unit_label" in values:
+            try:
+                validate_volume_unit_label(values["output.volume_unit_label"])
+            except ValueError as exc:
+                errors.append(("output.volume_unit_label", str(exc)))
+
+        from copy import copy
+        from customer_deferral import DEFERRAL_FIELDS, DEFERRAL_LABELS, validate_deferral_config
+        proposed = copy(getattr(self, "cfg", config.get_config()).cvrp)
+        try:
+            for name in DEFERRAL_FIELDS | {"solver_type", "distance_penalty_disjunction"}:
+                if "cvrp." + name not in values:
+                    continue
+                value = values["cvrp." + name]
+                if name == "customer_dropping_strategy":
+                    value = {v: k for k, v in DEFERRAL_LABELS.items()}.get(value, value)
+                elif name == "solver_type":
+                    value = self.SOLVER_VALUES_BY_LABEL.get(value, value)
+                elif name == "drop_repair_max_ejections" or name == "distance_penalty_disjunction":
+                    value = int(value)
+                else:
+                    value = float(value)
+                setattr(proposed, name, value)
+            validate_deferral_config(proposed)
+        except (ValueError, TypeError) as exc:
+            errors.append(("cvrp.customer_dropping_strategy", str(exc)))
 
         def text_value(key, default=""):
             value = values.get(key, default)
@@ -642,6 +704,19 @@ class ConfigGUI:
             if maximum is not None and number > maximum:
                 errors.append((key, f"{label}: максималната стойност е {maximum}."))
             return number
+
+        if proposed.customer_dropping_strategy == "legacy" and self._parse_bool_value(
+            values.get("cvrp.enable_priority_dropping", proposed.enable_priority_dropping)
+        ):
+            import math
+            for name, label in (("drop_volume_weight", "Тежест обем"), ("drop_closeness_weight", "Тежест близост")):
+                weight = require_number("cvrp." + name, label, 0)
+                if weight is not None and not math.isfinite(weight):
+                    errors.append(("cvrp." + name, label + ": въведи крайно число."))
+            minimum = require_number("cvrp.min_customer_drop_penalty", "Минимална глоба", 1, integer=True)
+            maximum = require_number("cvrp.max_customer_drop_penalty", "Максимална глоба", 1, integer=True)
+            if minimum is not None and maximum is not None and maximum < minimum:
+                errors.append(("cvrp.max_customer_drop_penalty", "Максималната глоба трябва да е поне колкото минималната."))
 
         require_number("api.api_port", "API порт", 1, 65535, integer=True)
         require_number("input.json_timeout_seconds", "HTTP JSON timeout", 1, 3600, integer=True)
@@ -1100,12 +1175,30 @@ class ConfigGUI:
         widget.delete("1.0", "end")
         widget.insert("1.0", text.strip())
 
+    def _refresh_volume_unit_labels(self, *_args):
+        values = {}
+        for field in ("volume_unit_label", "driver_total_volume_label", "driver_customer_volume_label"):
+            holder = self.widgets.get("output." + field)
+            values[field] = holder.get() if holder is not None else getattr(self.cfg.output, field, "")
+        output = SimpleNamespace(**values)
+        for widget, prefix in getattr(self, "_quantity_labels", []):
+            if widget.winfo_exists():
+                unit = total_volume_unit_label(output, short=True) if prefix == "Капацитет" else customer_volume_unit_label(output, short=True)
+                widget.configure(text=f"{prefix} ({unit}):")
+
     def _add_field(self, parent, row, key, label, value, field_type="str", options=None, tooltip=""):
         parent.columnconfigure(1, weight=1)
         display_value = "" if value is None else str(value)
-        ttk.Label(parent, text=label, anchor="w", width=28, wraplength=230, style="Surface.TLabel").grid(
+        label_widget = ttk.Label(parent, text=label, anchor="w", width=28, wraplength=230, style="Surface.TLabel")
+        label_widget.grid(
             row=row, column=0, sticky="nw", padx=(8, 12), pady=6
         )
+
+        if key.endswith(".capacity") or key == "api.tsp_customer_quantity_field":
+            if not hasattr(self, "_quantity_labels"):
+                self._quantity_labels = []
+            self._quantity_labels.append((label_widget, "Капацитет" if key.endswith(".capacity") else "Количество"))
+            self._refresh_volume_unit_labels()
 
         if field_type == "bool":
             var = tk.BooleanVar(value=bool(value))
@@ -4693,7 +4786,7 @@ solver_type:
     Стабилният PyVRP 0.13.x (минимум 0.13.4) и основният качествен solver.
     Добър при повече време и различни seed-ове.
   pyvrp_experimental:
-    Изолиран PyVRP 0.14 sidecar за сравнение, без да заменя stable версията.
+    Изолиран стабилен PyVRP 0.14.0 sidecar, без да заменя отделния PyVRP 0.13.
     Изисква работещ companion worker; при липса връща грешка, освен ако fallback е разрешен.
   or_tools:
     Стабилен solver за сравнение и контрол.
@@ -5487,13 +5580,13 @@ setData не трябва да се пуска:
             self._add_field(vehicle_box, gr, f"{prefix}.count", "Брой:", v.count); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.fixed_cost", "Цена за използване:", getattr(v, "fixed_cost", 40000),
                             tooltip="Глоба за всеки използван бус. 40000 е приблизително като 40 км."); gr += 1
-            self._add_field(vehicle_box, gr, f"{prefix}.capacity", "Капацитет (ст.):", v.capacity); gr += 1
+            self._add_field(vehicle_box, gr, f"{prefix}.capacity", f"Капацитет ({total_volume_unit_label(self.cfg.output, short=True)}):", v.capacity); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.max_distance_km", "Макс. км:",
                             "" if v.max_distance_km is None else v.max_distance_km,
                             tooltip="Празно = без лимит. При повторни курсове лимитът е общ за целия ден."); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", v.max_time_hours,
                             tooltip="Общото време включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
-            self._add_field(vehicle_box, gr, f"{prefix}.service_time_minutes", "Обслужване (мин):", v.service_time_minutes); gr += 1
+            gr = self._add_service_time_fields(vehicle_box, gr, prefix, v)
             self._add_field(vehicle_box, gr, f"{prefix}.max_customers_per_day", "Макс. клиенти за деня:",
                              getattr(v, "max_customers_per_day", None) or getattr(v, "max_customers_per_route", None) or "",
                              tooltip="Общ лимит за всички курсове на физическия бус. Празно = без ограничение."); gr += 1
@@ -5746,7 +5839,7 @@ setData не трябва да се пуска:
             getattr(vehicle, "fixed_cost", 0),
             tooltip="Глоба за всеки използван бус. 0 = solver-ът може да използва буса свободно.",
         ); gr += 1
-        self._add_field(vehicle_box, gr, f"{prefix}.capacity", "Капацитет (ст.):", vehicle.capacity); gr += 1
+        self._add_field(vehicle_box, gr, f"{prefix}.capacity", f"Капацитет ({total_volume_unit_label(self.cfg.output, short=True)}):", vehicle.capacity); gr += 1
         self._add_field(
             vehicle_box,
             gr,
@@ -5757,7 +5850,7 @@ setData не трябва да се пуска:
         ); gr += 1
         self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", vehicle.max_time_hours,
                         tooltip="Включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
-        self._add_field(vehicle_box, gr, f"{prefix}.service_time_minutes", "Обслужване (мин):", vehicle.service_time_minutes); gr += 1
+        gr = self._add_service_time_fields(vehicle_box, gr, prefix, vehicle)
         self._add_field(
             vehicle_box,
             gr,
@@ -5931,8 +6024,8 @@ setData не трябва да се пуска:
 
         pyvrp_next, r = self._add_group(
             f,
-            "PyVRP 0.14 experimental sidecar",
-            "Стабилният PyVRP 0.13.x остава в приложението. Тези настройки се използват само при solver_type=pyvrp_experimental.",
+            "PyVRP 0.14.0 — стабилна версия",
+            "PyVRP 0.13.x остава отделна опция. Тези настройки са за стабилния 0.14.0 worker; конфигурационният ключ остава pyvrp_experimental.",
         )
         self._add_field(
             pyvrp_next,
@@ -6133,17 +6226,32 @@ setData не трябва да се пуска:
             "Когато всички заявки не могат да влязат в ограниченията, тези настройки управляват кои клиенти са по-лесни за оставяне за склад.",
         )
         self._add_field(dropping, r, "cvrp.allow_customer_skipping", "Позволи пропускане:", c.allow_customer_skipping, "bool"); r += 1
+        from customer_deferral import DEFERRAL_LABELS
+        self._add_field(dropping, r, "cvrp.customer_dropping_strategy", "Начин на пропускане:",
+                        DEFERRAL_LABELS.get(getattr(c, "customer_dropping_strategy", "legacy"), DEFERRAL_LABELS["legacy"]),
+                        "combo", list(DEFERRAL_LABELS.values()),
+                        tooltip="Географският приоритет е само за PyVRP 0.14 и използва пътната матрица до собствения склад. Обем и близост използва относителен обем и близост по права линия до най-близкото депо."); r += 1
         self._add_field(dropping, r, "cvrp.distance_penalty_disjunction", "Базова глоба:", c.distance_penalty_disjunction,
-                        tooltip="Използва се като fallback, когато приоритетното изхвърляне е изключено."); r += 1
-        self._add_field(dropping, r, "cvrp.enable_priority_dropping", "Приоритетно изхвърляне:", c.enable_priority_dropping, "bool"); r += 1
-        self._add_field(dropping, r, "cvrp.drop_volume_weight", "Тежест обем:", c.drop_volume_weight,
-                        tooltip="По-висока стойност пази по-малките заявки и прави големите по-лесни за пропускане."); r += 1
-        self._add_field(dropping, r, "cvrp.drop_closeness_weight", "Тежест близост:", c.drop_closeness_weight,
-                        tooltip="По-висока стойност прави близките до депото заявки по-лесни за пропускане."); r += 1
-        self._add_field(dropping, r, "cvrp.min_customer_drop_penalty", "Мин. глоба клиент:", c.min_customer_drop_penalty,
-                        tooltip="Най-лесните за пропускане клиенти получават тази защита."); r += 1
-        self._add_field(dropping, r, "cvrp.max_customer_drop_penalty", "Макс. глоба клиент:", c.max_customer_drop_penalty,
-                        tooltip="Най-защитените клиенти получават тази стойност."); r += 1
+                        tooltip="Основа на географската глоба. В режим Обем и близост се използва само при изключено правило за обем и близост — еднакво за всички клиенти."); r += 1
+        geographic_panel, gr = self._add_grid_group(dropping, r, "Географски приоритет — PyVRP 0.14",
+            "Глоба = база × (1 + сила × (пътни км до собствения склад / мащаб)²). Обемът и границите на другия режим не участват. Това не е прогноза за утрешния маршрут.")
+        for name, label, default, tip in (
+            ("drop_geo_reference_km", "Мащаб разстояние (км):", 20.0, "По-малък мащаб = по-силен приоритет на далечните клиенти. Пътно разстояние от склада, не прогноза за утре."),
+            ("drop_geo_strength", "Сила на приоритета:", 1.0, "0 = еднаква базова глоба; 1 = базова × (1 + (км/мащаб)²). Обемът не намалява приоритета."),
+            ("drop_repair_max_ejections", "Макс. групова замяна:", 6, "1–12 клиента в една пробвана замяна. Не е фиксиран брой близки клиенти или лимит на всички необслужени."),
+            ("drop_repair_budget_fraction", "Дял от времето:", 0.15, "0.15 = до 15% от същия времеви лимит за групови замени. Не добавя отделен рън."),
+        ):
+            self._add_field(geographic_panel, gr, "cvrp." + name, label, getattr(c, name, default), tooltip=tip); gr += 1
+        priority_panel, pr = self._add_grid_group(dropping, r, "Обем и близост до депо",
+            "По-големият обем и по-голямата близост намаляват глобата за пропускане. Глобата е между минимум и максимум, без добавяне на базовата глоба. При изключено правило всички получават базовата глоба.")
+        self.deferral_panels = {"geographic": geographic_panel, "legacy": priority_panel}
+        self._add_field(priority_panel, pr, "cvrp.enable_priority_dropping", "Правило обем и близост:", c.enable_priority_dropping, "bool"); pr += 1
+        self._add_field(priority_panel, pr, "cvrp.drop_volume_weight", "Тежест обем:", c.drop_volume_weight,
+                        tooltip="По-висока стойност пази по-малките заявки и прави големите по-лесни за пропускане. Тежестите се нормализират автоматично."); pr += 1
+        self._add_field(priority_panel, pr, "cvrp.drop_closeness_weight", "Тежест близост:", c.drop_closeness_weight,
+                        tooltip="По-висока стойност прави близките до най-близкото депо заявки по-лесни за пропускане. Разстояние по права линия."); pr += 1
+        self._add_field(priority_panel, pr, "cvrp.min_customer_drop_penalty", "Мин. глоба клиент:", c.min_customer_drop_penalty); pr += 1
+        self._add_field(priority_panel, pr, "cvrp.max_customer_drop_penalty", "Макс. глоба клиент:", c.max_customer_drop_penalty); pr += 1
 
         parallel, r = self._add_group(
             f,
@@ -6666,6 +6774,22 @@ setData не трябва да се пуска:
         out = self.cfg.output
         r = 0
 
+        terminology, gr = self._add_grid_group(
+            f, r, "Наименование на количеството",
+            "Общ надпис в интерфейса, картите и отчетите. Не променя капацитетите или входните данни.",
+        ); r += 1
+        self._add_field(terminology, gr, "output.volume_unit_label", "Общ надпис по подразбиране:",
+                        volume_unit_label(out), tooltip="Например: стекове, кашони, палети, оборот, лв. До 40 знака."); gr += 1
+        self.widgets["output.volume_unit_label"].trace_add("write", self._refresh_volume_unit_labels)
+        self._add_field(terminology, gr, "output.driver_total_volume_label", "За общите количества:",
+                        getattr(out, "driver_total_volume_label", ""),
+                        tooltip="За капацитети, маршрути и общи количества навсякъде. Празно = общият надпис. До 40 знака."); gr += 1
+        self._add_field(terminology, gr, "output.driver_customer_volume_label", "При клиент и заявка:",
+                        getattr(out, "driver_customer_volume_label", ""),
+                        tooltip="За отделни клиенти и заявки навсякъде. Празно = общият надпис. До 40 знака."); gr += 1
+        for field in ("driver_total_volume_label", "driver_customer_volume_label"):
+            self.widgets["output." + field].trace_add("write", self._refresh_volume_unit_labels)
+
         maps, gr = self._add_grid_group(
             f,
             r,
@@ -6673,6 +6797,12 @@ setData не трябва да се пуска:
             "Интерактивната карта и отделните HTML маршрути за проверка на решението.",
         ); r += 1
         self._add_field(maps, gr, "output.enable_interactive_map", "Генерирай карта:", out.enable_interactive_map, "bool"); gr += 1
+        self._add_field(maps, gr, "output.mobile_driver_panel", "Мобилен панел за шофьора:",
+                        getattr(out, "mobile_driver_panel", False), "bool",
+                        tooltip="Алтернативен изглед: компактни клиенти, един разгънат клиент и голяма навигация. На телефон панелът е отдолу."); gr += 1
+        self._add_field(maps, gr, "output.mandatory_customer_comment", "Текст за задължителен клиент:",
+                        mandatory_customer_comment(out),
+                        tooltip="Червен надпис в индивидуалните карти. До 200 знака. Не заменя коментара за доставка и не променя задължителността."); gr += 1
         self._add_field(maps, gr, "output.map_output_file", "Файл карта:", out.map_output_file); gr += 1
         self._add_field(maps, gr, "output.routes_output_dir", "HTML маршрути:", out.routes_output_dir,
                          tooltip="Отделни HTML файлове за всеки маршрут"); gr += 1
@@ -6718,6 +6848,8 @@ setData не трябва да се пуска:
             "Основните файлове за работа и проверка след run.",
         ); r += 1
         self._add_field(excel, gr, "output.enable_excel_output", "Генерирай Excel:", getattr(out, "enable_excel_output", True), "bool"); gr += 1
+        self._add_field(excel, gr, "output.enable_routing_quality_report", "Отчет за приблизителни отсечки:", getattr(out, "enable_routing_quality_report", False), "bool",
+                        tooltip="Допълнителен лист в Excel при приблизителни данни или неизвестен произход. Изисква включен Excel отчет."); gr += 1
         self._add_field(excel, gr, "output.excel_output_dir", "Директория:", out.excel_output_dir); gr += 1
         self._add_field(excel, gr, "output.routes_excel_file", "Маршрути:", out.routes_excel_file); gr += 1
         self._add_field(excel, gr, "output.warehouse_excel_file", "Склад:", out.warehouse_excel_file); gr += 1
@@ -7017,7 +7149,7 @@ setData не трябва да се пуска:
                         tooltip="Пример: document,order,DocNo."); r += 1
         self._add_field(tsp_fields, r, "api.tsp_customer_gps_field", "GPS координати:", getattr(api, "tsp_customer_gps_field", "gps"),
                         tooltip="Пример: gps,GPS,coordinates,location."); r += 1
-        self._add_field(tsp_fields, r, "api.tsp_customer_quantity_field", "Количество/стекове:", getattr(api, "tsp_customer_quantity_field", "quantity"),
+        self._add_field(tsp_fields, r, "api.tsp_customer_quantity_field", f"Количество ({customer_volume_unit_label(self.cfg.output)}):", getattr(api, "tsp_customer_quantity_field", "quantity"),
                         tooltip="Пример: quantity,Volume,stacks."); r += 1
         self._add_field(tsp_fields, r, "api.tsp_customer_turnover_field", "Оборот:", getattr(api, "tsp_customer_turnover_field", "turnover"),
                         tooltip="Пример: turnover,amount,oborot."); r += 1
@@ -7736,6 +7868,11 @@ TSP имената на полетата се настройват от GUI:
             "cvrp.allow_customer_skipping": ("allow_customer_skipping", "bool"),
             "cvrp.distance_penalty_disjunction": ("distance_penalty_disjunction", "int"),
             "cvrp.enable_priority_dropping": ("enable_priority_dropping", "bool"),
+            "cvrp.customer_dropping_strategy": ("customer_dropping_strategy", "str"),
+            "cvrp.drop_geo_reference_km": ("drop_geo_reference_km", "float"),
+            "cvrp.drop_geo_strength": ("drop_geo_strength", "float"),
+            "cvrp.drop_repair_max_ejections": ("drop_repair_max_ejections", "int"),
+            "cvrp.drop_repair_budget_fraction": ("drop_repair_budget_fraction", "float"),
             "cvrp.drop_volume_weight": ("drop_volume_weight", "float"),
             "cvrp.drop_closeness_weight": ("drop_closeness_weight", "float"),
             "cvrp.min_customer_drop_penalty": ("min_customer_drop_penalty", "int"),
@@ -7805,6 +7942,11 @@ TSP имената на полетата се настройват от GUI:
             "locations.city_traffic_radius_km": ("city_traffic_radius_km", "float"),
             "locations.city_traffic_duration_multiplier": ("city_traffic_duration_multiplier", "float"),
             # Output
+            "output.volume_unit_label": ("volume_unit_label", "str"),
+            "output.mandatory_customer_comment": ("mandatory_customer_comment", "str"),
+            "output.mobile_driver_panel": ("mobile_driver_panel", "bool"),
+            "output.driver_total_volume_label": ("driver_total_volume_label", "str"),
+            "output.driver_customer_volume_label": ("driver_customer_volume_label", "str"),
             "output.enable_interactive_map": ("enable_interactive_map", "bool"),
             "output.map_output_file": ("map_output_file", "path"),
             "output.routes_output_dir": ("routes_output_dir", "path"),
@@ -7920,6 +8062,9 @@ TSP имената на полетата се настройват от GUI:
             if gui_key not in values:
                 continue
             raw_val = values[gui_key]
+            if gui_key == "cvrp.customer_dropping_strategy":
+                from customer_deferral import DEFERRAL_LABELS
+                raw_val = {v: k for k, v in DEFERRAL_LABELS.items()}.get(raw_val, raw_val)
             content = self._replace_field_value(content, field_name, raw_val, ftype)
 
         scoped_field_map = {
@@ -7940,6 +8085,30 @@ TSP имената на полетата се настройват от GUI:
             if gui_key not in values:
                 continue
             content = self._replace_scoped_field_value(content, class_name, field_name, values[gui_key], ftype)
+
+        if "output.volume_unit_label" in values:
+            from cvrp_api_server import _replace_class_field_literal
+            content = _replace_class_field_literal(
+                content, "OutputConfig", "volume_unit_label",
+                validate_volume_unit_label(values["output.volume_unit_label"]),
+            )
+        if "output.mandatory_customer_comment" in values:
+            from cvrp_api_server import _replace_class_field_literal
+            content = _replace_class_field_literal(
+                content, "OutputConfig", "mandatory_customer_comment",
+                validate_mandatory_customer_comment(values["output.mandatory_customer_comment"]),
+            )
+        if "output.mobile_driver_panel" in values:
+            from cvrp_api_server import _replace_class_field_literal
+            content = _replace_class_field_literal(content, "OutputConfig", "mobile_driver_panel", values["output.mobile_driver_panel"])
+        if "output.enable_routing_quality_report" in values:
+            from cvrp_api_server import _replace_class_field_literal
+            content = _replace_class_field_literal(content, "OutputConfig", "enable_routing_quality_report", values["output.enable_routing_quality_report"])
+        for field in ("driver_total_volume_label", "driver_customer_volume_label"):
+            if "output." + field in values:
+                from cvrp_api_server import _replace_class_field_literal
+                content = _replace_class_field_literal(content, "OutputConfig", field,
+                                                       validate_driver_volume_label(values["output." + field]))
 
         # ─── List fields (parallel strategies) ───
         list_fields = {
@@ -8305,6 +8474,48 @@ TSP имената на полетата се настройват от GUI:
             return self.cfg.locations.depot_location
         return (float(coords[0]), float(coords[1]))
 
+    def _add_service_time_fields(self, parent, row, prefix, vehicle):
+        from types import SimpleNamespace
+        box = ttk.Frame(parent, style="Surface.TFrame")
+        box.grid(row=row, column=0, columnspan=2, sticky="ew")
+        settings = service_settings(vehicle)
+        self._add_field(box, 0, f"{prefix}.service_time_mode", "Обслужване:",
+                        "Формула" if settings["service_time_mode"] == "formula" else "Фиксирано",
+                        "combo", options=["Фиксирано", "Формула"])
+        self._add_field(box, 1, f"{prefix}.service_time_minutes", "Фиксирано (мин):", vehicle.service_time_minutes)
+        for index, (key, label) in enumerate((
+            ("service_base_seconds", "Начално време (сек):"),
+            ("service_seconds_per_unit", "Секунди:"),
+            ("service_quantity_units", "За единици количество:"),
+            ("service_max_seconds", "Максимално време (сек):"),
+        ), start=2):
+            self._add_field(box, index, f"{prefix}.{key}", label, settings[key])
+        preview = ttk.Label(box, text="", style="Surface.TLabel", wraplength=420)
+        preview.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        widgets_by_row = {index: list(box.grid_slaves(row=index)) for index in range(1, 7)}
+
+        def refresh(*_):
+            formula = self.widgets[f"{prefix}.service_time_mode"].get() == "Формула"
+            for index, widgets in widgets_by_row.items():
+                for widget in widgets:
+                    widget.grid() if (formula if index >= 2 else not formula) else widget.grid_remove()
+            if formula:
+                try:
+                    cfg = SimpleNamespace(**{
+                        key: ("formula" if key == "service_time_mode" else
+                              float(str(self.widgets[f"{prefix}.{key}"].get()).replace(",", ".")))
+                        for key in SERVICE_FIELDS
+                    })
+                    preview.configure(text="Пример: " + " · ".join(
+                        f"{quantity} единици → {formula_seconds(quantity, cfg)} сек"
+                        for quantity in (10, 100, 1000)))
+                except (ValueError, TypeError, ArithmeticError):
+                    preview.configure(text="Въведи валидни стойности. Броят единици трябва да е над 0.")
+        for key in SERVICE_FIELDS:
+            self.widgets[f"{prefix}.{key}"].trace_add("write", refresh)
+        refresh()
+        return row + 1
+
     def _vehicle_config_from_values(self, values, prefix):
         vehicle_type_value = str(values.get(f"{prefix}.vehicle_type", "internal_bus")).strip()
         try:
@@ -8318,7 +8529,21 @@ TSP имената на полетата се настройват от GUI:
             values.get(f"{prefix}.reload_depot_name", ""),
             values,
         )
+        try:
+            previous_service = service_settings(self.cfg.vehicles[int(prefix.rsplit(".", 1)[-1])])
+        except (IndexError, ValueError, AttributeError):
+            previous_service = SERVICE_FIELDS
+        service_values = {
+            key: (str(values.get(f"{prefix}.{key}", default)) if key == "service_time_mode"
+                  else float(str(values.get(f"{prefix}.{key}", default)).replace(",", ".")))
+            for key, default in previous_service.items()
+        }
+        service_values["service_time_mode"] = {"Фиксирано": "fixed", "Формула": "formula"}.get(
+            service_values["service_time_mode"], service_values["service_time_mode"])
+        from types import SimpleNamespace
+        validate_service_settings(SimpleNamespace(**service_values))
         return config.VehicleConfig(
+            **service_values,
             vehicle_type=vehicle_type,
             capacity=self._parse_int_value(values.get(f"{prefix}.capacity", 320), 320),
             count=max(0, self._parse_int_value(values.get(f"{prefix}.count", 1), 1)),
@@ -8408,6 +8633,7 @@ TSP имената на полетата се настройват от GUI:
             f"                max_distance_km={self._optional_int_literal(vehicle.max_distance_km)},",
             f"                max_time_hours={int(vehicle.max_time_hours)},",
             f"                service_time_minutes={int(vehicle.service_time_minutes)},",
+            *(f"                {key}={value!r}," for key, value in service_settings(vehicle).items()),
             f"                enabled={'True' if vehicle.enabled else 'False'},",
             f"                max_customers_per_route={self._optional_int_literal(vehicle.max_customers_per_route)},",
             f"                max_customers_per_day={self._optional_int_literal(getattr(vehicle, 'max_customers_per_day', None))},",
@@ -8538,6 +8764,16 @@ TSP имената на полетата се настройват от GUI:
                     continue
                 block = self._replace_vehicle_tuple_assignment(block, "reload_location", new_val)
 
+        if any(f"{prefix}.{key}" in values for key in SERVICE_FIELDS):
+            updated_vehicle = self._vehicle_config_from_values(values, prefix)
+            for key, value in service_settings(updated_vehicle).items():
+                literal = repr(value)
+                pattern = rf"(\b{key}\s*=\s*)[^,\n]+"
+                if re.search(pattern, block):
+                    block = re.sub(pattern, lambda match: match.group(1) + literal, block, count=1)
+                else:
+                    block = re.sub(r"(\n\s*count\s*=\s*[^,\n]+,)",
+                                   lambda match: match.group(1) + f"\n                {key}={literal},", block, count=1)
         content = content[:block_start] + block + content[block_end:]
         return content
 

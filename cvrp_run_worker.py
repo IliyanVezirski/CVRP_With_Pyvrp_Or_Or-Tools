@@ -46,9 +46,10 @@ def run_worker_from_files(input_path: str, output_path: str) -> int:
 
         # Imported lazily to avoid a circular import while cvrp_api_server is
         # launching this worker from its own process.
-        from cvrp_api_server import _build_web_run_config_override
+        from cvrp_api_server import _build_web_run_config_override, _prepare_web_run_dates
 
         config_override, applied_settings, ignored_settings = _build_web_run_config_override(worker_request)
+        _prepare_web_run_dates(config_override)
         result = run_optimization(config_override=config_override)
         if not isinstance(result, dict):
             raise TypeError("run_optimization must return a JSON object")
