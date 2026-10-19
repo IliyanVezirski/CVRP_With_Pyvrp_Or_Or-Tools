@@ -37,6 +37,7 @@ from input_handler import (
     format_time_windows_minutes,
     time_windows_to_seconds,
     is_mandatory_customer,
+    customer_has_missing_gps,
 )
 from osrm_client import get_distance_matrix_from_central_cache
 from vehicle_numbering import (
@@ -45,6 +46,7 @@ from vehicle_numbering import (
     is_multi_trip_route,
     order_routes_for_output,
     route_identifier,
+    route_output_number,
     route_trip_number,
     route_vehicle_key,
 )
@@ -1587,9 +1589,10 @@ class InteractiveMapGenerator:
         bus_number = _format_output_bus_number(
             self.config, route_number - 1, route, all_routes
         )
+        display_number = route_output_number(self.config, route_number - 1, route, all_routes)
         lines = [
             "CVRP_ROUTE_DELIVERY_ORDER",
-            f"route_number={_html_comment_safe(route_number)}",
+            f"route_number={_html_comment_safe(display_number)}",
             f"bus_id={_html_comment_safe(bus_number)}",
             f"vehicle={_html_comment_safe(_route_vehicle_name(route))}",
             "delivery_order | customer_id | customer_name | document | delivery_comment",
@@ -1940,6 +1943,8 @@ class InteractiveMapGenerator:
                 if route_numbers and route_idx < len(route_numbers)
                 else start_number + route_idx
             )
+            route_index = route_number - 1
+            route_number = route_output_number(self.config, route_index, route, numbering_routes)
             vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
                 "color": "gray",
                 "icon": "circle",
@@ -1963,11 +1968,11 @@ class InteractiveMapGenerator:
                 else display_vehicle_name
             )
             bus_number = _format_output_bus_number(
-                self.config, route_number - 1, route, numbering_routes
+                self.config, route_index, route, numbering_routes
             )
             # Colours still group courses of one physical vehicle, while the
             # public output number remains unique per course.
-            physical_color_key = route_vehicle_key(route, route_number - 1)
+            physical_color_key = route_vehicle_key(route, route_index)
             if physical_color_key not in bus_colors:
                 bus_colors[physical_color_key] = BUS_COLORS[len(bus_colors) % len(BUS_COLORS)]
             bus_color = bus_colors[physical_color_key]
@@ -2099,7 +2104,7 @@ class InteractiveMapGenerator:
                 "googleMissingCoords": len(route.customers) - len(markers),
             }
             if stable_route_id:
-                route_payload["vehicleKey"] = route_vehicle_key(route, route_number - 1)
+                route_payload["vehicleKey"] = route_vehicle_key(route, route_index)
                 route_payload["routeId"] = stable_route_id
             google_routes.append(route_payload)
         return google_routes
@@ -2191,7 +2196,10 @@ class InteractiveMapGenerator:
                 show_bus_ids=single_route_number is not None or course_filter,
                 route_numbers=route_numbers,
             ),
-            "singleRouteNumber": single_route_number,
+            "singleRouteNumber": (
+                route_output_number(self.config, single_route_number - 1, routes[0], all_routes or routes)
+                if single_route_number is not None and routes else single_route_number
+            ),
             "courseFilter": course_filter,
             "unserved": unserved_data,
             "totals": {
@@ -3652,6 +3660,8 @@ class InteractiveMapGenerator:
                 if route_numbers and route_idx < len(route_numbers)
                 else route_idx + 1
             )
+            route_index = route_number - 1
+            route_number = route_output_number(self.config, route_index, route, numbering_routes)
             vehicle_settings = VEHICLE_SETTINGS.get(route.vehicle_type.value, {
                 'color': 'gray', 
                 'icon': 'circle',
@@ -3671,7 +3681,7 @@ class InteractiveMapGenerator:
             )
             popup_route_title_with_icon = f"🚌 {popup_route_title}"
             bus_number = _format_output_bus_number(
-                self.config, route_number - 1, route, numbering_routes
+                self.config, route_index, route, numbering_routes
             )
             stable_route_id = (
                 _map_route_identifier(route, route_number, numbering_routes)
@@ -3680,7 +3690,7 @@ class InteractiveMapGenerator:
             )
             
             # Всеки автобус получава уникален цвят
-            physical_color_key = route_vehicle_key(route, route_number - 1)
+            physical_color_key = route_vehicle_key(route, route_index)
             if physical_color_key not in physical_colors:
                 physical_colors[physical_color_key] = BUS_COLORS[len(physical_colors) % len(BUS_COLORS)]
             bus_color = physical_colors[physical_color_key]
@@ -5357,6 +5367,7 @@ class InteractiveMapGenerator:
         all_routes: Optional[List[Route]] = None,
     ) -> folium.Map:
         """Създава интерактивна карта за един отделен маршрут"""
+        display_number = route_output_number(self.config, route_number - 1, route, all_routes)
         course_suffix = _route_course_suffix(route, all_routes)
         logger.info(f"Създавам карта за маршрут {route_number}{course_suffix}")
 
@@ -5378,7 +5389,7 @@ class InteractiveMapGenerator:
 
         if self._use_google_maps():
             route_document = self._build_google_html(
-                f"Маршрут {route_number}{course_suffix}",
+                f"Маршрут {display_number}{course_suffix}",
                 center,
                 [route],
                 list(dict.fromkeys([route_depot, route_end])),
@@ -5502,7 +5513,7 @@ class InteractiveMapGenerator:
                 popup_text = f"""
                 <div style="font-family: Arial, sans-serif;">
                     <h4 style="margin: 0; color: {bus_color};">
-                        Автобус {route_number} - {display_vehicle_name}
+                        Автобус {display_number} - {display_vehicle_name}
                     </h4>
                     <hr style="margin: 5px 0;">
                     <b>Клиент:</b> {customer.name}<br>
@@ -5587,11 +5598,11 @@ class InteractiveMapGenerator:
                 self._add_direction_arrows(polyline, bus_layer, bus_color)
 
         bus_layer.add_to(route_map)
-        self._add_single_route_customer_control(route_map, route, route_number, bus_color, marker_entries)
+        self._add_single_route_customer_control(route_map, route, display_number, bus_color, marker_entries)
         if getattr(self.config, "mobile_driver_panel", False):
             route_map.add_child(MobileDriverPanel())
         else:
-            self._add_google_route_segments_control(route_map, route, route_number, bus_color, route_depot)
+            self._add_google_route_segments_control(route_map, route, display_number, bus_color, route_depot)
         route_end_time_text = self._route_end_time_text(route)
 
         # Легенда с информация за маршрута
@@ -5602,7 +5613,7 @@ class InteractiveMapGenerator:
                     font-size:14px; padding: 10px; border-radius: 5px;
                     box-shadow: 0 0 15px rgba(0,0,0,0.2);">
         <h4 style="margin-top:0; margin-bottom:10px; text-align: center;">
-            \U0001f68c Маршрут {route_number}{course_suffix} - {vehicle_name}
+            \U0001f68c Маршрут {display_number}{course_suffix} - {vehicle_name}
         </h4>
         <p style="margin: 3px 0; font-size: 12px;">\U0001f4ca Клиенти: {len(route.customers)}</p>
         <p style="margin: 3px 0; font-size: 12px;">ID бус: {html.escape(str(bus_number))}</p>
@@ -5649,8 +5660,9 @@ class InteractiveMapGenerator:
 class ExcelExporter:
     """Експортър на Excel файлове"""
     
-    def __init__(self, config: OutputConfig):
+    def __init__(self, config: OutputConfig, set_data_config=None):
         self.config = config
+        self.set_data_config = set_data_config
         self.run_date = str(
             getattr(config, "_api_run_date_stamp", "")
             or datetime.now().strftime("%Y-%m-%d")
@@ -5927,7 +5939,7 @@ class ExcelExporter:
                 j = entry["index"]
                 data = [
                     self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
-                    i + 1,  # Номер маршрут
+                    route_output_number(self.config, i, route, solution.routes),  # Номер маршрут
                     vehicle_name,  # Превозно средство
                     j,  # Ред в маршрута
                     self._format_movement_direction(entry["previous_stop_name"], customer.name),
@@ -5974,13 +5986,62 @@ class ExcelExporter:
             ws.column_dimensions[column_letter].width = adjusted_width
         self._prepare_report_table(ws)
     
+    def _unserved_report_records(self, customers, include_coordinates=False):
+        from types import SimpleNamespace
+        from setdata_client import build_missing_gps_report_records, build_excluded_report_records
+        report_config = (SimpleNamespace(set_data=self.set_data_config)
+                         if self.set_data_config is not None else get_config())
+        quantity_header = f"Обем ({customer_volume_unit_label(self.config, short=True)})"
+        missing = [c for c in customers if customer_has_missing_gps(c)]
+        has_excluded = any(getattr(c, "manually_excluded", False) for c in customers)
+        excluded = [c for c in customers if getattr(c, "manually_excluded", False) and not customer_has_missing_gps(c)]
+        extra_keys = ("Номер поръчка", "IdPlasDoc", "Коментар", "Склад", "Направление", "Буква", "DoneFlag")
+        records = []
+        for customer in customers:
+            if customer_has_missing_gps(customer) or getattr(customer, "manually_excluded", False):
+                continue
+            record = {"ID": customer.id, "Име": customer.name, quantity_header: customer.volume,
+                      "GPS координати": customer.original_gps_data}
+            if include_coordinates:
+                record.update(Latitude=customer.coordinates[0] if customer.coordinates else "",
+                              Longitude=customer.coordinates[1] if customer.coordinates else "")
+            if missing or has_excluded:
+                record.update({key: "" for key in extra_keys})
+                record["Номер поръчка"] = customer.document
+                record["Коментар"] = getattr(customer, "delivery_comment", "")
+            records.append(record)
+        if excluded:
+            excluded_records = build_excluded_report_records(
+                [c for c in customers if not customer_has_missing_gps(c)],
+                report_config,
+            )
+            for item in excluded_records:
+                record = {"ID": item["ID"], "Име": item["Име"], quantity_header: item["Обем"],
+                          "GPS координати": item["GPS координати"]}
+                if include_coordinates:
+                    record.update(Latitude=item["Latitude"], Longitude=item["Longitude"])
+                record.update({key: item[key] for key in extra_keys})
+                records.append(record)
+        if missing:
+            missing_records = build_missing_gps_report_records(
+                missing, report_config,
+            )
+            for item in missing_records:
+                record = {"ID": item["ID"], "Име": item["Име"], quantity_header: item["Обем"], "GPS координати": ""}
+                if include_coordinates:
+                    record.update(Latitude="", Longitude="")
+                record.update({key: item[key] for key in extra_keys})
+                if any(str(c.id) == str(item["ID"]) and getattr(c, "manually_excluded", False) for c in missing):
+                    record["Коментар"] += "; Ръчно изключен от маршрутите"
+                records.append(record)
+        return records
+
     def _create_unserved_sheet(self, wb, warehouse_customers: List[Customer]):
         """Създава sheet с необслужените клиенти"""
         ws = wb.create_sheet("Необслужени клиенти")
         
-        headers = [
-            'ID', 'Име', f'Обем ({customer_volume_unit_label(self.config, short=True)})', 'GPS координати'
-        ]
+        records = self._unserved_report_records(warehouse_customers)
+        headers = list(records[0]) if records else ['ID', 'Име', f'Обем ({customer_volume_unit_label(self.config, short=True)})', 'GPS координати']
         
         # Стилове за заглавния ред
         header_font = Font(bold=True, color="FFFFFF")
@@ -5997,13 +6058,8 @@ class ExcelExporter:
         # Данни
         row = 2
         
-        for customer in warehouse_customers:
-            data = [
-                customer.id,
-                customer.name,
-                customer.volume,
-                customer.original_gps_data
-            ]
+        for record in records:
+            data = [record[header] for header in headers]
             
             for col, value in enumerate(data, 1):
                 self._write_report_value(ws, row, col, value)
@@ -6212,7 +6268,7 @@ class ExcelExporter:
             
             data = [
                 self._format_report_bus_number(i, route, solution.routes),  # Маршрут / номер бус
-                i + 1,  # Номер маршрут
+                route_output_number(self.config, i, route, solution.routes),  # Номер маршрут
                 vehicle_name,  # Тип бус
                 len(route.customers),  # Брой клиенти
                 route.total_volume,  # Общ обем
@@ -6422,19 +6478,9 @@ class ExcelExporter:
         file_path = _append_run_date_to_filename(file_path, self.run_date)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
-        data = []
-        for customer in warehouse_customers:
-            data.append({
-                'ID': customer.id,
-                'Име': customer.name,
-                f'Обем ({customer_volume_unit_label(self.config, short=True)})': customer.volume,
-                'GPS координати': customer.original_gps_data,
-                'Latitude': customer.coordinates[0] if customer.coordinates else '',
-                'Longitude': customer.coordinates[1] if customer.coordinates else ''
-            })
-        
+        data = self._unserved_report_records(warehouse_customers, include_coordinates=True)
         df = pd.DataFrame(data)
-        df.to_excel(file_path, index=False)
+        df.to_excel(file_path, index=False, sheet_name="Необслужени клиенти")
         self._apply_decimal_format_to_excel_file(file_path, [f"Обем ({customer_volume_unit_label(self.config, short=True)})"])
         
         logger.info(f"Складови заявки експортирани в {file_path}")
@@ -6453,7 +6499,7 @@ class ExcelExporter:
             for j, customer in enumerate(route.customers):
                 data.append({
                     'ID бус': self._format_report_bus_number(i, route, solution.routes),
-                    'Маршрут': i + 1,
+                    'Маршрут': route_output_number(self.config, i, route, solution.routes),
                     'Превозно средство': vehicle_name,
                     'Ред в маршрута': j + 1,
                     'Посока на движение': self._format_movement_direction(previous_stop_name, customer.name),
@@ -6505,7 +6551,7 @@ class ExcelExporter:
                 for entry in schedule_entries:
                     customer = entry["customer"]
                     row = [
-                        i + 1,
+                        route_output_number(self.config, i, route, solution.routes),
                         vehicle_name,
                         entry["index"],
                         self._format_movement_direction(entry["previous_stop_name"], customer.name),
@@ -6599,7 +6645,7 @@ class ChartGenerator:
             vc = _vehicle_config_for_route(route) or self._get_vehicle_config(route.vehicle_type)
             cap = vc.capacity if vc else 1
             usage = (route.total_volume / cap * 100) if cap > 0 else 0
-            labels.append(f"М{i+1}")
+            labels.append(f"М{route_output_number(self.config, i, route, solution.routes)}")
             usages.append(usage)
 
         colors = [BUS_COLORS[i % len(BUS_COLORS)] for i in range(len(labels))]
@@ -6651,7 +6697,8 @@ class ChartGenerator:
             return None
 
         n = len(solution.routes)
-        labels = [f"М{i+1}" for i in range(n)]
+        labels = [f"М{route_output_number(self.config, i, route, solution.routes)}"
+                  for i, route in enumerate(solution.routes)]
         distances = [r.total_distance_km for r in solution.routes]
         times = [r.total_time_minutes for r in solution.routes]
         volumes = [r.total_volume for r in solution.routes]
@@ -6712,7 +6759,7 @@ class ChartGenerator:
         for i, route in enumerate(solution.routes):
             vols = [c.volume for c in route.customers]
             all_volumes.extend(vols)
-            route_labels.append(f"М{i+1}")
+            route_labels.append(f"М{route_output_number(self.config, i, route, solution.routes)}")
             route_volumes.append(vols)
 
         if not all_volumes:

@@ -35,7 +35,7 @@ from config import (
     CVRP_SOLVER_TYPES,
     PYVRP_SOLVER_TYPES,
 )
-from input_handler import InputHandler, InputData, MandatoryCustomerError, is_mandatory_customer
+from input_handler import InputHandler, InputData, MandatoryCustomerError, is_mandatory_customer, customer_has_missing_gps
 from warehouse_manager import WarehouseManager, WarehouseAllocation
 from cvrp_solver import CVRPSolver, CVRPSolution
 from pyvrp_solver import solve_cvrp_pyvrp
@@ -275,7 +275,8 @@ def move_customers_without_coordinates_to_unserved(
     if not missing_coordinates:
         return allocation
 
-    mandatory_missing = [customer for customer in missing_coordinates if is_mandatory_customer(customer)]
+    mandatory_missing = [customer for customer in missing_coordinates
+                         if is_mandatory_customer(customer) and not customer_has_missing_gps(customer)]
     if mandatory_missing:
         preview = ", ".join(
             str(getattr(customer, "id", "") or getattr(customer, "name", ""))
@@ -853,6 +854,32 @@ def _solution_to_api_response(
     return response
 
 
+def _finish_optimization(solution, input_data, allocation, config, start_time,
+                         active_vehicle_configs, distance_matrix=None):
+    """Export both ordinary solutions and runs containing only absent-GPS orders."""
+    execution_time = time.time() - start_time
+    sorted_depots = build_ordered_depots(
+        config.locations.depot_location,
+        active_vehicle_configs,
+        include_reload_locations=bool(getattr(config.cvrp, "enable_multiple_trips", False)),
+    )
+    output_files = process_results(
+        solution, input_data, allocation, execution_time, sorted_depots,
+        distance_matrix=distance_matrix,
+    )
+    _assert_mandatory_customer_solution(allocation, solution, context="immediately before setData upload")
+    try:
+        from setdata_client import upload_solution_set_data
+        set_data_result = upload_solution_set_data(solution, config, allocation)
+    except Exception as exc:
+        logging.getLogger(__name__).error("setData изпращането завърши с грешка: %s", exc, exc_info=True)
+        set_data_result = {"enabled": True, "attempted": 0, "succeeded": 0, "failed": 1, "errors": [{"error": str(exc)}]}
+    print("\n[OK] CVRP оптимизация завършена успешно!")
+    return _solution_to_api_response(
+        solution, input_data, allocation, output_files, execution_time, set_data_result,
+    )
+
+
 def run_optimization(
     input_file: Optional[str] = None,
     input_data_override: Optional[InputData] = None,
@@ -882,6 +909,17 @@ def run_optimization(
         raise RuntimeError("Не са намерени валидни клиенти във входните данни.")
     warehouse_allocation = move_customers_without_coordinates_to_unserved(warehouse_allocation)
     active_vehicle_configs = get_active_vehicle_configs(warehouse_allocation, config)
+    if (not warehouse_allocation.vehicle_customers
+            and all(customer_has_missing_gps(c) or getattr(c, "manually_excluded", False) for c in input_data.customers)):
+        logger.warning("Всички клиенти са без GPS или ръчно изключени. Без изчисление на маршрути; към необслужените.")
+        empty_solution = CVRPSolution(
+            routes=[], dropped_customers=[], total_distance_km=0,
+            total_time_minutes=0, total_vehicles_used=0, fitness_score=0, is_feasible=True,
+        )
+        return _finish_optimization(
+            empty_solution, input_data, warehouse_allocation, config,
+            start_time, active_vehicle_configs,
+        )
     if geographic_enabled(config.cvrp):
         prepare_customer_depots(warehouse_allocation.vehicle_customers, config)
 
@@ -980,37 +1018,9 @@ def run_optimization(
         ))
 
     if _is_usable_solution(best_solution):
-        execution_time = time.time() - start_time
-        # Получаваме депата за предаване към process_results в същия ред като матрицата.
-        enabled_vehicles = active_vehicle_configs
-        sorted_depots = build_ordered_depots(
-            config.locations.depot_location,
-            enabled_vehicles,
-            include_reload_locations=bool(getattr(config.cvrp, "enable_multiple_trips", False)),
-        )
-        
-        output_files = process_results(best_solution, input_data, warehouse_allocation, execution_time, sorted_depots,
-                                       distance_matrix=distance_matrix)
-        set_data_result = None
-        _assert_mandatory_customer_solution(
-            warehouse_allocation,
-            best_solution,
-            context="immediately before setData upload",
-        )
-        try:
-            from setdata_client import upload_solution_set_data
-            set_data_result = upload_solution_set_data(best_solution, config, warehouse_allocation)
-        except Exception as exc:
-            logger.error(f"setData изпращането завърши с грешка: {exc}", exc_info=True)
-            set_data_result = {"enabled": True, "attempted": 0, "succeeded": 0, "failed": 1, "errors": [{"error": str(exc)}]}
-        print("\n[OK] CVRP оптимизация завършена успешно!")
-        return _solution_to_api_response(
-            best_solution,
-            input_data,
-            warehouse_allocation,
-            output_files,
-            execution_time,
-            set_data_result,
+        return _finish_optimization(
+            best_solution, input_data, warehouse_allocation, config,
+            start_time, active_vehicle_configs, distance_matrix,
         )
     else:
         logger.error("[ERROR] Не успях да намеря решение на проблема.")

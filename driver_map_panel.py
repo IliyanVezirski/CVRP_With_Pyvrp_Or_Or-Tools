@@ -86,7 +86,10 @@ def driver_panel_css():
       max-height:85vh !important; max-height:85dvh !important;
     }
     @media(max-width:700px) {
-      .bizant-mobile-driver .driver-panel-toggle {position:fixed; bottom:12px; left:12px; z-index:1001;}
+      .bizant-mobile-driver .driver-panel-toggle {
+        position:fixed; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right));
+        bottom:auto; left:auto; z-index:1001;
+      }
       .bizant-mobile-driver .route-map-legend, .bizant-mobile-driver #legend {display:none;}
       .bizant-mobile-driver .route-client-panel,
       .bizant-mobile-driver .multi-course-panel,

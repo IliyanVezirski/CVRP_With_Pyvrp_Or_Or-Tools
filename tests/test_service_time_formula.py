@@ -109,12 +109,15 @@ def test_desktop_controls_switch_and_live_preview():
         assert base.winfo_manager() == ""
         assert fixed.winfo_manager() == "grid"
         gui.widgets["vehicle.0.service_time_mode"].set("Формула")
+        assert base.winfo_manager() == ""
+        gui.controls["vehicle.0.formula_toggle"].invoke()
         assert base.winfo_manager() == "grid"
         assert fixed.winfo_manager() == ""
         gui.widgets["vehicle.0.service_quantity_units"].set("100")
         gui.widgets["vehicle.0.service_seconds_per_unit"].set("30")
         preview = base.master.grid_slaves(row=6)[0]
-        assert "100 единици → 60 сек" in preview.cget("text")
+        assert "100 единици → 1 мин" in preview.cget("text")
+        assert "За клиент: 30 сек + 30 сек за всеки 100 единици." in preview.cget("text")
         gui.widgets["vehicle.0.service_quantity_units"].set("0")
         assert "над 0" in preview.cget("text")
     finally:

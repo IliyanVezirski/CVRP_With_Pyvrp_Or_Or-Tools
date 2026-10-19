@@ -99,6 +99,8 @@ from cvrp_solver import (
 )
 
 
+from vehicle_schedules import route_schedule_fields
+
 logger = logging.getLogger(__name__)
 
 # The one-minute allowance is an explicit business policy for the complete
@@ -149,7 +151,8 @@ class PyVRPSolver:
             location_config: Географски настройки
         """
         self.config = config
-        self.vehicle_configs = vehicle_configs
+        from vehicle_schedules import expand_physical_vehicles
+        self.vehicle_configs = expand_physical_vehicles(vehicle_configs)
         self.customers = customers
         self.distance_matrix = distance_matrix
         self.unique_depots = unique_depots
@@ -254,13 +257,15 @@ class PyVRPSolver:
         return None
 
     def _dynamic_max_reloads(self, vehicle_config: VehicleConfig) -> int:
-        """Finite solver-only upper bound; the user never configures trip count."""
+        """Finite resource bound, additionally capped by the physical bus limit."""
         if not self._multiple_trips_enabled() or not self.customers:
             return 0
 
         # A useful trip serves at least one customer, so more than N - 1
         # reloads can never improve a solution with N customers.
         bounds = [max(0, len(self.customers) - 1)]
+        if getattr(vehicle_config, '_max_trips', None) is not None:
+            bounds.append(vehicle_config._max_trips - 1)
 
         daily_limit = getattr(vehicle_config, "max_customers_per_day", None)
         if daily_limit is None:
@@ -646,6 +651,8 @@ class PyVRPSolver:
                 continue
 
             daily_customers = 0
+            if getattr(vehicle, '_max_trips', None) is not None and len(vehicle_routes) > vehicle._max_trips:
+                violations.append(f'{vehicle_key}: надвишен максимум {vehicle._max_trips} курса')
             daily_distance_km = 0.0
             planned_starts: List[float] = []
             planned_ends: List[float] = []
@@ -1846,6 +1853,7 @@ class PyVRPSolver:
                     total_volume=route_volume,
                     is_feasible=True,
                     schedule_entries=schedule_entries,
+                    **route_schedule_fields(vehicle_config, trip_number),
                     vehicle_key=vehicle_key,
                     trip_number=trip_number,
                     trip_count=trip_count,

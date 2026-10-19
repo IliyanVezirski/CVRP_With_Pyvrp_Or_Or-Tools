@@ -33,7 +33,7 @@ import ipaddress
 import importlib
 import json
 import logging
-from service_time import SERVICE_FIELDS, service_settings, validate_service_settings
+from service_time import SERVICE_FIELDS, service_settings, validate_service_settings, parse_work_hours
 import math
 import os
 import re
@@ -86,6 +86,7 @@ from display_units import volume_unit_label, validate_volume_unit_label
 from map_display_settings import DEFAULT_MANDATORY_CUSTOMER_COMMENT, validate_mandatory_customer_comment, validate_driver_volume_label
 _CURRENT_WEEK_SATURDAY_TOKEN = "current_week_saturday"
 _OUTPUT_COMPAT_DEFAULTS = {
+    "excel_bus_number_start": 1,
     "volume_unit_label": "стекове",
     "mandatory_customer_comment": DEFAULT_MANDATORY_CUSTOMER_COMMENT,
     "mobile_driver_panel": False,
@@ -99,6 +100,7 @@ _OUTPUT_COMPAT_DEFAULTS = {
     "saturday_excel_bus_number_digits": 1,
 }
 _OUTPUT_COMPAT_FIELD_SPECS = {
+    "excel_bus_number_start": ("int", "excel_bus_number_digits", "Начален номер за SetData, Excel и карти."),
     "volume_unit_label": ("str", "enable_interactive_map", "Наименование на количеството в интерфейса и отчетите."),
     "mandatory_customer_comment": ("str", "enable_interactive_map", "Текст за задължителните клиенти в индивидуалните карти."),
     "mobile_driver_panel": ("bool", "enable_interactive_map", "Алтернативен мобилен панел за шофьора."),
@@ -117,9 +119,19 @@ _OUTPUT_COMPAT_FIELD_SPECS = {
     ),
 }
 _SET_DATA_COMPAT_DEFAULTS = {
+    "set_data_excluded_id_grafik": "",
     "enable_unserved_final_done_flag_update": True,
+    "enable_missing_gps_set_data_upload": True,
+    "set_data_missing_gps_done_flag": "0",
+    "set_data_missing_gps_id_grafik": "1004501000",
+    "set_data_missing_gps_bukva_template": "HOF1-{stop_number}",
 }
 _SET_DATA_COMPAT_FIELD_SPECS = {
+    "set_data_excluded_id_grafik": ("str", "enable_set_data_upload", "Направление за ръчно изключените клиенти."),
+    "enable_missing_gps_set_data_upload": ("bool", "enable_set_data_upload", "Изпращане на заявки без GPS."),
+    "set_data_missing_gps_done_flag": ("str", "enable_set_data_upload", "Директен DoneFlag за заявки без GPS."),
+    "set_data_missing_gps_id_grafik": ("str", "enable_set_data_upload", "Направление за заявки без GPS."),
+    "set_data_missing_gps_bukva_template": ("str", "enable_set_data_upload", "Буква за заявки без GPS."),
     "enable_unserved_final_done_flag_update": (
         "bool",
         "set_data_unserved_done_flag",
@@ -154,6 +166,9 @@ def _output_config_value(output: Any, field_name: str) -> Any:
 
 def _set_data_config_value(set_data: Any, field_name: str) -> Any:
     """Read a setData field with defaults for preserved legacy configs."""
+    from missing_gps_settings import MISSING_GPS_DEFAULTS, missing_gps_setting
+    if field_name in MISSING_GPS_DEFAULTS:
+        return missing_gps_setting(set_data, field_name)
     if hasattr(set_data, field_name):
         return getattr(set_data, field_name)
     if field_name == "set_data_unserved_final_done_flag":
@@ -1050,6 +1065,11 @@ def _parse_solver_type(value: Any) -> str:
 
 
 def _coerce_setting_value(section_name: str, field_name: str, value: Any, current_value: Any) -> Any:
+    if section_name == "input" and field_name == "excluded_customer_ids":
+        from input_handler import normalise_excluded_customer_ids
+        return normalise_excluded_customer_ids(value)
+    if section_name == "vehicles" and field_name == "max_time_hours":
+        return parse_work_hours(value)
     if value == "" and field_name in {
         "pyvrp_seed",
         "max_distance_km",
@@ -1461,6 +1481,10 @@ def _vehicle_from_payload(config: MainConfig, payload: Dict[str, Any], template:
     for field_name, value in payload.items():
         if field_name not in allowed_fields:
             continue
+        if field_name == 'physical_bus_schedules':
+            from vehicle_schedules import normalise_schedules
+            vehicle.physical_bus_schedules = normalise_schedules(value)
+            continue
         if field_name in {"start_location", "end_location", "tsp_depot_location", "reload_location"} and isinstance(value, str):
             value = _resolve_depot_reference(config, value)
         current_value = getattr(vehicle, field_name)
@@ -1475,6 +1499,8 @@ def _vehicle_from_payload(config: MainConfig, payload: Dict[str, Any], template:
 
 
 def _validate_vehicle_configs(vehicles: list[VehicleConfig]) -> None:
+    from vehicle_schedules import validate_fleet_schedules
+    validate_fleet_schedules(vehicles)
     seen_config_ids: set[str] = set()
     for index, vehicle in enumerate(vehicles):
         validate_service_settings(vehicle)
@@ -1496,8 +1522,7 @@ def _validate_vehicle_configs(vehicles: list[VehicleConfig]) -> None:
             raise ValueError(f"{label}: count не може да е отрицателно")
         if float(getattr(vehicle, "capacity", 0) or 0) <= 0:
             raise ValueError(f"{label}: capacity трябва да е положително")
-        if float(getattr(vehicle, "max_time_hours", 0) or 0) <= 0:
-            raise ValueError(f"{label}: max_time_hours трябва да е положително")
+        parse_work_hours(getattr(vehicle, "max_time_hours", None))
         if int(getattr(vehicle, "reload_time_minutes", 0) or 0) < 0:
             raise ValueError(f"{label}: reload_time_minutes не може да е отрицателно")
         daily_limit = getattr(vehicle, "max_customers_per_day", None)
@@ -1879,7 +1904,48 @@ _WEB_GUI_API_FIELDS = {
 _WEB_GUI_PERSIST_API_FIELDS = _WEB_GUI_API_FIELDS | {"web_gui_run_defaults_json"}
 
 # Shared fleet and server/security settings are never part of a planning profile.
+_SHARED_EXCLUSION_FIELDS = {("input", "excluded_customer_ids"), ("set_data", "set_data_excluded_id_grafik")}
+
+
+def _shared_exclusions(config_obj):
+    from input_handler import shared_customer_exclusions
+    return shared_customer_exclusions(config_obj)
+
+
+def _save_shared_exclusions(payload):
+    from input_handler import normalise_excluded_customer_ids
+    if not isinstance(payload, dict) or set(payload) != {"customer_ids", "direction"}:
+        raise ValueError("Подай списък с клиенти и направление.")
+    if not isinstance(payload["direction"], str):
+        raise ValueError("Направлението трябва да е текст.")
+    ids = normalise_excluded_customer_ids(payload["customer_ids"])
+    direction = payload["direction"].strip()
+    if any(c.isspace() for c in direction):
+        raise ValueError("Въведи един номер на направление без интервали.")
+    with _CONFIG_TRANSACTION_LOCK:
+        config_obj = deepcopy(get_config())
+        config_obj.input.excluded_customer_ids = ids
+        config_obj.set_data.set_data_excluded_id_grafik = direction
+        # Migrate only these two old profile values; preserve every other setting.
+        raw = getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""
+        if raw:
+            stored = json.loads(raw)
+            settings = stored.get("settings", {}) if stored.get("version") == 2 else stored
+            for section, field in _SHARED_EXCLUSION_FIELDS:
+                if isinstance(settings.get(section), dict):
+                    settings[section].pop(field, None)
+            config_obj.api.web_gui_run_defaults_json = json.dumps(stored, ensure_ascii=False)
+        backup = _persist_web_gui_config(config_obj, include_api=False, include_cvrp=False,
+            include_vehicles=False, include_exclusions=True)
+        current = config_module.config_manager.config
+        current.input.excluded_customer_ids = ids
+        current.set_data.set_data_excluded_id_grafik = direction
+        current.api.web_gui_run_defaults_json = config_obj.api.web_gui_run_defaults_json
+        return {"status": "saved", "scope": "shared_customer_exclusions", "backup_file": backup}
+
+
 _WEB_RUN_INPUT_FIELDS = {
+    "excluded_customer_ids",
     "input_source", "excel_file_path", "sheet_name", "json_url",
     "json_http_method", "json_command", "json_sklad", "json_done_flag",
     "json_extra_query", "json_override_date", "json_timeout_seconds",
@@ -1911,6 +1977,7 @@ _WEB_RUN_OUTPUT_FIELDS = {
     "efficiency_excel_file",
     "excel_bus_number_prefix",
     "excel_bus_number_digits",
+    "excel_bus_number_start",
     "saturday_excel_bus_number_prefix",
     "saturday_excel_bus_number_digits",
     "center_bus_numbering_enabled",
@@ -1921,6 +1988,7 @@ _WEB_RUN_OUTPUT_FIELDS = {
     "charts_output_dir",
 }
 _WEB_RUN_SET_DATA_FIELDS = {
+    "set_data_excluded_id_grafik",
     "enable_set_data_upload",
     "set_data_url",
     "set_data_http_method",
@@ -1933,6 +2001,10 @@ _WEB_RUN_SET_DATA_FIELDS = {
     "set_data_id_grafik_template",
     "set_data_bukva_template",
     "enable_unserved_set_data_upload",
+    "enable_missing_gps_set_data_upload",
+    "set_data_missing_gps_done_flag",
+    "set_data_missing_gps_id_grafik",
+    "set_data_missing_gps_bukva_template",
     "set_data_unserved_done_flag",
     "enable_unserved_final_done_flag_update",
     "set_data_unserved_final_done_flag",
@@ -2444,6 +2516,8 @@ def _validate_web_run_config(config_obj: MainConfig) -> None:
     for field in ("driver_total_volume_label", "driver_customer_volume_label"):
         setattr(output, field, validate_driver_volume_label(_output_config_value(output, field)))
 
+    from vehicle_numbering import validate_bus_number_start
+    output.excel_bus_number_start = validate_bus_number_start(_output_config_value(output, "excel_bus_number_start"))
     saturday_prefix = str(
         _output_config_value(output, "saturday_excel_bus_number_prefix") or ""
     ).strip()
@@ -2505,6 +2579,8 @@ def _apply_web_run_settings(config_obj: MainConfig, settings: Dict[str, Dict[str
     for section_name, section_payload in (settings or {}).items():
         section_obj = getattr(config_obj, section_name)
         for field_name, raw_value in section_payload.items():
+            if (section_name, field_name) in _SHARED_EXCLUSION_FIELDS:
+                continue  # Old profile/browser payloads cannot override common exclusions.
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
@@ -2602,6 +2678,7 @@ def _web_run_settings_from_config(config_obj: MainConfig) -> Dict[str, Dict[str,
                 )
             )
             for field_name in sorted(allowed_fields)
+            if (section_name, field_name) not in _SHARED_EXCLUSION_FIELDS
             if (
                 hasattr(getattr(config_obj, section_name), field_name)
                 or (section_name == "output" and field_name in _OUTPUT_COMPAT_DEFAULTS)
@@ -2673,17 +2750,18 @@ def _vehicle_to_web_dict(vehicle: VehicleConfig, config_obj: Optional[MainConfig
         "vehicle_type": getattr(getattr(vehicle, "vehicle_type", None), "value", str(getattr(vehicle, "vehicle_type", ""))),
         "name": str(getattr(vehicle, "name", "") or ""),
         "config_id": str(getattr(vehicle, "config_id", "") or ""),
+        "physical_bus_schedules": getattr(vehicle, 'physical_bus_schedules', None) or [],
         "enabled": bool(getattr(vehicle, "enabled", True)),
         "count": int(getattr(vehicle, "count", 0) or 0),
         "capacity": int(getattr(vehicle, "capacity", 0) or 0),
         "fixed_cost": int(getattr(vehicle, "fixed_cost", 0) or 0),
         "max_distance_km": getattr(vehicle, "max_distance_km", None),
-        "max_time_hours": int(getattr(vehicle, "max_time_hours", 8) or 8),
+        "max_time_hours": parse_work_hours(getattr(vehicle, "max_time_hours", 8)),
         "service_time_minutes": int(getattr(vehicle, "service_time_minutes", 8)),
         "max_customers_per_route": getattr(vehicle, "max_customers_per_route", None),
         "max_customers_per_day": getattr(vehicle, "max_customers_per_day", None),
         "end_location": _coords_to_text(getattr(vehicle, "end_location", None)),
-        "reload_location": _coords_to_text(getattr(vehicle, "reload_location", None) or getattr(vehicle, "start_location", None)),
+        "reload_location": _coords_to_text(getattr(vehicle, "reload_location", None)),
         "reload_time_minutes": int(getattr(vehicle, "reload_time_minutes", 30) or 0),
         "start_time_minutes": int(getattr(vehicle, "start_time_minutes", 480)),
     }
@@ -2702,7 +2780,8 @@ def _reload_config_from_disk():
     global MainConfig, RoutingEngine, CenterZoneConfig, TrafficZoneConfig, VehicleConfig, VehicleType, CVRP_SOLVER_TYPES, get_named_depots, get_config
 
     with _CONFIG_RELOAD_LOCK:
-        module = importlib.reload(config_module)
+        from config_compat import reload_config_module
+        module = reload_config_module(config_module)
         MainConfig = module.MainConfig
         RoutingEngine = module.RoutingEngine
         CenterZoneConfig = module.CenterZoneConfig
@@ -2718,6 +2797,7 @@ def _reload_config_from_disk():
 def _web_config_revision(config_obj: MainConfig) -> str:
     from hashlib import sha256
     snapshot = {
+        "customer_exclusions": _shared_exclusions(config_obj),
         "settings": _web_run_settings_from_config(config_obj),
         "vehicles": [_vehicle_to_web_dict(vehicle, config_obj) for vehicle in config_obj.vehicles],
         "profile": str(getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""),
@@ -2760,6 +2840,7 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
             if hasattr(cvrp, field_name)
         },
         "vehicles": [_vehicle_to_web_dict(vehicle, cfg) for vehicle in (cfg.vehicles or [])],
+        "customer_exclusions": _shared_exclusions(cfg),
         "depots": [
             {
                 "name": str(name),
@@ -2841,6 +2922,8 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
         # A preserved config.py can be older than the executable. Insert the
         # known additive fields during the first global Web save instead of
         # silently leaving the external config structurally incompatible.
+        if class_name == "InputConfig" and field_name == "excluded_customer_ids":
+            return class_block.rstrip() + f'\n    excluded_customer_ids: str = {_python_literal(value)}\n\n'
         if class_name == "OutputConfig" and field_name in _OUTPUT_COMPAT_FIELD_SPECS:
             annotation, anchor_name, comment = _OUTPUT_COMPAT_FIELD_SPECS[field_name]
             anchor_pattern = rf'(?m)^(\s*){re.escape(anchor_name)}\s*:.*$'
@@ -2894,9 +2977,10 @@ def _vehicle_config_literal(vehicle: VehicleConfig) -> str:
         f"                count={int(getattr(vehicle, 'count', 0) or 0)},",
         f"                name={_python_literal(getattr(vehicle, 'name', ''))},",
         f"                config_id={_python_literal(getattr(vehicle, 'config_id', ''))},",
+        f"                physical_bus_schedules={getattr(vehicle, 'physical_bus_schedules', None)!r},",
         f"                fixed_cost={int(getattr(vehicle, 'fixed_cost', 0) or 0)},",
         f"                max_distance_km={_optional_int_literal(getattr(vehicle, 'max_distance_km', None))},",
-        f"                max_time_hours={int(getattr(vehicle, 'max_time_hours', 8) or 8)},",
+        f"                max_time_hours={parse_work_hours(getattr(vehicle, 'max_time_hours', 8))!r},",
         f"                service_time_minutes={int(getattr(vehicle, 'service_time_minutes', 8))},",
         *(f"                {key}={value!r}," for key, value in service_settings(vehicle).items()),
         f"                enabled={'True' if bool(getattr(vehicle, 'enabled', True)) else 'False'},",
@@ -2904,7 +2988,7 @@ def _vehicle_config_literal(vehicle: VehicleConfig) -> str:
         f"                max_customers_per_day={_optional_int_literal(getattr(vehicle, 'max_customers_per_day', None))},",
         f"                start_location={_tuple_literal(getattr(vehicle, 'start_location', None))},",
         f"                end_location={_tuple_literal(getattr(vehicle, 'end_location', None))},",
-        f"                reload_location={_tuple_literal(getattr(vehicle, 'reload_location', None) or getattr(vehicle, 'start_location', None))},",
+        f"                reload_location={_tuple_literal(getattr(vehicle, 'reload_location', None))},",
         f"                reload_time_minutes={int(getattr(vehicle, 'reload_time_minutes', 30) or 0)},",
         f"                start_time_minutes={int(getattr(vehicle, 'start_time_minutes', 480))},",
         f"                tsp_depot_location={_tuple_literal(getattr(vehicle, 'tsp_depot_location', None) or getattr(vehicle, 'start_location', None))}",
@@ -2936,6 +3020,7 @@ def _persist_web_gui_config(
     include_output: bool = False,
     include_set_data: bool = False,
     include_input: bool = False,
+    include_exclusions: bool = False,
 ) -> str:
     """Atomically persists only the explicitly selected config.py sections."""
     config_path = os.path.abspath(config_module.__file__)
@@ -2964,7 +3049,13 @@ def _persist_web_gui_config(
                 content = _replace_class_field_literal(content, "InputConfig", field_name, getattr(config_obj.input, field_name))
     if include_vehicles:
         content = _replace_vehicles_list_literal(content, list(config_obj.vehicles or []))
+        from config_compat import ensure_vehicle_schema
+        content = ensure_vehicle_schema(content)
 
+    if include_exclusions:
+        content = _replace_class_field_literal(content, "InputConfig", "excluded_customer_ids", config_obj.input.excluded_customer_ids)
+        content = _replace_class_field_literal(content, "SetDataConfig", "set_data_excluded_id_grafik", config_obj.set_data.set_data_excluded_id_grafik)
+        content = _replace_class_field_literal(content, "APIConfig", "web_gui_run_defaults_json", config_obj.api.web_gui_run_defaults_json)
     compile(content, config_path, "exec")
     backup_path = _backup_config_py(config_path)
     fd, tmp_path = tempfile.mkstemp(
@@ -3044,6 +3135,8 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
                 f"Unsupported global Web fields in {section_name}: " + ", ".join(unknown_fields)
             )
         for field_name, raw_value in section_payload.items():
+            if (section_name, field_name) in _SHARED_EXCLUSION_FIELDS:
+                continue
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
@@ -3177,6 +3270,9 @@ def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
         raise ValueError("Web run defaults body must be a JSON object")
 
     config_obj = deepcopy(get_config())
+    common = _shared_exclusions(config_obj)
+    config_obj.input.excluded_customer_ids = common["customer_ids"]
+    config_obj.set_data.set_data_excluded_id_grafik = common["direction"]
     if bool(payload.get("clear", False)):
         config_obj.api.web_gui_run_defaults_json = ""
         applied: list[str] = ["api.web_gui_run_defaults_json.clear"]
@@ -3212,6 +3308,7 @@ def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
         include_api=True,
         include_cvrp=False,
         include_vehicles=False,
+        include_exclusions=True,
     )
     config_module.config_manager.config = config_obj
     return {
@@ -3393,7 +3490,7 @@ def _web_gui_login_html(api_config) -> str:
 def _web_gui_html(api_config, host: str, port: int) -> str:
     from supervisor_ui import supervisor_css, supervisor_toolbar, supervisor_progress, supervisor_script
     from web_portal import (dispatcher_labels, portal_css, portal_navigation,
-                            portal_heading, portal_input_settings, portal_script)
+                            portal_heading, portal_input_settings, portal_script, portal_exclusions_dialog)
     base_path = _web_gui_endpoint(api_config)
     data_json = _json_for_inline_script({
         "apiBase": f"{base_path}/api",
@@ -3509,12 +3606,14 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     </div>
     {supervisor_progress()}
     <div class="actions">
+      <button class="quiet" id="excludedCustomersButton" onclick="openExclusions()" aria-haspopup="dialog" disabled>Изключени клиенти <span id="excludedCustomersCount"></span></button>
       <span id="statusPill" class="pill">Зареждане…</span>
       <button onclick="loadAll()">Обнови</button>
       <button id="stopPlanButton" onclick="stopRun()" hidden>Спри изчислението</button>
       <button onclick="logout()">Изход</button>
     </div>
   </header>
+  {portal_exclusions_dialog()}
   <main>
     <section class="vehicles-section" id="fleetSection">
       <div class="section-head">
@@ -3696,6 +3795,9 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             <div><label for="outMapProvider">Карта</label><select id="outMapProvider"><option value="osm">OpenStreetMap</option><option value="google">Google</option></select></div>
             <div><label for="outFoliumTiles">OSM слой</label><input id="outFoliumTiles"></div>
           </div>
+          <div class="field-grid">
+            <div><label for="outBusNumberStart">Начален номер</label><input id="outBusNumberStart" type="number" min="1" max="999999999" step="1" title="Общ за SetData, Excel и картите. При 5 номерацията започва от 05. Отделната номерация за Център се запазва."></div>
+          </div>
           <div class="check-line"><input id="outUploadEnabled" type="checkbox"><label for="outUploadEnabled">Качвай картите за шофьорите</label></div>
           <details class="connection-settings">
             <summary>Връзка за качване</summary>
@@ -3763,6 +3865,15 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div><label for="setDataUnservedGrafikTemplate">IdGrafik шаблон</label><input id="setDataUnservedGrafikTemplate"></div>
               <div><label for="setDataUnservedBukvaTemplate">Bukva шаблон</label><input id="setDataUnservedBukvaTemplate"></div>
               <div class="wide"><label for="setDataMakeGroupCommand">makeGroup cmd</label><input id="setDataMakeGroupCommand"></div>
+            </div>
+          </details>
+          <details id="missingGpsSettings">
+            <summary>Заявки без GPS</summary>
+            <div class="field-grid">
+              <div class="check-line wide"><input id="setDataMissingGpsEnabled" type="checkbox"><label for="setDataMissingGpsEnabled">Изпращай заявките без GPS</label></div>
+              <div><label for="setDataMissingGpsGrafik">Направление</label><input id="setDataMissingGpsGrafik"></div>
+              <div><label for="setDataMissingGpsBukva">Буква</label><input id="setDataMissingGpsBukva" title="Може да използвате {{stop_number}} за пореден номер."></div>
+              <div><label for="setDataMissingGpsDoneFlag">Статус (DoneFlag)</label><input id="setDataMissingGpsDoneFlag" placeholder="0" title="Изпраща се директно. Не се променя с финалния статус на необслужените."></div>
             </div>
           </details>
           </details>
@@ -4010,6 +4121,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("outRoutesExcel", output.routes_excel_file);
       put("outEfficiencyExcel", output.efficiency_excel_file);
       put("outSaturdayBusPrefix", output.saturday_excel_bus_number_prefix);
+      put("outBusNumberStart", output.excel_bus_number_start ?? 1);
       put("outSaturdayBusDigits", output.saturday_excel_bus_number_digits);
       $("outUploadTokenState").textContent = output.route_maps_upload_token_configured
         ? "Има запазен код за достъп. Остави полето празно, за да го използваш."
@@ -4035,6 +4147,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("setDataUnservedGrafik", setData.set_data_unserved_id_grafik);
       put("setDataUnservedGrafikTemplate", setData.set_data_unserved_id_grafik_template);
       put("setDataUnservedBukvaTemplate", setData.set_data_unserved_bukva_template);
+      put("setDataMissingGpsEnabled", setData.enable_missing_gps_set_data_upload !== false);
+      put("setDataMissingGpsGrafik", setData.set_data_missing_gps_id_grafik);
+      put("setDataMissingGpsBukva", setData.set_data_missing_gps_bukva_template);
+      put("setDataMissingGpsDoneFlag", setData.set_data_missing_gps_done_flag ?? "0");
       put("setDataMakeGroupCommand", setData.set_data_make_group_command);
       updateTimeObjectiveFieldState();
       updateSolverFinePanels();
@@ -4127,6 +4243,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         enable_routing_quality_report:bool("outRoutingQuality"),
         warehouse_excel_file:value("outWarehouseExcel"), routes_excel_file:value("outRoutesExcel"), efficiency_excel_file:value("outEfficiencyExcel"),
         saturday_excel_bus_number_prefix:value("outSaturdayBusPrefix"), saturday_excel_bus_number_digits:requiredInt("outSaturdayBusDigits", "Цифри за събота", 1, 9),
+        excel_bus_number_start:requiredInt("outBusNumberStart", "Начален номер", 1, 999999999),
         enable_csv_output:bool("outCsvEnabled"), csv_output_file:value("outCsvFile"),
         enable_charts:bool("outChartsEnabled"), charts_output_dir:value("outChartsDir"),
         map_provider:value("outMapProvider"), folium_tiles:value("outFoliumTiles"),
@@ -4150,6 +4267,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         set_data_unserved_final_done_flag:value("setDataUnservedFinalDoneFlag"),
         set_data_unserved_id_grafik:value("setDataUnservedGrafik"), set_data_unserved_id_grafik_template:value("setDataUnservedGrafikTemplate"),
         set_data_unserved_bukva_template:value("setDataUnservedBukvaTemplate"), enable_make_group:bool("setDataMakeGroup"),
+        enable_missing_gps_set_data_upload:bool("setDataMissingGpsEnabled"),
+        set_data_missing_gps_id_grafik:value("setDataMissingGpsGrafik"),
+        set_data_missing_gps_bukva_template:value("setDataMissingGpsBukva"),
+        set_data_missing_gps_done_flag:value("setDataMissingGpsDoneFlag") || "0",
         set_data_make_group_command:value("setDataMakeGroupCommand"), set_data_timeout_seconds:requiredInt("setDataTimeout", "setData timeout")
       }};
     }}
@@ -4234,6 +4355,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
 
     function applyCommonState(data) {{
       state = data;
+      updateExclusionButton();
       vehicleTypes = data.vehicle_types || vehicleTypes;
       depotOptions = data.depots || [];
       $("pageTitle").textContent = "Bizant";
@@ -4322,19 +4444,19 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         <div class="vehicle-field small"><label>Брой</label><input data-field="count" type="number" min="0"></div>
         <div class="vehicle-field medium"><label>Капацитет (<span class="quantity-unit-label"></span>)</label><input data-field="capacity" type="number" min="0"></div>
         <div class="vehicle-field medium"><label>Цена</label><input data-field="fixed_cost" type="number"></div>
-        <div class="vehicle-field medium"><label>Макс. часове</label><input data-field="max_time_hours" type="number"></div>
+        <div class="vehicle-field medium"><label>Работно време (ч)</label><input data-field="max_time_hours" type="text" inputmode="decimal" placeholder="7,5" title="7,5 = 7 ч 30 мин"><small>7,5 = 7 ч 30 мин</small></div>
         <div class="vehicle-field medium"><label>Макс. км/ден</label><input data-field="max_distance_km" type="number" min="0" placeholder="без лимит"></div>
         <div class="vehicle-field service"><label>Клиенти/ден</label><input data-field="max_customers_per_day" type="number" min="1" placeholder="без лимит"></div>
         <div class="vehicle-field service"><label>Обслужване (мин)</label><input data-field="service_time_minutes" type="number"></div>
         <div class="vehicle-field service"><label>Обслужване</label><select data-field="service_time_mode"><option value="fixed">Фиксирано</option><option value="formula">Формула</option></select></div>
-        <div class="vehicle-field service"><label>Начално време (сек)</label><input data-field="service_base_seconds" type="number" min="0" step="any"></div>
-        <div class="vehicle-field service"><label>Секунди</label><input data-field="service_seconds_per_unit" type="number" min="0" step="any"></div>
-        <div class="vehicle-field service"><label>За единици количество</label><input data-field="service_quantity_units" type="number" min="0" step="any"></div>
-        <div class="vehicle-field service"><label>Максимално време (сек)</label><input data-field="service_max_seconds" type="number" min="0" step="any"></div>
+        <div class="vehicle-field service"><label>Начални секунди</label><input data-field="service_base_seconds" type="number" min="0" step="any" title="Време за всеки клиент. Въведи 0, ако няма такова."></div>
+        <div class="vehicle-field service"><label>Добави секунди</label><input data-field="service_seconds_per_unit" type="number" min="0" step="any"></div>
+        <div class="vehicle-field service"><label>За всеки … единици</label><input data-field="service_quantity_units" type="number" min="0" step="any" title="Количество от входните данни: стекове, оборот и др."></div>
+        <div class="vehicle-field service"><label>Не повече от (сек)</label><input data-field="service_max_seconds" type="number" min="0" step="any" title="Например: 900 секунди = 15 минути."></div>
         <div class="vehicle-field medium"><label>Тръгване в</label><input data-field="start_time_minutes" type="time" required></div>
         <div class="vehicle-field gps"><label>Начално депо</label><select data-field="start_depot_name"></select></div>
         <div class="vehicle-field gps"><label>Крайна точка (координати)</label><input data-field="end_location" placeholder="празно = депо"></div>
-        <div class="vehicle-field gps"><label>Място за презареждане</label><input data-field="reload_location" placeholder="празно = началното депо"></div>
+        <div class="vehicle-field gps"><label>Място за презареждане</label><select data-field="reload_location"></select></div>
         <div class="vehicle-field service"><label>Презареждане (мин)</label><input data-field="reload_time_minutes" type="number" min="0"></div>
       `;
       const extra = document.createElement("details"); extra.className = "vehicle-extra";
@@ -4365,6 +4487,22 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         missing.disabled = true;
         startDepotSelect.appendChild(missing);
       }}
+      const reloadSelect = row.querySelector('[data-field="reload_location"]');
+      const followStart = document.createElement("option");
+      followStart.value = ""; followStart.textContent = "Като началното депо";
+      reloadSelect.appendChild(followStart);
+      depotOptions.forEach(depot => {{
+        const option = document.createElement("option");
+        option.value = depot.coordinates; option.textContent = depot.name;
+        reloadSelect.appendChild(option);
+      }});
+      if (vehicle.reload_location && !depotOptions.some(depot => depot.coordinates === vehicle.reload_location)) {{
+        const saved = document.createElement("option");
+        saved.value = vehicle.reload_location;
+        saved.textContent = "Запазено място (извън списъка)";
+        saved.title = vehicle.reload_location;
+        reloadSelect.appendChild(saved);
+      }}
       vehicle = {{service_time_mode:"fixed", service_base_seconds:0, service_seconds_per_unit:12, service_quantity_units:1, service_max_seconds:900, ...vehicle}};
       for (const [key, val] of Object.entries(vehicle)) {{
         const input = row.querySelector(`[data-field="${{key}}"]`);
@@ -4382,7 +4520,47 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       row.addEventListener("change", markVehicleSettingsDirty);
       updateVehicleCard(row);
       enhanceVehicleRow(row);
+      addBusSchedules(row, vehicle.physical_bus_schedules || []);
       return row;
+    }}
+
+    function addBusSchedules(row, saved) {{
+      row.busSchedules = saved.map(item => ({{...item}}));
+      const panel = document.createElement('details');
+      panel.className = 'bus-schedules';
+      panel.style.cssText = 'grid-column:1/-1;width:100%;padding:10px 16px;box-sizing:border-box;border-top:1px solid #dde5ee';
+      const title = document.createElement('summary'); title.textContent = 'Направления за всеки бус';
+      const body = document.createElement('div');
+      panel.append(title,body); row.append(panel);
+      function draw() {{
+        body.replaceChildren();
+        const count = Math.max(0,Number(row.querySelector('[data-field="count"]').value)||0);
+        while(row.busSchedules.length < count) row.busSchedules.push({{bus_id:globalThis.crypto?.randomUUID?.() || ('bus_'+Date.now()+'_'+Math.random().toString(36).slice(2)),start_id:'',max_trips:null}});
+        const hint=document.createElement('p');hint.textContent='Начално ID и максимум курсове. Празни полета = автоматично.';body.append(hint);
+        row.busSchedules.forEach((item,index)=>{{
+          const line=document.createElement('div');line.style.cssText='display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:10px 0';
+          const name=document.createElement('strong');
+          name.textContent=(row.querySelector('[data-field="name"]').value || 'Бус')+' '+(index+1)+(index>=count?' (неактивен)':'');
+          const startLabel=document.createElement('label');startLabel.textContent='Начално ID ';
+          const start=document.createElement('input');start.type='text';start.inputMode='numeric';start.value=item.start_id||'';start.style.width='160px';startLabel.append(start);
+          const limitLabel=document.createElement('label');limitLabel.textContent='Максимум курсове ';
+          const limit=document.createElement('input');limit.type='number';limit.min='1';limit.max='1000';limit.step='1';limit.value=item.max_trips??'';limit.style.width='85px';limitLabel.append(limit);
+          const preview=document.createElement('span');
+          function update() {{
+            item.start_id=start.value.trim();item.max_trips=limit.value===''?null:limit.value;
+            try {{
+              if(!item.start_id) preview.textContent=item.max_trips?'До '+item.max_trips+' курса · автоматични номера':'Автоматично';
+              else if(!/^[0-9]+$/.test(item.start_id)||!Number.isInteger(Number(item.max_trips))||Number(item.max_trips)<1||Number(item.max_trips)>1000) preview.textContent='Провери номера и броя';
+              else preview.textContent=item.start_id+' – '+(BigInt(item.start_id)+BigInt(item.max_trips)-1n).toString().padStart(item.start_id.length,'0');
+            }} catch(e) {{preview.textContent='Провери номера и броя';}}
+          }}
+          start.addEventListener('input',update);limit.addEventListener('input',update);update();
+          line.append(name,startLabel,limitLabel,preview);body.append(line);
+        }});
+      }}
+      row.querySelector('[data-field="count"]').addEventListener('change',draw);
+      row.querySelector('[data-field="name"]').addEventListener('change',draw);
+      draw();
     }}
 
     function updateVehicleCard(row) {{
@@ -4435,11 +4613,12 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           vehicle_type: get("vehicle_type").value,
           name: get("name").value,
           config_id: get("config_id").value.trim(),
+          physical_bus_schedules: row.busSchedules || [],
           enabled: get("enabled").checked,
           count: intOrNull(get("count").value) || 0,
           capacity: intOrNull(get("capacity").value) || 0,
           fixed_cost: intOrNull(get("fixed_cost").value) || 0,
-          max_time_hours: intOrNull(get("max_time_hours").value) ?? 8,
+          max_time_hours: Number(get("max_time_hours").value.trim().replace(",", ".")),
           max_distance_km: intOrNull(get("max_distance_km").value),
           max_customers_per_day: intOrNull(get("max_customers_per_day").value),
           service_time_minutes: intOrNull(get("service_time_minutes").value) ?? 8,
@@ -4451,7 +4630,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           start_time_minutes: clockToMinutes(get("start_time_minutes").value),
           start_depot_name: get("start_depot_name").value,
           end_location: get("end_location").value || null,
-          reload_location: get("reload_location").value || get("start_depot_name").value,
+          reload_location: get("reload_location").value || null,
           reload_time_minutes: intOrNull(get("reload_time_minutes").value) ?? 30,
         }};
       }});
@@ -6001,6 +6180,11 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 host = self.server.server_address[0]
                 port = self.server.server_address[1]
                 result["config"] = _web_gui_config_payload(host, port)
+                self._send_json(200, result)
+                return
+            if subpath == "/api/customer-exclusions":
+                result = _save_shared_exclusions(payload)
+                result["config"] = _web_gui_config_payload(self.server.server_address[0], self.server.server_address[1])
                 self._send_json(200, result)
                 return
             if subpath == "/api/vehicles":

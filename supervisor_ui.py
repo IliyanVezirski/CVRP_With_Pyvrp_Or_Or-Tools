@@ -3,7 +3,7 @@
 
 def supervisor_css():
     return """
-    :root { --bg:#f3f5f8; --text:#1c3046; --muted:#62748a; --accent:#2463d5; --line:#e4e9f0; --fleet-columns:28px minmax(130px,1.4fr) 76px minmax(112px,.85fr) 136px minmax(160px,1.2fr) 44px; }
+    :root { --bg:#f3f5f8; --text:#1c3046; --muted:#62748a; --accent:#2463d5; --line:#e4e9f0; --fleet-columns:28px minmax(130px,1.4fr) 76px minmax(112px,.85fr) 230px minmax(160px,1.2fr) 44px; }
     main { padding:24px 24px 36px; gap:20px; }
     .workspace-header { background:#142b45; padding:18px 24px; gap:16px 24px; }
     .workspace-header h1 { font-size:1.375rem; letter-spacing:-.6px; }
@@ -37,6 +37,11 @@ def supervisor_css():
     .vehicle-core .vehicle-field.checkbox input { flex-shrink:0; }
     .vehicle-core :is(input:not([type=checkbox]),select) { height:38px; min-height:38px; min-width:0; border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:.875rem; color:var(--text); background:#fff; }
     .vehicle-core input[type=number] { text-align:right; font-variant-numeric:tabular-nums; }
+    .vehicle-service-control { display:grid; grid-template-columns:minmax(112px,1fr) 92px; gap:8px; align-items:end; min-width:0; }
+    .vehicle-service-control.is-formula { grid-template-columns:1fr; }
+    .service-fixed-inline { position:relative; }
+    .vehicle-core .service-fixed-inline input { padding-right:36px; }
+    .service-fixed-inline::after { content:'мин'; position:absolute; right:9px; bottom:11px; font-size:12px; color:var(--muted); pointer-events:none; }
     .vehicle-row .vehicle-card-header { display:none; }
     .vehicle-row:nth-child(n) { gap:0; padding:11px 20px; border:0; border-radius:0; background:#fff; box-shadow:none; }
     .vehicle-row + .vehicle-row { border-top:1px solid var(--line); }
@@ -50,11 +55,15 @@ def supervisor_css():
     .vehicle-extra[open] { margin-top:14px; border-top:1px solid var(--line); padding:14px 0 4px; }
     .vehicle-extra-fields { padding-top:0; }
     .vehicle-field[hidden], .service-formula-preview[hidden] { display:none !important; }
-    .service-policy-fields { grid-column:1 / -1; flex-basis:100%; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:0 0 12px; padding:16px; border:1px solid var(--line); border-radius:8px; background:#f7f9fc; min-width:0; }
+    .service-policy-fields { grid-column:1 / -1; flex-basis:100%; width:100%; box-sizing:border-box; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px 14px; margin:14px 0 0; padding:12px 16px; border:1px solid var(--line); border-radius:8px; background:#f7f9fc; min-width:0; }
     .service-policy-fields[hidden] { display:none !important; }
+    .service-formula-details { width:100%; margin-top:10px; border:0; padding:0; }
+    .service-formula-details[hidden] { display:none !important; }
+    .service-formula-details > summary { cursor:pointer; color:var(--accent); font-size:13px; padding:8px 0; }
+    .service-formula-details .service-policy-fields { margin:4px 0 0; }
     .service-policy-fields legend { padding:0 6px; font-weight:600; }
     .service-policy-fields .vehicle-field { width:auto !important; min-width:0; }
-    .service-formula-preview { margin:0; color:var(--muted); font-size:13px; }
+    .service-formula-preview { margin:0; color:var(--text); font-size:13px; white-space:pre-line; line-height:1.7; }
     @media(max-width:760px) { .service-policy-fields { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     @media(max-width:420px) { .service-policy-fields { grid-template-columns:1fr; } }
     .vehicle-extra .remove-vehicle { margin-top:12px; }
@@ -152,9 +161,10 @@ def supervisor_css():
       .vehicle-row:nth-child(n) { padding:14px; }
       .vehicle-core { grid-template-columns:44px minmax(0,1fr) minmax(0,1fr) 44px; gap:10px; }
       .vehicle-core [data-core-field=name] { grid-column:2/4; }
-      .vehicle-core [data-core-field=count], .vehicle-core [data-core-field=service_time_minutes] { grid-column:2; }
+      .vehicle-core [data-core-field=count] { grid-column:2; }
+      .vehicle-core [data-core-field=service_time_minutes] { grid-column:2/-1; }
       .vehicle-core [data-core-field=capacity] { grid-column:3/5; }
-      .vehicle-core [data-core-field=start_depot_name] { grid-column:3/5; }
+      .vehicle-core [data-core-field=start_depot_name] { grid-column:2/-1; }
       .vehicle-core .vehicle-tools { grid-column:4; }
       .vehicle-core :is(input:not([type=checkbox]),select) { height:44px; min-height:44px; font-size:1rem; }
       .vehicle-core .vehicle-field.checkbox, .vehicle-core .vehicle-field.checkbox > label, .vehicle-extra-toggle { min-height:44px; }
@@ -298,26 +308,43 @@ def supervisor_script():
       tools.append(toggle,changes);core.append(tools);extra.before(core);
       extra.append(row.querySelector('.remove-vehicle'));
       const serviceMode=row.querySelector('[data-field="service_time_mode"]');
+      const serviceControl=document.createElement('div');serviceControl.className='vehicle-service-control';
+      serviceControl.dataset.coreField='service_time_minutes';
+      const modeField=serviceMode.closest('.vehicle-field');
+      modeField.removeAttribute('data-core-field');modeField.before(serviceControl);
+      const fixedField=row.querySelector('[data-field="service_time_minutes"]').closest('.vehicle-field');
+      fixedField.classList.add('service-fixed-inline');fixedField.querySelector('label').textContent='Минути';
+      serviceControl.append(modeField,fixedField);
       const formulaBox=document.createElement('fieldset');formulaBox.className='service-policy-fields';
       const legend=document.createElement('legend');legend.textContent='Формула';formulaBox.append(legend);
-      extraFields.prepend(formulaBox);
+      const formulaDetails=document.createElement('details');formulaDetails.className='service-formula-details';
+      const formulaSummary=document.createElement('summary');formulaSummary.textContent='Настройки на формулата';
+      formulaDetails.append(formulaSummary,formulaBox);core.after(formulaDetails);
       const preview=document.createElement('p');preview.className='service-formula-preview';
       preview.style.gridColumn='1 / -1';preview.setAttribute('aria-live','polite');
       const formulaKeys=['service_base_seconds','service_seconds_per_unit','service_quantity_units','service_max_seconds'];
       for(const key of formulaKeys)formulaBox.append(row.querySelector('[data-field="'+key+'"]').closest('.vehicle-field'));
       formulaBox.append(preview);
+      const serviceNote=document.createElement('p');serviceNote.className='service-formula-preview';
+      serviceNote.style.gridColumn='1 / -1';
+      serviceNote.textContent='Единици = количеството на клиента (стекове, оборот и др.).\nАко клиентът има зададено собствено време, използваме него.';
+      formulaBox.append(serviceNote);
       function refreshService() {
         const formula=serviceMode.value==='formula';
+        serviceControl.classList.toggle('is-formula',formula);
         formulaBox.hidden=!formula;
+        formulaDetails.hidden=!formula;
+        if(!formula)formulaDetails.open=false;
         row.querySelector('[data-field="service_time_minutes"]').closest('.vehicle-field').hidden=formula;
         for(const key of formulaKeys)row.querySelector('[data-field="'+key+'"]').closest('.vehicle-field').hidden=!formula;
         preview.hidden=!formula;
         const [base,seconds,units,max]=formulaKeys.map(key=>Number(row.querySelector('[data-field="'+key+'"]').value));
-        preview.textContent=units>0 && [base,seconds,max].every(v=>Number.isFinite(v)&&v>=0)
-          ? 'Пример: '+[10,100,1000].map(q=>q+' единици → '+Math.floor(Math.min(base+q*seconds/units,max))+' сек').join(' · ')
+        const duration=s=>{s=Math.floor(s);const m=Math.floor(s/60),r=s%60;return m?m+' мин'+(r?' '+r+' сек':''):r+' сек';};
+        preview.textContent=Number.isFinite(units) && units>0 && [base,seconds,max].every(v=>Number.isFinite(v)&&v>=0)
+          ? 'За клиент: '+base+' сек + '+seconds+' сек '+(units===1?'за всяка единица':'за всеки '+units+' единици')+'.\nНе повече от '+duration(max)+' на клиент.\nПримери: '+[10,100].map(q=>q+' единици → '+duration(Math.min(base+q*seconds/units,max))).join(' · ')
           : 'Въведи валидни стойности. Броят единици трябва да е над 0.';
       }
-      serviceMode.addEventListener('change',()=>{refreshService();extra.open=true;});
+      serviceMode.addEventListener('change',refreshService);
       for(const key of formulaKeys)row.querySelector('[data-field="'+key+'"]').addEventListener('input',refreshService);
       refreshService();
     }
@@ -399,7 +426,9 @@ def supervisor_script():
         if(optional && raw==='')return;
         if(raw==='' || !Number.isSafeInteger(n) || n<min)throw fieldError(el,'Въведи цяло число, не по-малко от '+min+'.');
       };
-      number('count',0);number('capacity',1);number('fixed_cost',Number.MIN_SAFE_INTEGER);number('max_time_hours',1);
+      number('count',0);number('capacity',1);number('fixed_cost',Number.MIN_SAFE_INTEGER);
+      const workHours=get('max_time_hours'),hours=Number(workHours.value.trim().replace(',','.'));
+      if(!Number.isFinite(hours)||hours<=0)throw fieldError(workHours,'Въведи часове, например 7,5 за 7 ч 30 мин.');
       number('service_time_minutes',0);number('reload_time_minutes',0);
       for(const key of ['service_base_seconds','service_seconds_per_unit','service_quantity_units','service_max_seconds']) {
         const el=get(key),n=Number(el.value);

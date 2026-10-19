@@ -16,7 +16,8 @@ cfg.api.web_gui_run_defaults_json = ""
 cfg.vehicles = cfg.vehicles[:2]
 for index, vehicle in enumerate(cfg.vehicles):
     vehicle.name = "Примерен бус " + str(index + 1)
-    vehicle.service_time_mode = "fixed"
+    vehicle.service_time_mode = "fixed" if index == 0 else "formula"
+    vehicle.max_time_hours = 7.5
 auth = SimpleNamespace(credential_store=SimpleNamespace(list_usernames=lambda: []))
 with patch.object(api, "get_config", return_value=cfg), patch.object(api, "_get_web_auth_service", return_value=auth):
     payload = api._web_gui_config_payload("127.0.0.1", 18765, refresh_from_disk=False)

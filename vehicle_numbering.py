@@ -118,10 +118,39 @@ def _parse_int(value: Any, default: int) -> int:
         return default
 
 
+def validate_bus_number_start(value: Any) -> int:
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()):
+        raise ValueError("Началният номер трябва да е цяло число от 1 до 999999999.")
+    result = int(str(value).strip())
+    if not 1 <= result <= 999999999:
+        raise ValueError("Началният номер трябва да е цяло число от 1 до 999999999.")
+    return result
+
+
 def _sequential_bus_number(output_config: Any, route_index: int) -> str:
     prefix = str(getattr(output_config, "excel_bus_number_prefix", "10045010") or "")
     digits = _parse_int(getattr(output_config, "excel_bus_number_digits", 2), 2)
-    return f"{prefix}{route_index + 1:0{max(1, digits)}d}"
+    start = validate_bus_number_start(getattr(output_config, "excel_bus_number_start", 1))
+    return f"{prefix}{route_index + start:0{max(1, digits)}d}"
+
+
+def route_output_number(
+    output_config: Any,
+    route_index: int,
+    route: Any = None,
+    routes: Optional[Sequence[Any]] = None,
+) -> int:
+    """Public route number is the numeric suffix after the configured prefix.
+
+    Keep solver/list indices and physical trip numbers separate. IDs outside
+    this prefix (e.g. external TSP driver IDs) retain the legacy ordinal.
+    """
+    bus_id = format_route_bus_number(output_config, route_index, route, routes)
+    prefix = str(getattr(output_config, "excel_bus_number_prefix", "10045010") or "")
+    suffix = bus_id[len(prefix):] if bus_id.startswith(prefix) else ""
+    if re.fullmatch(r"[0-9]+", suffix) and int(suffix) > 0:
+        return int(suffix)
+    return route_index + 1
 
 
 def _route_from_list(routes: Optional[Sequence[Any]], route_index: int) -> Any:
@@ -226,6 +255,32 @@ def format_route_bus_number(
     business output.  Legacy single-course routes keep their previous IDs.
     """
     route = route if route is not None else _route_from_list(routes, route_index)
+    assigned = str(getattr(route, 'schedule_id', '') or '')
+    if assigned:
+        return assigned
+    reserved = {int(number) for candidate in (routes or [route])
+                for number in getattr(candidate, 'reserved_schedule_ids', ())}
+    if reserved:
+        # Explicitly reserved ranges include unused buses/courses. Automatic
+        # courses may never consume them, even when no reserved bus is used.
+        automatic = [r for r in (routes or [route]) if not getattr(r, 'schedule_id', '')]
+        position = next((i for i, r in enumerate(automatic) if r is route), route_index)
+        if _truthy(getattr(output_config, 'center_bus_numbering_enabled', False)) and _is_center_route(route):
+            number = str(_parse_int(getattr(output_config, 'center_bus_numbering_start_id', 1004501015), 1004501015)
+                         + _occurrence_in_routes(route, route_index, routes, True) - 1)
+            if int(number) in reserved:
+                raise ValueError(f'Направление {number} се застъпва със запазените номера на бус.')
+            return number
+        reserved.update(int(n) for n in _reserved_center_bus_numbers(output_config, routes)
+                        if _truthy(getattr(output_config, 'center_bus_numbering_enabled', False)))
+        found, index = -1, 0
+        while True:
+            number = _sequential_bus_number(output_config, index)
+            index += 1
+            if int(number) not in reserved:
+                found += 1
+                if found == position:
+                    return number
     enabled = _truthy(getattr(output_config, "center_bus_numbering_enabled", False))
     if not enabled:
         return _sequential_bus_number(output_config, route_index)

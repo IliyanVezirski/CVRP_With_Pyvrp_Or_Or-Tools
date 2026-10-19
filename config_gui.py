@@ -4,7 +4,7 @@
 """
 
 import tkinter as tk
-from service_time import SERVICE_FIELDS, service_settings, validate_service_settings, formula_seconds
+from service_time import SERVICE_FIELDS, service_settings, validate_service_settings, formula_seconds, parse_work_hours
 from tkinter import ttk, messagebox
 import copy
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ import os
 import importlib
 import ipaddress
 import json
+from vehicle_schedules import normalise_schedules
 import re
 import shutil
 import socket
@@ -95,7 +96,8 @@ class ConfigGUI:
         self._configure_style()
 
         # Зареждаме текущата конфигурация
-        importlib.reload(config)
+        from config_compat import reload_config_module
+        reload_config_module(config)
         self.cfg = config.get_config()
         self.widgets = {}  # field_key → widget
         self.controls = {}  # field_key → visible input control
@@ -490,6 +492,10 @@ class ConfigGUI:
         for key in self.controls:
             if key.startswith("set_data.") and key != "set_data.enable_set_data_upload":
                 self._set_control_enabled(key, set_data_enabled)
+        # These values also label local Excel rows when uploads are disabled.
+        for field in ("set_data_missing_gps_id_grafik", "set_data_missing_gps_bukva_template",
+                      "set_data_missing_gps_done_flag"):
+            self._set_control_enabled("set_data." + field, True)
         final_unserved_flag_enabled = set_data_enabled and bool(
             current("set_data.enable_unserved_final_done_flag_update", True)
         )
@@ -645,6 +651,12 @@ class ConfigGUI:
 
     def _validate_values(self, values):
         errors = []
+        if "output.excel_bus_number_start" in values:
+            from vehicle_numbering import validate_bus_number_start
+            try:
+                validate_bus_number_start(values["output.excel_bus_number_start"])
+            except ValueError as exc:
+                errors.append(("output.excel_bus_number_start", str(exc)))
         warnings = []
         if "output.mandatory_customer_comment" in values:
             try:
@@ -843,6 +855,11 @@ class ConfigGUI:
                         errors.append((key, "Капацитетът на буса трябва да е положителен."))
                 except (TypeError, ValueError):
                     errors.append((key, "Капацитетът на буса трябва да е число."))
+            elif key.endswith(".max_time_hours"):
+                try:
+                    parse_work_hours(raw_value)
+                except ValueError as exc:
+                    errors.append((key, str(exc)))
             elif key.endswith(".count"):
                 try:
                     if int(float(raw_value)) < 0:
@@ -5578,6 +5595,7 @@ setData не трябва да се пуска:
             ); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.enabled", "Активен:", v.enabled, "bool"); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.count", "Брой:", v.count); gr += 1
+            gr = self._add_physical_bus_schedules(vehicle_box, gr, prefix, v)
             self._add_field(vehicle_box, gr, f"{prefix}.fixed_cost", "Цена за използване:", getattr(v, "fixed_cost", 40000),
                             tooltip="Глоба за всеки използван бус. 40000 е приблизително като 40 км."); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.capacity", f"Капацитет ({total_volume_unit_label(self.cfg.output, short=True)}):", v.capacity); gr += 1
@@ -5585,7 +5603,7 @@ setData не трябва да се пуска:
                             "" if v.max_distance_km is None else v.max_distance_km,
                             tooltip="Празно = без лимит. При повторни курсове лимитът е общ за целия ден."); gr += 1
             self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", v.max_time_hours,
-                            tooltip="Общото време включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
+                            tooltip="Например 7,5 = 7 ч 30 мин. Включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
             gr = self._add_service_time_fields(vehicle_box, gr, prefix, v)
             self._add_field(vehicle_box, gr, f"{prefix}.max_customers_per_day", "Макс. клиенти за деня:",
                              getattr(v, "max_customers_per_day", None) or getattr(v, "max_customers_per_route", None) or "",
@@ -5748,6 +5766,7 @@ setData не трябва да се пуска:
                 clone.name = ""
                 clone.end_location = None
                 clone.config_id = ""
+                clone.physical_bus_schedules = None
                 return clone
 
         try:
@@ -5831,6 +5850,7 @@ setData не трябва да се пуска:
         ); gr += 1
         self._add_field(vehicle_box, gr, f"{prefix}.enabled", "Активен:", vehicle.enabled, "bool"); gr += 1
         self._add_field(vehicle_box, gr, f"{prefix}.count", "Брой:", vehicle.count); gr += 1
+        gr = self._add_physical_bus_schedules(vehicle_box, gr, prefix, vehicle)
         self._add_field(
             vehicle_box,
             gr,
@@ -5849,7 +5869,7 @@ setData не трябва да се пуска:
             tooltip="Празно = без лимит. При повторни курсове лимитът е общ за деня.",
         ); gr += 1
         self._add_field(vehicle_box, gr, f"{prefix}.max_time_hours", "Работно време за деня (ч.):", vehicle.max_time_hours,
-                        tooltip="Включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
+                        tooltip="Например 7,5 = 7 ч 30 мин. Включва движение, обслужване, чакане, връщане и презареждане."); gr += 1
         gr = self._add_service_time_fields(vehicle_box, gr, prefix, vehicle)
         self._add_field(
             vehicle_box,
@@ -6856,6 +6876,8 @@ setData не трябва да се пуска:
         self._add_field(excel, gr, "output.efficiency_excel_file", "Ефективност:", out.efficiency_excel_file); gr += 1
         self._add_field(excel, gr, "output.excel_bus_number_prefix", "Префикс ID бус:", getattr(out, "excel_bus_number_prefix", "10045010")); gr += 1
         self._add_field(excel, gr, "output.excel_bus_number_digits", "Цифри:", getattr(out, "excel_bus_number_digits", 2), "int"); gr += 1
+        self._add_field(excel, gr, "output.excel_bus_number_start", "Начален номер:", getattr(out, "excel_bus_number_start", 1), "int",
+                        tooltip="Общ за SetData, Excel и картите. При 5 започва от 05. Отделните номера за Център се запазват."); gr += 1
         self._add_field(excel, gr, "output.saturday_excel_bus_number_prefix", "Префикс за събота:", getattr(out, "saturday_excel_bus_number_prefix", "100450121"),
                         tooltip="Използва се автоматично за normal номерирането при HTTP /run_saturday. Активното CENTER_BUS ID правило има предимство."); gr += 1
         self._add_field(excel, gr, "output.saturday_excel_bus_number_digits", "Цифри за събота:", getattr(out, "saturday_excel_bus_number_digits", 1), "int",
@@ -7559,6 +7581,21 @@ TSP имената на полетата се настройват от GUI:
             tooltip="Позволени: {id_grafik}, {customer_id}, {customer_document}, {id_plas_doc}, {id_skld}, {stop_number}.",
         ); gr += 1
 
+        from missing_gps_settings import missing_gps_setting
+        missing_gps, gr = self._add_grid_group(
+            f, r, "Заявки без GPS",
+            "Отделно направление и статус. Без последваща промяна на DoneFlag.",
+        ); r += 1
+        for key, label, field_type in (
+            ("enable_missing_gps_set_data_upload", "Изпращай заявки без GPS:", "bool"),
+            ("set_data_missing_gps_id_grafik", "Направление:", "str"),
+            ("set_data_missing_gps_bukva_template", "Буква:", "str"),
+            ("set_data_missing_gps_done_flag", "Статус (DoneFlag):", "str"),
+        ):
+            self._add_field(missing_gps, gr, "set_data." + key, label,
+                            missing_gps_setting(set_data, key), field_type)
+            gr += 1
+
         grouping, gr = self._add_grid_group(
             f,
             r,
@@ -8086,6 +8123,27 @@ TSP имената на полетата се настройват от GUI:
                 continue
             content = self._replace_scoped_field_value(content, class_name, field_name, values[gui_key], ftype)
 
+        if "output.excel_bus_number_start" in values:
+            from vehicle_numbering import validate_bus_number_start
+            from cvrp_api_server import _replace_class_field_literal
+            content = _replace_class_field_literal(content, "OutputConfig", "excel_bus_number_start",
+                validate_bus_number_start(values["output.excel_bus_number_start"]))
+
+        # Insert as well as update these fields in preserved older config files.
+        from missing_gps_settings import MISSING_GPS_DEFAULTS
+        from cvrp_api_server import _replace_class_field_literal
+        for field_name, default in MISSING_GPS_DEFAULTS.items():
+            gui_key = "set_data." + field_name
+            if gui_key in values:
+                value = values[gui_key]
+                if isinstance(default, bool):
+                    value = str(value).strip().lower() in {"true", "1", "yes", "on"}
+                else:
+                    value = str(value).strip()
+                if field_name == "set_data_missing_gps_done_flag" and not value:
+                    value = "0"
+                content = _replace_class_field_literal(content, "SetDataConfig", field_name, value)
+
         if "output.volume_unit_label" in values:
             from cvrp_api_server import _replace_class_field_literal
             content = _replace_class_field_literal(
@@ -8161,6 +8219,10 @@ TSP имената на полетата се настройват от GUI:
                 vtype = v.vehicle_type.value
                 content = self._replace_vehicle_field(content, vtype, i, values, prefix)
 
+        # Saved VehicleConfig(...) calls include the new fields. Persist their
+        # declarations too, so plain imports/restarts can read the saved file.
+        from config_compat import ensure_vehicle_schema
+        content = ensure_vehicle_schema(content)
         if content != original:
             compile(content, config_path, "exec")
             backup_dir = os.path.join(os.path.dirname(config_path), "config_backups")
@@ -8474,8 +8536,72 @@ TSP имената на полетата се настройват от GUI:
             return self.cfg.locations.depot_location
         return (float(coords[0]), float(coords[1]))
 
+    def _add_physical_bus_schedules(self, parent, row, prefix, vehicle):
+        from vehicle_schedules import normalise_schedules, schedule_ids
+        saved = normalise_schedules(getattr(vehicle, 'physical_bus_schedules', None))
+        value = tk.StringVar(value=json.dumps(saved, ensure_ascii=False))
+        self.widgets[f'{prefix}.physical_bus_schedules'] = value
+
+        def edit():
+            from uuid import uuid4
+            dialog = tk.Toplevel(self.root)
+            dialog.title('Направления за всеки бус')
+            dialog.transient(self.root)
+            frame = ttk.Frame(dialog, padding=16)
+            frame.pack(fill='both', expand=True)
+            items = json.loads(value.get())
+            count = max(0, int(self.widgets[f'{prefix}.count'].get() or 0))
+            while len(items) < count:
+                items.append(dict(bus_id=uuid4().hex, start_id='', max_trips=None))
+            ttk.Label(frame, text='Начално ID + максимум курсове = запазени последователни номера.').grid(row=0, column=0, columnspan=4, pady=(0,12))
+            for c, title in enumerate(('Бус', 'Начално ID', 'Максимум курсове', 'Запазени номера')):
+                ttk.Label(frame, text=title).grid(row=1, column=c, padx=8, sticky='w')
+            fields = []
+            name = self.widgets[f'{prefix}.name'].get() or 'Бус'
+            for i, item in enumerate(items):
+                ttk.Label(frame, text=f'{name} {i+1}' + (' (неактивен)' if i >= count else '')).grid(row=i+2,column=0,padx=8,pady=5)
+                start = tk.StringVar(value=item['start_id'])
+                limit = tk.StringVar(value='' if item['max_trips'] is None else str(item['max_trips']))
+                ttk.Entry(frame, textvariable=start, width=18).grid(row=i+2,column=1,padx=8)
+                ttk.Entry(frame, textvariable=limit, width=12).grid(row=i+2,column=2,padx=8)
+                preview = ttk.Label(frame)
+                preview.grid(row=i+2,column=3,padx=8)
+                def refresh(*args, start=start, limit=limit, preview=preview):
+                    try:
+                        entry = normalise_schedules([dict(start_id=start.get(), max_trips=limit.get())])[0]
+                        numbers = schedule_ids(entry)
+                        preview.config(text=(f'{numbers[0]} – {numbers[-1]}' if len(numbers)>1 else numbers[0]) if numbers else 'Автоматично')
+                    except ValueError:
+                        preview.config(text='Провери номера и броя')
+                start.trace_add('write', refresh)
+                limit.trace_add('write', refresh)
+                refresh()
+                fields.append((item, start, limit))
+
+            def accept():
+                try:
+                    updated = normalise_schedules([dict(bus_id=item['bus_id'], start_id=start.get(), max_trips=limit.get())
+                                                   for item,start,limit in fields])
+                    old = value.get()
+                    value.set(json.dumps(updated, ensure_ascii=False))
+                    try:
+                        self._collect_vehicle_configs_from_values(self._collect_values())
+                    except Exception:
+                        value.set(old)
+                        raise
+                except Exception as exc:
+                    messagebox.showerror('Направления', str(exc), parent=dialog)
+                    return
+                dialog.destroy()
+            ttk.Label(frame,text='Празни полета = досегашната автоматична номерация.').grid(row=len(items)+2,column=0,columnspan=4,pady=12)
+            ttk.Button(frame,text='Приложи',command=accept).grid(row=len(items)+3,column=3,pady=8)
+            dialog.grab_set()
+        ttk.Button(parent, text='Направления за всеки бус…', command=edit).grid(row=row,column=0,columnspan=2,sticky='w',pady=6)
+        return row + 1
+
     def _add_service_time_fields(self, parent, row, prefix, vehicle):
         from types import SimpleNamespace
+        from service_time import service_formula_preview
         box = ttk.Frame(parent, style="Surface.TFrame")
         box.grid(row=row, column=0, columnspan=2, sticky="ew")
         settings = service_settings(vehicle)
@@ -8484,21 +8610,44 @@ TSP имената на полетата се настройват от GUI:
                         "combo", options=["Фиксирано", "Формула"])
         self._add_field(box, 1, f"{prefix}.service_time_minutes", "Фиксирано (мин):", vehicle.service_time_minutes)
         for index, (key, label) in enumerate((
-            ("service_base_seconds", "Начално време (сек):"),
-            ("service_seconds_per_unit", "Секунди:"),
-            ("service_quantity_units", "За единици количество:"),
-            ("service_max_seconds", "Максимално време (сек):"),
+            ("service_base_seconds", "Начални секунди:"),
+            ("service_seconds_per_unit", "Добави секунди:"),
+            ("service_quantity_units", "За всеки … единици:"),
+            ("service_max_seconds", "Не повече от (сек):"),
         ), start=2):
-            self._add_field(box, index, f"{prefix}.{key}", label, settings[key])
-        preview = ttk.Label(box, text="", style="Surface.TLabel", wraplength=420)
+            self._add_field(box, index, f"{prefix}.{key}", label, f"{settings[key]:g}", tooltip={
+                "service_base_seconds": "Време за всеки клиент, независимо от количеството. Въведи 0, ако няма такова.",
+                "service_seconds_per_unit": "Тези секунди се умножават по количеството на клиента.",
+                "service_quantity_units": "Например: 12 секунди за всеки 1 стек или 30 секунди за всеки 100 оборот. Използва се количеството от входните данни.",
+                "service_max_seconds": "Горна граница за времето по формулата. Например 900 секунди = 15 минути.",
+            }[key])
+        preview = ttk.Label(box, text="", style="Surface.TLabel", wraplength=600, justify="left")
         preview.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=6)
-        widgets_by_row = {index: list(box.grid_slaves(row=index)) for index in range(1, 7)}
+        note = ttk.Label(box, text="Единици = количеството на клиента (стекове, оборот и др.).\nАко клиентът има зададено собствено време, използваме него.",
+                         style="Surface.TLabel", wraplength=600, justify="left")
+        note.grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        widgets_by_row = {index: list(box.grid_slaves(row=index)) for index in range(1, 8)}
+        expanded = False
+        previous_mode = None
+        def toggle_formula():
+            nonlocal expanded
+            expanded = not expanded
+            refresh()
+        toggle = ttk.Button(box, text="▸ Настройки на формулата", command=toggle_formula)
+        toggle.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        self.controls[f"{prefix}.formula_toggle"] = toggle
 
         def refresh(*_):
+            nonlocal expanded, previous_mode
             formula = self.widgets[f"{prefix}.service_time_mode"].get() == "Формула"
+            if formula != previous_mode:
+                expanded = False
+                previous_mode = formula
+            toggle.grid() if formula else toggle.grid_remove()
+            toggle.configure(text=("▾ Свий формулата" if expanded else "▸ Настройки на формулата"))
             for index, widgets in widgets_by_row.items():
                 for widget in widgets:
-                    widget.grid() if (formula if index >= 2 else not formula) else widget.grid_remove()
+                    widget.grid() if ((formula and expanded) if index >= 2 else not formula) else widget.grid_remove()
             if formula:
                 try:
                     cfg = SimpleNamespace(**{
@@ -8506,9 +8655,7 @@ TSP имената на полетата се настройват от GUI:
                               float(str(self.widgets[f"{prefix}.{key}"].get()).replace(",", ".")))
                         for key in SERVICE_FIELDS
                     })
-                    preview.configure(text="Пример: " + " · ".join(
-                        f"{quantity} единици → {formula_seconds(quantity, cfg)} сек"
-                        for quantity in (10, 100, 1000)))
+                    preview.configure(text=service_formula_preview(cfg))
                 except (ValueError, TypeError, ArithmeticError):
                     preview.configure(text="Въведи валидни стойности. Броят единици трябва да е над 0.")
         for key in SERVICE_FIELDS:
@@ -8544,6 +8691,8 @@ TSP имената на полетата се настройват от GUI:
         validate_service_settings(SimpleNamespace(**service_values))
         return config.VehicleConfig(
             **service_values,
+            physical_bus_schedules=normalise_schedules(
+                values.get(f'{prefix}.physical_bus_schedules', None)),
             vehicle_type=vehicle_type,
             capacity=self._parse_int_value(values.get(f"{prefix}.capacity", 320), 320),
             count=max(0, self._parse_int_value(values.get(f"{prefix}.count", 1), 1)),
@@ -8551,7 +8700,7 @@ TSP имената на полетата се настройват от GUI:
             config_id=str(values.get(f"{prefix}.config_id", "") or "").strip(),
             fixed_cost=self._parse_int_value(values.get(f"{prefix}.fixed_cost", 0), 0),
             max_distance_km=self._parse_optional_int_value(values.get(f"{prefix}.max_distance_km", "")),
-            max_time_hours=self._parse_int_value(values.get(f"{prefix}.max_time_hours", 8), 8),
+            max_time_hours=parse_work_hours(values.get(f"{prefix}.max_time_hours", 8)),
             service_time_minutes=self._parse_int_value(values.get(f"{prefix}.service_time_minutes", 8), 8),
             enabled=self._parse_bool_value(values.get(f"{prefix}.enabled", True)),
             max_customers_per_route=None,
@@ -8579,13 +8728,15 @@ TSP имената на полетата се настройват от GUI:
             if self._parse_bool_value(values.get(f"{prefix}.remove", False)):
                 continue
             vehicle = self._vehicle_config_from_values(values, prefix)
-            if vehicle.count <= 0:
-                continue
             vehicles.append(vehicle)
+        from vehicle_schedules import validate_fleet_schedules
+        validate_fleet_schedules(vehicles)
         return vehicles
 
     def _should_rewrite_vehicle_list(self, values):
         import re
+        if any(key.endswith('.physical_bus_schedules') for key in values):
+            return True
 
         indices = sorted({
             int(match.group(1))
@@ -8629,9 +8780,10 @@ TSP имената на полетата се настройват от GUI:
             f"                count={int(vehicle.count)},",
             f"                name={self._string_literal(getattr(vehicle, 'name', ''))},",
             f"                config_id={self._string_literal(getattr(vehicle, 'config_id', ''))},",
+            f"                physical_bus_schedules={getattr(vehicle, 'physical_bus_schedules', None)!r},",
             f"                fixed_cost={int(getattr(vehicle, 'fixed_cost', 0) or 0)},",
             f"                max_distance_km={self._optional_int_literal(vehicle.max_distance_km)},",
-            f"                max_time_hours={int(vehicle.max_time_hours)},",
+            f"                max_time_hours={parse_work_hours(vehicle.max_time_hours)!r},",
             f"                service_time_minutes={int(vehicle.service_time_minutes)},",
             *(f"                {key}={value!r}," for key, value in service_settings(vehicle).items()),
             f"                enabled={'True' if vehicle.enabled else 'False'},",
@@ -8685,7 +8837,7 @@ TSP имената на полетата се настройват от GUI:
             "fixed_cost": "int",
             "capacity": "int",
             "max_distance_km": "optional_int",
-            "max_time_hours": "int",
+            "max_time_hours": "work_hours",
             "service_time_minutes": "int",
             "max_customers_per_route": "optional_int",
             "max_customers_per_day": "optional_int",
@@ -8729,6 +8881,9 @@ TSP имената на полетата се настройват от GUI:
                         block,
                         count=1,
                     )
+            elif ftype == "work_hours":
+                val = parse_work_hours(raw)
+                block = re.sub(rf'({field}\s*=\s*)[^,\n)]+', lambda match: f"{match.group(1)}{val!r}", block, count=1)
             elif ftype == "int":
                 try:
                     val = int(raw)

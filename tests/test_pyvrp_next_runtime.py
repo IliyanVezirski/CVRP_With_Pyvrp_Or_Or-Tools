@@ -236,7 +236,7 @@ assert raw.getvalue().decode("utf-8").strip() == "Ред на депата"
 
         with (
             patch.dict(os.environ, {"FAKE_PYVRP_NEXT_MODE": "self_check_version_mismatch"}),
-            self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, r"must use stable PyVRP 0\.14\.0"),
+            self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, r"must use pinned PyVRP 0\.14\.0"),
         ):
             solve(config)
 

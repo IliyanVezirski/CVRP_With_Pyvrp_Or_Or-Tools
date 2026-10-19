@@ -162,14 +162,23 @@ def validate_mandatory_customer_solution(
 
     Every mandatory visit assigned to the solver must occur on routes exactly
     once. It must not also be reported as dropped, and no mandatory visit may
-    remain in the warehouse allocation. The comparison is content-based and
+    remain in the warehouse allocation, except orders with absent GPS or an
+    explicit customer exclusion.
+    The comparison is content-based and
     count-aware, so it remains valid after pickle round-trips and does not
     collapse separate visits that merely share a business customer ID.
     """
     vehicle_customers = list(getattr(allocation, "vehicle_customers", None) or [])
     warehouse_customers = list(getattr(allocation, "warehouse_customers", None) or [])
     expected_customers = [customer for customer in vehicle_customers if _is_mandatory_visit(customer)]
-    warehouse_mandatory = [customer for customer in warehouse_customers if _is_mandatory_visit(customer)]
+    # Missing GPS is an explicit input rejection, even for mandatory orders.
+    # Keep the invariant unchanged for malformed but non-empty GPS values.
+    from input_handler import customer_has_missing_gps
+    warehouse_mandatory = [
+        customer for customer in warehouse_customers
+        if _is_mandatory_visit(customer) and not customer_has_missing_gps(customer)
+        and not getattr(customer, "manually_excluded", False)
+    ]
 
     expected = _mandatory_counter(expected_customers)
     routes = list(getattr(solution, "routes", None) or []) if solution is not None else []
@@ -189,6 +198,11 @@ def validate_mandatory_customer_solution(
         labels.setdefault(mandatory_visit_fingerprint(customer), _customer_label(customer))
 
     problems: list[str] = []
+    excluded_ids = {str(c.id).strip() for c in warehouse_customers
+                    if getattr(c, "manually_excluded", False)}
+    if any(str(c.id).strip() in excluded_ids or getattr(c, "manually_excluded", False)
+           for c in served_customers):
+        problems.append("Ръчно изключен клиент е включен в маршрут.")
     if warehouse_mandatory:
         preview = ", ".join(_customer_label(customer) for customer in warehouse_mandatory[:5])
         problems.append(
@@ -753,6 +767,8 @@ def _solve_experimental(
             {GEOGRAPHIC_CAPABILITY} if geographic_enabled(config) else set()
         ) | (
             {SERVICE_FORMULA_CAPABILITY} if any(getattr(v, "service_time_mode", "fixed") == "formula" for v in (vehicle_configs or [])) else set()
+        ) | (
+            {'physical_bus_schedules_v1'} if any(getattr(v, 'physical_bus_schedules', None) for v in (vehicle_configs or [])) else set()
         )),
         "payload": {
             "allocation": allocation,
@@ -808,6 +824,8 @@ def _solve_experimental(
         # with parallel one-file builds, could spend over a minute only
         # extracting files before the actual solve even begins.
         result_version = _validate_worker_metadata(envelope, context="solve result", backend=backend)
+        if 'physical_bus_schedules_v1' in request['required_capabilities'] and envelope.get('capabilities', {}).get('physical_bus_schedules_v1') is not True:
+            raise PyVRPNextRuntimeError('PyVRP worker не поддържа индивидуални направления и лимит курсове. Обнови решителя.')
         if SERVICE_FORMULA_CAPABILITY in request["required_capabilities"] and envelope.get("capabilities", {}).get(SERVICE_FORMULA_CAPABILITY) is not True:
             raise PyVRPNextRuntimeError("PyVRP worker не поддържа Формула за обслужване. Обнови и решителя с новия build.")
         if geographic_enabled(config) and envelope.get("capabilities", {}).get(GEOGRAPHIC_CAPABILITY) is not True:

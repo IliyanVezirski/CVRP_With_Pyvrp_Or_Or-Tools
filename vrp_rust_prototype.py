@@ -28,6 +28,8 @@ from vroom_solver import VROOMSolver, VROOMSolverError
 from vrp_runtime import run_vrp_problem, vrp_max_generations, vrp_thread_count
 
 
+from vehicle_schedules import route_schedule_fields
+
 logger = logging.getLogger(__name__)
 
 _BASE_INSTANT = datetime(2026, 7, 16, tzinfo=timezone.utc)
@@ -259,6 +261,10 @@ class VRPRustPrototype(VROOMSolver):
                 },
             }
             if bool(getattr(self.config, "enable_multiple_trips", False)):
+                if getattr(vehicle_config, '_max_trips', None) is not None:
+                    raise VRPRustPrototypeError(
+                        'VRP-Rust не поддържа индивидуален максимум курсове. Избери PyVRP или OR-Tools.'
+                    )
                 shift["reloads"] = [
                     {
                         "location": {"index": reload_index},
@@ -489,6 +495,7 @@ class VRPRustPrototype(VROOMSolver):
                         ),
                         is_feasible=True,
                         schedule_entries=schedule_entries,
+                        **route_schedule_fields(info.config, trip_index),
                         vehicle_key=info.vehicle_key,
                         trip_number=trip_index,
                         trip_count=trip_count,

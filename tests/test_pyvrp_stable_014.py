@@ -27,9 +27,9 @@ class StableReleaseContractTests(unittest.TestCase):
         for version in ("0.14.0a0", "0.14.0rc1", "0.14.1", "0.140.0", "0.13.4"):
             with self.subTest(version=version):
                 with patch.object(worker.importlib.metadata, "version", return_value=version):
-                    with self.assertRaisesRegex(worker.WorkerValidationError, "stable PyVRP"):
+                    with self.assertRaisesRegex(worker.WorkerValidationError, "pinned PyVRP"):
                         worker._pyvrp_version()
-                with self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, "stable PyVRP"):
+                with self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, "pinned PyVRP"):
                     runtime._validate_worker_metadata(worker._metadata(version), context="test")
                 with patch.object(build_worker.importlib.metadata, "version", return_value=version):
                     with self.assertRaisesRegex(SystemExit, "requires stable"):

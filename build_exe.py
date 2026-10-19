@@ -234,6 +234,7 @@ explicit_hiddenimports = [
     "input_handler",
     "warehouse_manager",
     "service_time",
+    "vehicle_schedules",
     "cvrp_solver",
     "pyvrp_solver",
     "output_handler",

@@ -46,6 +46,8 @@ from input_handler import (
 from osrm_client import DistanceMatrix
 from warehouse_manager import WarehouseAllocation
 
+from vehicle_schedules import route_schedule_fields
+
 logger = logging.getLogger(__name__)
 
 # Full-workday time is expressed directly in seconds. Distance remains a hard
@@ -102,6 +104,8 @@ class Route:
     schedule_entries: List[Dict[str, object]] = field(default_factory=list)
     # Multi-trip identity. Defaults keep existing callers backward compatible.
     vehicle_key: str = ""
+    schedule_id: str = ""
+    reserved_schedule_ids: tuple = ()
     trip_number: int = 1
     trip_count: int = 1
     route_id: str = ""
@@ -180,7 +184,8 @@ class ORToolsSolver:
             location_config: Географски настройки (център координати, радиус, наказания/отстъпки).
         """
         self.config = config
-        self.vehicle_configs = vehicle_configs
+        from vehicle_schedules import expand_physical_vehicles
+        self.vehicle_configs = expand_physical_vehicles(vehicle_configs)
         self.customers = customers
         self.distance_matrix = distance_matrix
         self.unique_depots = unique_depots
@@ -945,14 +950,16 @@ class ORToolsSolver:
             return len(self.customers) + 1
 
     def _max_useful_trips_for_vehicle(self, vehicle_config: VehicleConfig) -> int:
-        """Problem/resource-derived upper bound, never a configured trip count.
+        """Resource-derived upper bound capped by the individual bus trip limit.
 
         A non-empty trip must serve at least one customer. It also consumes one
         customer service time, while every trip after the first consumes a reload.
-        Those facts give a finite complete set of optional reload nodes without a
-        business-level ``max_trips`` setting.
+        Those facts give a finite set of optional reload nodes. Reserved
+        directions can further restrict that set for each physical vehicle.
         """
         customer_bound = min(len(self.customers), self._daily_customer_limit(vehicle_config))
+        if getattr(vehicle_config, '_max_trips', None) is not None:
+            customer_bound = min(customer_bound, vehicle_config._max_trips)
         if customer_bound <= 1:
             return max(0, customer_bound)
 
@@ -1613,6 +1620,7 @@ class ORToolsSolver:
                     total_volume=sum(c.volume for c in route_customers),
                     is_feasible=True,
                     schedule_entries=schedule_entries,
+                    **route_schedule_fields(vehicle_config),
                     vehicle_key=self._vehicle_key(vehicle_config, vehicle_id),
                     trip_number=1,
                     trip_count=1,
@@ -1851,6 +1859,7 @@ class ORToolsSolver:
                     total_volume=total_volume,
                     is_feasible=trip_is_feasible,
                     schedule_entries=schedule_entries,
+                    **route_schedule_fields(vehicle_config, trip_number),
                     vehicle_key=vehicle_key,
                     trip_number=trip_number,
                     trip_count=trip_count,
@@ -2068,6 +2077,8 @@ class ORToolsSolver:
                 is_feasible=True,
                 schedule_entries=schedule_entries,
                 vehicle_key=getattr(route, "vehicle_key", ""),
+                schedule_id=getattr(route, "schedule_id", ""),
+                reserved_schedule_ids=getattr(route, "reserved_schedule_ids", ()),
                 trip_number=getattr(route, "trip_number", 1),
                 trip_count=getattr(route, "trip_count", 1),
                 route_id=getattr(route, "route_id", ""),
@@ -2792,6 +2803,7 @@ class ORToolsSolver:
                     total_volume=total_volume,
                     is_feasible=True,
                     schedule_entries=schedule_entries,
+                    **route_schedule_fields(vehicle_config),
                     vehicle_key=self._vehicle_key(vehicle_config, vehicle_id) if vehicle_config else str(vehicle_id),
                     trip_number=1,
                     trip_count=1,

@@ -100,10 +100,11 @@ class VehicleConfig:
     capacity: int              # Максимален капацитет/обем (в стекове, грамове или друга единица)
     count: int                 # Брой налични превозни средства от този тип
     config_id: str = ""        # Stable unique key for this configuration row and its physical vehicles.
+    physical_bus_schedules: Optional[List[Dict]] = None  # Per bus: bus_id, start_id, max_trips.
     name: str = ""             # Име на буса за отчети и карти. При count > 1 се показва като "Име 1", "Име 2"...
     fixed_cost: int = 40000    # Цена/глоба за използване на един бус. По-висока стойност намалява броя използвани бусове.
     max_distance_km: Optional[int] = None  # Максимален дневен пробег на физическия бус. None означава без лимит.
-    max_time_hours: int = 8    # Максимално дневно работно време (включва пътуване, обслужване и презареждане).
+    max_time_hours: float = 8.0    # Часове за деня; 7.5 = 7 ч 30 мин (пътуване, обслужване и презареждане).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
     service_time_mode: str = "fixed"  # fixed or formula; old configurations stay unchanged.
     service_base_seconds: float = 0.0
@@ -795,6 +796,7 @@ class InputConfig:
     delivery_comment_column: str = "Коментар доставка"  # Excel колона с коментар/инструкция за доставката.
     mandatory_column: str = "Задължителен"  # Optional Excel колона: true/false, 1/0 или да/не.
     enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
+    excluded_customer_ids: str = ""  # Клиентски номера, изпращани директно към необслужените.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
 
@@ -1056,6 +1058,7 @@ class OutputConfig:
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
     excel_bus_number_prefix: str = "10045010" # Префикс за номерата на бусове в Excel отчета.
     excel_bus_number_digits: int = 2 # Брой цифри след префикса: 01, 02, 03...
+    excel_bus_number_start: int = 1 # Начален пореден номер за SetData, Excel и картите.
     saturday_excel_bus_number_prefix: str = "100450121" # Префикс за бусове при HTTP /run_saturday.
     saturday_excel_bus_number_digits: int = 1 # Брой цифри след съботния префикс.
     center_bus_numbering_enabled: bool = True # Ако е включено, CENTER_BUS започва от ID 1004501015 нагоре, а другите бусове си тръгват от 1004501001 нагоре.
@@ -1200,8 +1203,13 @@ class SetDataConfig:
     enable_unserved_final_done_flag_update: bool = True  # Дали след makeGroup да се задава отделен финален DoneFlag.
     set_data_unserved_final_done_flag: str = "1973"  # Финален DoneFlag само за необслужените; празно = общият set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
+    set_data_excluded_id_grafik: str = ""  # Отделно направление за ръчно изключените; празно = текущото за необслужени.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
     set_data_unserved_bukva_template: str = "HOF1-{stop_number}"  # Шаблон за Bukva на необслужени клиенти.
+    enable_missing_gps_set_data_upload: bool = True  # Отделно изпращане на заявките без въведени GPS.
+    set_data_missing_gps_done_flag: str = "0"  # Изпраща се директно, без финална промяна на DoneFlag.
+    set_data_missing_gps_id_grafik: str = "1004501000"  # Направление за заявките без GPS.
+    set_data_missing_gps_bukva_template: str = "HOF1-{stop_number}"  # Буква за заявките без GPS.
     enable_make_group: bool = False  # След първоначалния setData изпраща makeGroup; после необслужените получават общия DoneFlag.
     set_data_make_group_command: str = "makeGroup"  # cmd за групиране след успешни setData заявки.
     set_data_timeout_seconds: int = 30  # Таймаут за setData заявка.

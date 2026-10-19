@@ -57,6 +57,7 @@ FIELD_LABELS = {
     "setDataUrl": "Адрес за изпращане", "setDataMethod": "Начин на изпращане",
     "setDataTimeout": "Изчакване (сек.)", "setDataCommand": "Команда за запис",
     "setDataDoneFlag": "Статус на обслужените", "setDataMainSkld": "Главен склад (номер)",
+    "setDataMissingGpsDoneFlag": "Статус на заявките без GPS",
     "setDataVratzaSkld": "Склад Враца (номер)", "setDataDepotMap": "Депа и номера на складове",
     "setDataIdGrafik": "Номер на графика", "setDataIdGrafikTemplate": "Шаблон за графика",
     "setDataBukvaTemplate": "Обозначение на доставките", "setDataMakeGroup": "Групирай заявките",
@@ -99,6 +100,13 @@ def portal_css() -> str:
     header button { color:#e6effa; background:transparent; border-color:#45607d; }
     header .pill { background:#28435f; color:#dbeafe; }
     header .pill.ok { background:#dcfce7; color:#14532d; }
+    #excludedCustomersButton { font-size:13px; padding:7px 10px; }
+    #excludedCustomersCount:empty { display:none; }
+    #exclusionsDialog { width:min(500px,calc(100vw - 32px)); box-sizing:border-box; border:1px solid var(--line); border-radius:14px; padding:24px; color:var(--text); max-height:85vh; overflow:auto; box-shadow:0 18px 60px #10243c30; }
+    #exclusionsDialog::backdrop { background:#10243c55; }
+    #exclusionsDialog h2 { margin:0 0 8px; }
+    #exclusionsDialog textarea, #exclusionsDialog input { width:100%; box-sizing:border-box; margin-bottom:12px; }
+    #exclusionsDialog .actions { justify-content:flex-end; margin-top:16px; }
     main { padding:18px 24px 32px; gap:16px; }
     h2 { font-size:20px; letter-spacing:-.35px; }
     label, .vehicle-field label, summary, .check-line, .notice, .form-status { font-size:14px; }
@@ -219,6 +227,20 @@ def portal_input_settings() -> str:
     """
 
 
+def portal_exclusions_dialog() -> str:
+    return '''<dialog id="exclusionsDialog" aria-labelledby="exclusionsTitle" oncancel="if(exclusionsBusy)event.preventDefault()">
+      <h2 id="exclusionsTitle">Изключени клиенти</h2>
+      <p class="muted">Общи за тестовете и основното стартиране.</p>
+      <label for="inExcludedCustomers">Клиентски номера</label>
+      <textarea id="inExcludedCustomers" rows="5" placeholder="По един на ред или със запетая" autofocus></textarea>
+      <label for="setDataExcludedGrafik">Направление</label>
+      <input id="setDataExcludedGrafik" type="text" placeholder="Както необслужените">
+      <div id="exclusionsStatus" class="form-status" role="status"></div>
+      <div class="actions"><button id="exclusionsCancel" onclick="closeExclusions()">Отказ</button>
+      <button id="exclusionsSave" class="primary" onclick="saveExclusions()">Запази</button></div>
+    </dialog>'''
+
+
 def portal_script() -> str:
     return r"""
     let activeProfile = 'web';
@@ -228,6 +250,38 @@ def portal_script() -> str:
     const inputFields = {inSource:'input_source', inExcel:'excel_file_path', inSheet:'sheet_name', inUrl:'json_url',
       inMethod:'json_http_method', inCommand:'json_command', inWarehouses:'json_sklad', inStatus:'json_done_flag',
       inExtra:'json_extra_query', inTimeout:'json_timeout_seconds', inGroup:'enable_customer_document_grouping'};
+    let exclusionsBusy=false;
+    function updateExclusionButton() {
+      $('excludedCustomersButton').disabled=!state;
+      const ids=String((state.customer_exclusions || {}).customer_ids || '').split(/[\s,;]+/).filter(Boolean);
+      $('excludedCustomersCount').textContent=ids.length ? '· ' + new Set(ids).size : '';
+    }
+    function openExclusions() {
+      if(!state)return;
+      const saved=state.customer_exclusions || {};
+      put('inExcludedCustomers',saved.customer_ids || '');
+      put('setDataExcludedGrafik',saved.direction || '');
+      $('exclusionsStatus').textContent=saved.direction_conflict ? 'Има различни стари направления. Избери общото и запази.' : '';
+      $('exclusionsDialog').showModal();
+    }
+    function closeExclusions() {
+      if(!exclusionsBusy)$('exclusionsDialog').close();
+    }
+    async function saveExclusions() {
+      if(exclusionsBusy)return;
+      exclusionsBusy=true;
+      $('exclusionsSave').disabled=true; $('exclusionsCancel').disabled=true;
+      $('exclusionsStatus').textContent='';
+      try {
+        const result=await apiFetch('/customer-exclusions',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({customer_ids:value('inExcludedCustomers'),direction:value('setDataExcludedGrafik')})});
+        state.customer_exclusions=result.config.customer_exclusions;
+        state.revision=result.config.revision;
+        updateExclusionButton();
+        $('exclusionsDialog').close();
+      } catch(err) {$('exclusionsStatus').textContent=err.message || String(err);}
+      finally {exclusionsBusy=false; $('exclusionsSave').disabled=false; $('exclusionsCancel').disabled=false;}
+    }
     const vehicleNames = {internal_bus:'Основен',center_bus:'Център',external_bus:'Външен',special_bus:'Специализиран',vratza_bus:'Враца'};
     const strategyNames = {AUTOMATIC:'Автоматичен избор',PATH_CHEAPEST_ARC:'Най-изгодна следваща отсечка',SAVINGS:'Обединяване на курсове',SWEEP:'По посока около депото',CHRISTOFIDES:'Свързване на близки точки',PARALLEL_CHEAPEST_INSERTION:'Най-изгодно добавяне на клиент',GUIDED_LOCAL_SEARCH:'Насочено подобряване',SIMULATED_ANNEALING:'По-широко изследване на варианти',TABU_SEARCH:'Търсене без повторение'};
     function fieldLabel(id, fallback) {

@@ -74,6 +74,22 @@ class DriverMapPanelTests(unittest.TestCase):
                     self.assertEqual(len(segments), 3)  # Same split, including return to depot.
                     self.assertIn('<li>1. Client 0, Ltd</li>', generator._google_segment_stops_html(segments[0]))
 
+    def test_mobile_customer_toggle_is_top_right_only_on_small_screens(self):
+        css = driver_panel_css()
+        mobile_css = css.split('@media(max-width:700px)', 1)[1]
+        rule = re.search(r'\.bizant-mobile-driver \.driver-panel-toggle\s*\{([^}]+)\}', mobile_css).group(1)
+        self.assertIn('top:max(12px,env(safe-area-inset-top))', rule)
+        self.assertIn('right:max(12px,env(safe-area-inset-right))', rule)
+        self.assertIn('bottom:auto', rule)
+        self.assertIn('left:auto', rule)
+        self.assertNotIn('.driver-panel-toggle', css.split('@media(max-width:700px)', 1)[0])
+        for provider in ('osm', 'google'):
+            for multiple in (False, True):
+                with self.subTest(provider=provider, multiple=multiple):
+                    _, _, page, _ = self.create(provider, True, multiple)
+                    self.assertIn('top:max(12px,env(safe-area-inset-top))', page)
+                    self.assertNotIn('position:fixed; bottom:12px; left:12px', page)
+
     def test_google_modes_share_settings_and_valid_javascript(self):
         for multiple in (False, True):
             _, _, page, _ = self.create("google", True, multiple)

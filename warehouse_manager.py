@@ -17,7 +17,7 @@ from config import (
     describe_center_zone,
     is_location_in_center_zone,
 )
-from input_handler import Customer, InputData, MandatoryCustomerError, is_mandatory_customer
+from input_handler import Customer, InputData, MandatoryCustomerError, is_mandatory_customer, customer_has_missing_gps
 
 logger = logging.getLogger(__name__)
 
@@ -74,23 +74,45 @@ class WarehouseManager:
         self.vehicle_configs = vehicle_configs if vehicle_configs is not None else main_config.vehicles
         self.location_config = location_config or main_config.locations
         self.cvrp_config = cvrp_config or main_config.cvrp
+        self.main_config = main_config
     
     def allocate_customers(self, input_data: InputData) -> WarehouseAllocation:
         """Разпределя клиентите между превозни средства и склад по новата логика"""
         logger.info("Започвам разпределение на клиенти по новата логика")
         
         # Изчисляване на общия капацитет
-        total_capacity = self._calculate_total_vehicle_capacity(len(input_data.customers), input_data.customers)
+        from input_handler import mark_excluded_customers, shared_customer_exclusions
+        from types import SimpleNamespace
+        mark_excluded_customers(input_data.customers, SimpleNamespace(
+            excluded_customer_ids=shared_customer_exclusions(self.main_config)["customer_ids"]))
+        excluded = [c for c in input_data.customers if c.manually_excluded]
+        missing_gps = [c for c in input_data.customers if customer_has_missing_gps(c) and not c.manually_excluded]
+        route_customers = [c for c in input_data.customers if not customer_has_missing_gps(c) and not c.manually_excluded]
+        total_capacity = self._calculate_total_vehicle_capacity(len(route_customers), route_customers)
         
         # Сортиране на клиентите по обем (от най-малък към най-голям)
         # и за клиенти с еднакъв обем - по разстояние (от най-далечен към най-близък)
-        sorted_customers = self._sort_customers(input_data.customers)
+        sorted_customers = self._sort_customers(route_customers)
         
         logger.info(f"Сортирани {len(sorted_customers)} клиента по обем (най-малък → най-голям) "
                    f"и разстояние (най-далечен → най-близък)")
         
         # Прилагаме новата логика за разпределение
-        return self._allocate_with_warehouse(sorted_customers, total_capacity)
+        allocation = self._allocate_with_warehouse(sorted_customers, total_capacity)
+        allocation.warehouse_customers.extend(missing_gps)
+        allocation.warehouse_volume += sum(c.volume for c in missing_gps)
+        allocation.warehouse_customers.extend(excluded)
+        allocation.warehouse_volume += sum(c.volume for c in excluded)
+        if excluded:
+            logger.info("Ръчно изключени към необслужените: %d посещения; клиентски номера: %s",
+                        len(excluded), ", ".join(dict.fromkeys(str(c.id) for c in excluded)))
+        if missing_gps:
+            logger.warning(
+                "%d клиента без въведени GPS координати са отделени към необслужените; "
+                "няма да участват в матрицата и маршрутите: %s",
+                len(missing_gps), ", ".join(str(c.id) for c in missing_gps[:10]),
+            )
+        return allocation
     
     def _vehicle_trip_upper_bound(
         self,
@@ -123,6 +145,8 @@ class WarehouseManager:
             shift_bound = None
 
         candidates = [bound for bound in (shift_bound, customer_count) if bound is not None and bound > 0]
+        if getattr(vehicle, '_max_trips', None) is not None:
+            candidates.append(vehicle._max_trips)
         daily_customer_limit = getattr(vehicle, "max_customers_per_day", None)
         if daily_customer_limit is None:
             daily_customer_limit = getattr(vehicle, "max_customers_per_route", None)
@@ -137,7 +161,8 @@ class WarehouseManager:
         total_capacity = 0
         
         if self.vehicle_configs:
-            for vehicle in self.vehicle_configs:
+            from vehicle_schedules import expand_physical_vehicles
+            for vehicle in expand_physical_vehicles(self.vehicle_configs):
                 if vehicle.enabled:
                     trip_bound = self._vehicle_trip_upper_bound(vehicle, customer_count, customers)
                     total_capacity += vehicle.capacity * vehicle.count * trip_bound

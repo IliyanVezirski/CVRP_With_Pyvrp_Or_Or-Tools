@@ -30,6 +30,8 @@ from pyvrp_solver import PyVRPSolver
 from warehouse_manager import WarehouseAllocation
 
 
+from vehicle_schedules import route_schedule_fields
+
 logger = logging.getLogger(__name__)
 
 _UINT32_MAX = (1 << 32) - 1
@@ -508,6 +510,7 @@ class VROOMSolver(PyVRPSolver):
                 total_volume=route_volume,
                 is_feasible=route_is_feasible,
                 schedule_entries=schedule_entries,
+                **route_schedule_fields(runtime_info.config),
                 vehicle_key=runtime_info.vehicle_key,
                 trip_number=1,
                 trip_count=1,

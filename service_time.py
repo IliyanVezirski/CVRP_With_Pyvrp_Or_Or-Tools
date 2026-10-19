@@ -13,6 +13,17 @@ SERVICE_FIELDS = {
 SERVICE_FORMULA_CAPABILITY = "service_time_formula_v1"
 
 
+def parse_work_hours(value):
+    """Accept decimal hours, including Bulgarian decimal commas, without truncation."""
+    try:
+        hours = float(str(value).strip().replace(",", "."))
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("Работно време: въведи часове, например 7,5 за 7 ч 30 мин.") from None
+    if isinstance(value, bool) or not isfinite(hours) or hours <= 0:
+        raise ValueError("Работно време: въведи положително число, например 7,5.")
+    return hours
+
+
 def service_settings(vehicle):
     return {key: getattr(vehicle, key, default) for key, default in SERVICE_FIELDS.items()}
 
@@ -71,6 +82,23 @@ def formula_seconds(quantity, vehicle):
     )
     # Decimal avoids flooring 305.99999999999994 instead of the intended 306.
     return int(min(base + quantity * seconds / units, maximum).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def service_formula_preview(vehicle):
+    """Plain-language UI preview; calculations use the solver's exact formula."""
+    settings = validate_service_settings(vehicle)
+
+    def duration(seconds):
+        minutes, remainder = divmod(int(seconds), 60)
+        return (f"{minutes} мин" + (f" {remainder} сек" if remainder else "")) if minutes else f"{remainder} сек"
+
+    base = f"{float(settings['service_base_seconds']):g}"
+    rate = f"{float(settings['service_seconds_per_unit']):g}"
+    units = f"{float(settings['service_quantity_units']):g}"
+    maximum = duration(float(settings['service_max_seconds']))
+    examples = " · ".join(f"{q} единици → {duration(formula_seconds(q, vehicle))}" for q in (10, 100))
+    return (f"За клиент: {base} сек + {rate} сек за всеки {units} единици.\n"
+            f"Не повече от {maximum} на клиент.\nПримери: {examples}")
 
 
 def customer_service_seconds(customer, vehicle=None, default_minutes=15):

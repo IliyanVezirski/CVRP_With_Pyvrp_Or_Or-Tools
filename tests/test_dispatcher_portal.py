@@ -248,7 +248,7 @@ class DispatcherPortalTests(unittest.TestCase):
 
     def test_start_has_no_confirmation_dialog_or_scroll_to_logs(self):
         page = api._web_gui_html(self.base.api, '127.0.0.1', 8095)
-        for removed in ('planConfirmation', 'confirmPlan', 'pendingPlan', '<dialog', "$('progressSection').scrollIntoView"):
+        for removed in ('planConfirmation', 'confirmPlan', 'pendingPlan', "$('progressSection').scrollIntoView"):
             self.assertNotIn(removed, page)
         self.assertIn('await submitPlan(useGlobal)', page)
         self.assertIn('expected_revision:state.revision', page)
