@@ -79,11 +79,13 @@
 | `name` | Човешко име в карти/отчети. |
 | `enabled` | Дали редът участва. |
 | `count` | Брой еднакво конфигурирани физически бусове. |
+| `physical_bus_schedules` | Индивидуални записи `{bus_id, start_id, max_trips}` за всеки физически бус. Начално ID изисква брой запазени курсове; диапазоните не могат да се застъпват. |
 | `capacity` | Максимален обем за един курс. |
 | `fixed_cost` | Цена за използване на бус в solver objective-а. |
 | `max_distance_km` | Общ дневен пробег; `None` означава без лимит. |
-| `max_time_hours` | Общ дневен работен span, включително път, обслужване, чакане и reload. |
+| `max_time_hours` | Общ дневен работен span, включително път, обслужване, чакане и reload. Допуска дробни часове: `7.5` = 7 ч. 30 мин. |
 | `service_time_minutes` | Fallback обслужване на клиент, ако клиентът няма свое. |
+| `service_time_mode` | `fixed` или `formula`; индивидуалното входно време има предимство. Виж [формулата](SERVICE_TIME_FORMULA.md) за останалите полета. |
 | `max_customers_per_day` | Общ брой клиенти през всички курсове. |
 | `max_customers_per_route` | Legacy fallback; новите настройки използват дневния лимит. |
 | `start_location` | Начално депо. GUI го избира от именуваните депа. |
@@ -102,6 +104,7 @@
 | HTTP mapping | `json_gps_field`, `json_client_id_field`, `json_client_name_field`, `json_volume_field`, `json_document_field`, `json_plas_doc_field`, `json_id_skld_field`, `json_time_window_field`, `json_delivery_comment_field`, `json_service_time_field`, `json_mandatory_field` |
 | Excel mapping | `gps_column`, `client_id_column`, `client_name_column`, `volume_column`, `document_column`, `time_window_column`, `delivery_comment_column`, `mandatory_column` |
 | Обработка | `enable_customer_document_grouping` |
+| Изключени клиенти | `excluded_customer_ids` — точни клиентски номера, общи за Web тестовете и основните стартирания. |
 
 `json_override_date` приема нормална дата `DD/MM/YYYY`. В request-local API override се приема и `current_week_saturday`; специалният endpoint `/run_saturday` задава токена автоматично.
 
@@ -229,7 +232,7 @@ OSRM Table API връща едновременно duration и distance. Solver 
 | Upload | `route_maps_upload_mode`, `route_maps_upload_url`, `route_maps_upload_token_field`, `route_maps_upload_token`, `route_maps_upload_file_field`, `route_maps_upload_bus_id_field`, `route_maps_upload_timeout_seconds` |
 | Активен Excel | `enable_excel_output`, `excel_output_dir` |
 | Legacy Excel имена | `warehouse_excel_file`, `routes_excel_file`, `efficiency_excel_file`; текущият `generate_all_outputs()` не ги използва |
-| Номериране | `excel_bus_number_prefix`, `excel_bus_number_digits`, `saturday_excel_bus_number_prefix`, `saturday_excel_bus_number_digits`, `center_bus_numbering_enabled`, `center_bus_numbering_start_id` |
+| Номериране | `excel_bus_number_prefix`, `excel_bus_number_digits`, `excel_bus_number_start`, `saturday_excel_bus_number_prefix`, `saturday_excel_bus_number_digits`, `center_bus_numbering_enabled`, `center_bus_numbering_start_id` |
 | CSV | `enable_csv_output`, `csv_output_file` |
 | Графики | `enable_charts`, `charts_output_dir`, `efficiency_chart_file`, `route_comparison_file`, `volume_distribution_file` |
 | Детайли | `include_detailed_info`, `show_km_info`, `show_time_info`, `show_volume_info` |
@@ -238,13 +241,15 @@ OSRM Table API връща едновременно duration и distance. Solver 
 
 Google ключът може да идва от `GOOGLE_MAPS_API_KEY`. Upload token-ите не трябва да се публикуват в документация или source control.
 
+Изрично запазеното ID на физически бус е с предимство и пред center серията. Автоматичната серия започва от `excel_bus_number_start` (default 1) и прескача резервираните ID-та. При съвпадение с `excel_bus_number_prefix` числовият суфикс на ID-то определя видимия номер на маршрута и `{route_number}` в SetData; иначе се използва поредният номер.
+
 ## `APIConfig`
 
 ### HTTP и Web
 
 `api_host`, `api_port`, `api_public_url`, `api_key`, `api_endpoint`, `trigger_endpoint`, `saturday_trigger_endpoint`, `tsp_endpoint`, `tsp_report_endpoint`, `shutdown_endpoint`, `health_endpoint`, `web_gui_enabled`, `web_gui_endpoint`, `web_gui_title`, `web_gui_public_host`, `web_gui_public_url`, `web_gui_trusted_proxy_ips`, `web_gui_run_defaults_json`.
 
-`web_gui_run_defaults_json` е наследено поле. Вътрешният save endpoint съществува, но текущата Web страница няма бутон за него и Web стартът не смесва автоматично запазения preset. Не разчитай на това поле като активен слой настройки.
+`web_gui_run_defaults_json` пази активния независим профил „Тестове“ като `{"version":2,"settings":{...}}`. Той се прилага при Web старт с `profile="web"`, но не при публичните `/run` и `/solve`. Бусовете и изключените клиенти са общи, а не част от този профил. Стари записи без версия не се активират автоматично.
 
 `web_gui_users` е legacy bootstrap поле. Реалните PBKDF2 credentials са в `data/web_gui_auth.json` и се управляват от Desktop GUI.
 
@@ -278,6 +283,9 @@ Google ключът може да идва от `GOOGLE_MAPS_API_KEY`. Upload to
 | `set_data_bukva_template` | Буква/позиция за обслужени. |
 | `enable_unserved_set_data_upload` | Изпраща и необслужените. |
 | `set_data_unserved_done_flag`, `set_data_unserved_id_grafik`, `set_data_unserved_id_grafik_template`, `set_data_unserved_bukva_template` | Отделни стойности за необслужени. |
+| `set_data_excluded_id_grafik` | Отделно направление за ръчно изключени клиенти; празно използва обичайното за необслужени. Общо за двата Web профила. |
+| `enable_missing_gps_set_data_upload` | Отделно изпращане на заявки с липсващи GPS; изисква и главното `enable_set_data_upload`. |
+| `set_data_missing_gps_done_flag`, `set_data_missing_gps_id_grafik`, `set_data_missing_gps_bukva_template` | Директен статус (default `0`), направление и буква за липсващи GPS, без финалното маркиране на обичайните необслужени. |
 | `enable_make_group`, `set_data_make_group_command` | След успешните заявки изпраща групиране по склад. |
 
 Шаблоните могат да използват контекста, предоставен от `setdata_client.py`, включително route/stop/bus/trip стойности. Основният Excel отчет добавя само колоната **Курс**, когато има повече от един курс. Техническият CSV добавя `ID бус`, `Курс`, `ID курс` и `Ключ бус` за машинна корелация.

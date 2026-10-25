@@ -33,6 +33,8 @@ import ipaddress
 import importlib
 import json
 import logging
+from service_time import SERVICE_FIELDS, service_settings, validate_service_settings, parse_work_hours
+import math
 import os
 import re
 import shutil
@@ -80,8 +82,17 @@ from tsp_daily_report import (
 
 
 logger = logging.getLogger(__name__)
+from display_units import volume_unit_label, validate_volume_unit_label
+from map_display_settings import DEFAULT_MANDATORY_CUSTOMER_COMMENT, validate_mandatory_customer_comment, validate_driver_volume_label
 _CURRENT_WEEK_SATURDAY_TOKEN = "current_week_saturday"
 _OUTPUT_COMPAT_DEFAULTS = {
+    "excel_bus_number_start": 1,
+    "volume_unit_label": "стекове",
+    "mandatory_customer_comment": DEFAULT_MANDATORY_CUSTOMER_COMMENT,
+    "mobile_driver_panel": False,
+    "enable_routing_quality_report": False,
+    "driver_total_volume_label": "",
+    "driver_customer_volume_label": "",
     # Older preserved config.py files predate the dedicated Saturday fields.
     # Keep Web/API usable until the next global save writes the fields into the
     # external config file.
@@ -89,6 +100,13 @@ _OUTPUT_COMPAT_DEFAULTS = {
     "saturday_excel_bus_number_digits": 1,
 }
 _OUTPUT_COMPAT_FIELD_SPECS = {
+    "excel_bus_number_start": ("int", "excel_bus_number_digits", "Начален номер за SetData, Excel и карти."),
+    "volume_unit_label": ("str", "enable_interactive_map", "Наименование на количеството в интерфейса и отчетите."),
+    "mandatory_customer_comment": ("str", "enable_interactive_map", "Текст за задължителните клиенти в индивидуалните карти."),
+    "mobile_driver_panel": ("bool", "enable_interactive_map", "Алтернативен мобилен панел за шофьора."),
+    "enable_routing_quality_report": ("bool", "enable_excel_output", "Допълнителен отчет за приблизителни отсечки и неизвестен произход."),
+    "driver_total_volume_label": ("str", "enable_interactive_map", "Надпис за общите количества в интерфейса, картите и отчетите."),
+    "driver_customer_volume_label": ("str", "enable_interactive_map", "Надпис за количеството при клиент в интерфейса, картите и отчетите."),
     "saturday_excel_bus_number_prefix": (
         "str",
         "excel_bus_number_digits",
@@ -101,9 +119,19 @@ _OUTPUT_COMPAT_FIELD_SPECS = {
     ),
 }
 _SET_DATA_COMPAT_DEFAULTS = {
+    "set_data_excluded_id_grafik": "",
     "enable_unserved_final_done_flag_update": True,
+    "enable_missing_gps_set_data_upload": True,
+    "set_data_missing_gps_done_flag": "0",
+    "set_data_missing_gps_id_grafik": "1004501000",
+    "set_data_missing_gps_bukva_template": "HOF1-{stop_number}",
 }
 _SET_DATA_COMPAT_FIELD_SPECS = {
+    "set_data_excluded_id_grafik": ("str", "enable_set_data_upload", "Направление за ръчно изключените клиенти."),
+    "enable_missing_gps_set_data_upload": ("bool", "enable_set_data_upload", "Изпращане на заявки без GPS."),
+    "set_data_missing_gps_done_flag": ("str", "enable_set_data_upload", "Директен DoneFlag за заявки без GPS."),
+    "set_data_missing_gps_id_grafik": ("str", "enable_set_data_upload", "Направление за заявки без GPS."),
+    "set_data_missing_gps_bukva_template": ("str", "enable_set_data_upload", "Буква за заявки без GPS."),
     "enable_unserved_final_done_flag_update": (
         "bool",
         "set_data_unserved_done_flag",
@@ -138,6 +166,9 @@ def _output_config_value(output: Any, field_name: str) -> Any:
 
 def _set_data_config_value(set_data: Any, field_name: str) -> Any:
     """Read a setData field with defaults for preserved legacy configs."""
+    from missing_gps_settings import MISSING_GPS_DEFAULTS, missing_gps_setting
+    if field_name in MISSING_GPS_DEFAULTS:
+        return missing_gps_setting(set_data, field_name)
     if hasattr(set_data, field_name):
         return getattr(set_data, field_name)
     if field_name == "set_data_unserved_final_done_flag":
@@ -340,6 +371,7 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "charts_output_dir": ("output", "charts_output_dir"),
     "map_provider": ("output", "map_provider"),
     "enable_excel_output": ("output", "enable_excel_output"),
+    "enable_routing_quality_report": ("output", "enable_routing_quality_report"),
     "enable_csv_output": ("output", "enable_csv_output"),
     "enable_charts": ("output", "enable_charts"),
     "enable_interactive_map": ("output", "enable_interactive_map"),
@@ -475,6 +507,7 @@ _QUERY_SETTING_ALIASES = {
     "charts_output_dir": "charts_output_dir",
     "map_provider": "map_provider",
     "enable_excel_output": "enable_excel_output",
+    "enable_routing_quality_report": "enable_routing_quality_report",
     "enable_csv_output": "enable_csv_output",
     "enable_charts": "enable_charts",
     "enable_interactive_map": "enable_interactive_map",
@@ -1032,6 +1065,11 @@ def _parse_solver_type(value: Any) -> str:
 
 
 def _coerce_setting_value(section_name: str, field_name: str, value: Any, current_value: Any) -> Any:
+    if section_name == "input" and field_name == "excluded_customer_ids":
+        from input_handler import normalise_excluded_customer_ids
+        return normalise_excluded_customer_ids(value)
+    if section_name == "vehicles" and field_name == "max_time_hours":
+        return parse_work_hours(value)
     if value == "" and field_name in {
         "pyvrp_seed",
         "max_distance_km",
@@ -1443,17 +1481,29 @@ def _vehicle_from_payload(config: MainConfig, payload: Dict[str, Any], template:
     for field_name, value in payload.items():
         if field_name not in allowed_fields:
             continue
+        if field_name == 'physical_bus_schedules':
+            from vehicle_schedules import normalise_schedules
+            vehicle.physical_bus_schedules = normalise_schedules(value)
+            continue
         if field_name in {"start_location", "end_location", "tsp_depot_location", "reload_location"} and isinstance(value, str):
             value = _resolve_depot_reference(config, value)
         current_value = getattr(vehicle, field_name)
+        if field_name in SERVICE_FIELDS and field_name != "service_time_mode":
+            if isinstance(value, bool):
+                raise ValueError("Формула: въведи число, не отметка.")
+            setattr(vehicle, field_name, float(value))
+            continue
         setattr(vehicle, field_name, _coerce_setting_value("vehicles", field_name, value, current_value))
 
     return vehicle
 
 
 def _validate_vehicle_configs(vehicles: list[VehicleConfig]) -> None:
+    from vehicle_schedules import validate_fleet_schedules
+    validate_fleet_schedules(vehicles)
     seen_config_ids: set[str] = set()
     for index, vehicle in enumerate(vehicles):
+        validate_service_settings(vehicle)
         label = str(getattr(vehicle, "name", "") or f"vehicle {index + 1}")
         config_id = str(getattr(vehicle, "config_id", "") or "").strip()
         if not config_id:
@@ -1472,8 +1522,7 @@ def _validate_vehicle_configs(vehicles: list[VehicleConfig]) -> None:
             raise ValueError(f"{label}: count не може да е отрицателно")
         if float(getattr(vehicle, "capacity", 0) or 0) <= 0:
             raise ValueError(f"{label}: capacity трябва да е положително")
-        if float(getattr(vehicle, "max_time_hours", 0) or 0) <= 0:
-            raise ValueError(f"{label}: max_time_hours трябва да е положително")
+        parse_work_hours(getattr(vehicle, "max_time_hours", None))
         if int(getattr(vehicle, "reload_time_minutes", 0) or 0) < 0:
             raise ValueError(f"{label}: reload_time_minutes не може да е отрицателно")
         daily_limit = getattr(vehicle, "max_customers_per_day", None)
@@ -1789,6 +1838,10 @@ def _build_saturday_run_config_override(
 
 
 _WEB_GUI_CVRP_FIELDS = {
+    "enable_priority_dropping", "drop_volume_weight", "drop_closeness_weight",
+    "min_customer_drop_penalty", "max_customer_drop_penalty",
+    "customer_dropping_strategy", "drop_geo_reference_km", "drop_geo_strength",
+    "drop_repair_max_ejections", "drop_repair_budget_fraction", "distance_penalty_disjunction",
     "solver_type",
     "objective_metric",
     "time_objective_include_waiting",
@@ -1850,9 +1903,60 @@ _WEB_GUI_API_FIELDS = {
 }
 _WEB_GUI_PERSIST_API_FIELDS = _WEB_GUI_API_FIELDS | {"web_gui_run_defaults_json"}
 
-# The browser may override only operational output and setData settings.  This
-# deliberately excludes solver, input, routing, vehicles and API settings.
+# Shared fleet and server/security settings are never part of a planning profile.
+_SHARED_EXCLUSION_FIELDS = {("input", "excluded_customer_ids"), ("set_data", "set_data_excluded_id_grafik")}
+
+
+def _shared_exclusions(config_obj):
+    from input_handler import shared_customer_exclusions
+    return shared_customer_exclusions(config_obj)
+
+
+def _save_shared_exclusions(payload):
+    from input_handler import normalise_excluded_customer_ids
+    if not isinstance(payload, dict) or set(payload) != {"customer_ids", "direction"}:
+        raise ValueError("Подай списък с клиенти и направление.")
+    if not isinstance(payload["direction"], str):
+        raise ValueError("Направлението трябва да е текст.")
+    ids = normalise_excluded_customer_ids(payload["customer_ids"])
+    direction = payload["direction"].strip()
+    if any(c.isspace() for c in direction):
+        raise ValueError("Въведи един номер на направление без интервали.")
+    with _CONFIG_TRANSACTION_LOCK:
+        config_obj = deepcopy(get_config())
+        config_obj.input.excluded_customer_ids = ids
+        config_obj.set_data.set_data_excluded_id_grafik = direction
+        # Migrate only these two old profile values; preserve every other setting.
+        raw = getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""
+        if raw:
+            stored = json.loads(raw)
+            settings = stored.get("settings", {}) if stored.get("version") == 2 else stored
+            for section, field in _SHARED_EXCLUSION_FIELDS:
+                if isinstance(settings.get(section), dict):
+                    settings[section].pop(field, None)
+            config_obj.api.web_gui_run_defaults_json = json.dumps(stored, ensure_ascii=False)
+        backup = _persist_web_gui_config(config_obj, include_api=False, include_cvrp=False,
+            include_vehicles=False, include_exclusions=True)
+        current = config_module.config_manager.config
+        current.input.excluded_customer_ids = ids
+        current.set_data.set_data_excluded_id_grafik = direction
+        current.api.web_gui_run_defaults_json = config_obj.api.web_gui_run_defaults_json
+        return {"status": "saved", "scope": "shared_customer_exclusions", "backup_file": backup}
+
+
+_WEB_RUN_INPUT_FIELDS = {
+    "excluded_customer_ids",
+    "input_source", "excel_file_path", "sheet_name", "json_url",
+    "json_http_method", "json_command", "json_sklad", "json_done_flag",
+    "json_extra_query", "json_override_date", "json_timeout_seconds",
+    "enable_customer_document_grouping",
+}
 _WEB_RUN_OUTPUT_FIELDS = {
+    "volume_unit_label",
+    "mandatory_customer_comment",
+    "mobile_driver_panel",
+    "driver_total_volume_label",
+    "driver_customer_volume_label",
     "enable_interactive_map",
     "map_output_file",
     "routes_output_dir",
@@ -1866,12 +1970,14 @@ _WEB_RUN_OUTPUT_FIELDS = {
     "map_provider",
     "folium_tiles",
     "enable_excel_output",
+    "enable_routing_quality_report",
     "excel_output_dir",
     "warehouse_excel_file",
     "routes_excel_file",
     "efficiency_excel_file",
     "excel_bus_number_prefix",
     "excel_bus_number_digits",
+    "excel_bus_number_start",
     "saturday_excel_bus_number_prefix",
     "saturday_excel_bus_number_digits",
     "center_bus_numbering_enabled",
@@ -1882,6 +1988,7 @@ _WEB_RUN_OUTPUT_FIELDS = {
     "charts_output_dir",
 }
 _WEB_RUN_SET_DATA_FIELDS = {
+    "set_data_excluded_id_grafik",
     "enable_set_data_upload",
     "set_data_url",
     "set_data_http_method",
@@ -1894,6 +2001,10 @@ _WEB_RUN_SET_DATA_FIELDS = {
     "set_data_id_grafik_template",
     "set_data_bukva_template",
     "enable_unserved_set_data_upload",
+    "enable_missing_gps_set_data_upload",
+    "set_data_missing_gps_done_flag",
+    "set_data_missing_gps_id_grafik",
+    "set_data_missing_gps_bukva_template",
     "set_data_unserved_done_flag",
     "enable_unserved_final_done_flag_update",
     "set_data_unserved_final_done_flag",
@@ -1905,6 +2016,11 @@ _WEB_RUN_SET_DATA_FIELDS = {
     "set_data_timeout_seconds",
 }
 _WEB_RUN_CVRP_FIELDS = {
+    "enable_priority_dropping", "drop_volume_weight", "drop_closeness_weight",
+    "min_customer_drop_penalty", "max_customer_drop_penalty",
+    "customer_dropping_strategy", "drop_geo_reference_km", "drop_geo_strength",
+    "drop_repair_max_ejections", "drop_repair_budget_fraction", "distance_penalty_disjunction",
+    "allow_customer_skipping",
     "solver_type",
     "objective_metric",
     "time_objective_include_waiting",
@@ -1956,6 +2072,7 @@ _WEB_RUN_CVRP_FIELDS = {
     "vrp_log_progress",
 }
 _WEB_RUN_SECTION_FIELDS = {
+    "input": _WEB_RUN_INPUT_FIELDS,
     "cvrp": _WEB_RUN_CVRP_FIELDS,
     "output": _WEB_RUN_OUTPUT_FIELDS,
     "set_data": _WEB_RUN_SET_DATA_FIELDS,
@@ -2185,7 +2302,7 @@ def _validate_web_run_settings_shape(raw_settings: Any) -> Dict[str, Dict[str, A
     unknown_sections = sorted(set(raw_settings) - set(_WEB_RUN_SECTION_FIELDS))
     if unknown_sections:
         raise ValueError(
-            "Web run settings support only cvrp, output and set_data; disallowed sections: "
+            "Настройките за планиране не приемат следните раздели: "
             + ", ".join(unknown_sections)
         )
 
@@ -2213,12 +2330,19 @@ def _extract_web_run_settings(payload: Any) -> Dict[str, Dict[str, Any]]:
     return _validate_web_run_settings_shape(payload.get("run_settings", {}))
 
 
-def _stored_web_run_settings(api_config, strict: bool = False) -> Dict[str, Dict[str, Any]]:
+def _stored_web_run_settings(api_config, strict: bool = False, *, active_only: bool = False) -> Dict[str, Dict[str, Any]]:
     raw = str(getattr(api_config, "web_gui_run_defaults_json", "") or "").strip()
     if not raw:
         return {}
     try:
-        return _validate_web_run_settings_shape(json.loads(raw))
+        stored = json.loads(raw)
+        # Do not silently revive presets from builds that deliberately ignored
+        # them. A dispatcher activates the new profile with an explicit save.
+        if isinstance(stored, dict) and stored.get("version") == 2:
+            return _validate_web_run_settings_shape(stored.get("settings"))
+        if active_only:
+            return {}
+        return _validate_web_run_settings_shape(stored)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         if strict:
             raise ValueError(f"Invalid saved Web run defaults: {exc}") from exc
@@ -2227,9 +2351,34 @@ def _stored_web_run_settings(api_config, strict: bool = False) -> Dict[str, Dict
 
 
 def _validate_web_run_config(config_obj: MainConfig) -> None:
+    from customer_deferral import validate_deferral_config
+    validate_deferral_config(config_obj.cvrp)
     cvrp = config_obj.cvrp
     output = config_obj.output
     set_data = config_obj.set_data
+    input_cfg = config_obj.input
+    if input_cfg.input_source not in {"excel", "http_json"}:
+        raise ValueError("Избери източник на заявките: файл или свързана система.")
+    if str(input_cfg.json_http_method).upper() not in {"GET", "POST"}:
+        raise ValueError("Избраният начин за получаване на заявките е невалиден.")
+    if not 1 <= input_cfg.json_timeout_seconds <= 3600:
+        raise ValueError("Изчакването при получаване на заявки трябва да е между 1 и 3600 секунди.")
+    if input_cfg.input_source == "excel" and not str(input_cfg.excel_file_path or "").strip():
+        raise ValueError("Посочи файла със заявки на компютъра с Bizant.")
+    raw_date = str(input_cfg.json_override_date or "").strip()
+    if raw_date and input_cfg.input_source == "http_json":
+        try:
+            datetime.strptime(_resolve_dynamic_api_date(raw_date), "%d/%m/%Y")
+        except ValueError as exc:
+            raise ValueError("Избери валидна дата за доставка.") from exc
+
+    if cvrp.customer_dropping_strategy == "legacy" and cvrp.enable_priority_dropping:
+        for name in ("drop_volume_weight", "drop_closeness_weight"):
+            value = float(getattr(cvrp, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} трябва да е неотрицателно крайно число")
+        if not 1 <= cvrp.min_customer_drop_penalty <= cvrp.max_customer_drop_penalty:
+            raise ValueError("Максималната глоба за пропускане трябва да е поне колкото минималната, а минималната — поне 1.")
 
     for field_name in (
         "parallel_first_solution_strategies",
@@ -2362,7 +2511,13 @@ def _validate_web_run_config(config_obj: MainConfig) -> None:
     if map_provider not in {"osm", "google"}:
         raise ValueError("map_provider must be osm or google")
     output.map_provider = map_provider
+    output.volume_unit_label = validate_volume_unit_label(_output_config_value(output, "volume_unit_label"))
+    output.mandatory_customer_comment = validate_mandatory_customer_comment(_output_config_value(output, "mandatory_customer_comment"))
+    for field in ("driver_total_volume_label", "driver_customer_volume_label"):
+        setattr(output, field, validate_driver_volume_label(_output_config_value(output, field)))
 
+    from vehicle_numbering import validate_bus_number_start
+    output.excel_bus_number_start = validate_bus_number_start(_output_config_value(output, "excel_bus_number_start"))
     saturday_prefix = str(
         _output_config_value(output, "saturday_excel_bus_number_prefix") or ""
     ).strip()
@@ -2398,8 +2553,10 @@ def _validate_web_run_config(config_obj: MainConfig) -> None:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"{label} must be a valid http/https URL")
 
-    if upload_mode == "effect_upload":
+    if upload_mode == "effect_upload" and bool(getattr(output, "enable_interactive_map", False)):
         require_http_url("route_maps_upload_url", getattr(output, "route_maps_upload_url", ""))
+    if input_cfg.input_source == "http_json":
+        require_http_url("Адрес за получаване на заявки", input_cfg.json_url)
     if bool(getattr(set_data, "enable_set_data_upload", False)):
         require_http_url("set_data_url", getattr(set_data, "set_data_url", ""))
 
@@ -2422,6 +2579,8 @@ def _apply_web_run_settings(config_obj: MainConfig, settings: Dict[str, Dict[str
     for section_name, section_payload in (settings or {}).items():
         section_obj = getattr(config_obj, section_name)
         for field_name, raw_value in section_payload.items():
+            if (section_name, field_name) in _SHARED_EXCLUSION_FIELDS:
+                continue  # Old profile/browser payloads cannot override common exclusions.
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
@@ -2437,7 +2596,10 @@ def _apply_web_run_settings(config_obj: MainConfig, settings: Dict[str, Dict[str
             }:
                 current_value = _parse_string_list(current_value)
             setting_name = f"{section_name}.{field_name}"
-            if isinstance(current_value, bool):
+            if section_name == "input" and field_name == "sheet_name":
+                if raw_value is not None and not isinstance(raw_value, str):
+                    raise ValueError("Името на листа трябва да е текст или да остане празно.")
+            elif isinstance(current_value, bool):
                 if not isinstance(raw_value, bool):
                     raise ValueError(f"{setting_name} must be a JSON boolean")
             elif isinstance(current_value, int):
@@ -2470,10 +2632,27 @@ def _build_web_run_config_override(payload: Any = None) -> tuple[MainConfig, lis
     """Build an isolated config used exclusively by a Web GUI run."""
     base_config = get_config()
     request_settings = _extract_web_run_settings(payload)
-
+    profile = (payload or {}).get("profile", "web")
+    if profile not in {"web", "global"}:
+        raise ValueError("Избери планиране от портала или основните настройки.")
+    saved = _stored_web_run_settings(base_config.api, strict=True, active_only=True) if profile == "web" else {}
     request_config = deepcopy(base_config)
-    applied = _apply_web_run_settings(request_config, request_settings)
+    applied = _apply_web_run_settings(request_config, _merge_web_run_settings(saved, request_settings))
     return request_config, list(dict.fromkeys(applied)), []
+
+
+def _prepare_web_run_dates(config_obj: MainConfig) -> None:
+    """Resolve symbolic dates at execution, not while saving a recurring profile."""
+    if config_obj.input.input_source != "http_json":
+        return
+    raw = str(config_obj.input.json_override_date or "").strip()
+    config_obj.input.json_override_date = _resolve_dynamic_api_date(raw)
+    if raw == _CURRENT_WEEK_SATURDAY_TOKEN:
+        stamp = datetime.strptime(config_obj.input.json_override_date, "%d/%m/%Y").strftime("%Y-%m-%d")
+        config_obj.output._api_run_date_stamp = f"{stamp}_събота"
+        config_obj.output.excel_bus_number_prefix = _output_config_value(config_obj.output, "saturday_excel_bus_number_prefix")
+        config_obj.output.excel_bus_number_digits = _output_config_value(config_obj.output, "saturday_excel_bus_number_digits")
+    _expand_api_run_date_output_tokens(config_obj, [f"output.{name}" for name in _API_RUN_DATE_OUTPUT_FIELDS])
 
 
 def _web_run_settings_from_config(config_obj: MainConfig) -> Dict[str, Dict[str, Any]]:
@@ -2499,6 +2678,7 @@ def _web_run_settings_from_config(config_obj: MainConfig) -> Dict[str, Dict[str,
                 )
             )
             for field_name in sorted(allowed_fields)
+            if (section_name, field_name) not in _SHARED_EXCLUSION_FIELDS
             if (
                 hasattr(getattr(config_obj, section_name), field_name)
                 or (section_name == "output" and field_name in _OUTPUT_COMPAT_DEFAULTS)
@@ -2566,22 +2746,24 @@ def _depot_name_for_coords(config_obj: MainConfig, coords: Any) -> str:
 
 def _vehicle_to_web_dict(vehicle: VehicleConfig, config_obj: Optional[MainConfig] = None) -> Dict[str, Any]:
     result = {
+        **service_settings(vehicle),
         "vehicle_type": getattr(getattr(vehicle, "vehicle_type", None), "value", str(getattr(vehicle, "vehicle_type", ""))),
         "name": str(getattr(vehicle, "name", "") or ""),
         "config_id": str(getattr(vehicle, "config_id", "") or ""),
+        "physical_bus_schedules": getattr(vehicle, 'physical_bus_schedules', None) or [],
         "enabled": bool(getattr(vehicle, "enabled", True)),
         "count": int(getattr(vehicle, "count", 0) or 0),
         "capacity": int(getattr(vehicle, "capacity", 0) or 0),
         "fixed_cost": int(getattr(vehicle, "fixed_cost", 0) or 0),
         "max_distance_km": getattr(vehicle, "max_distance_km", None),
-        "max_time_hours": int(getattr(vehicle, "max_time_hours", 8) or 8),
-        "service_time_minutes": int(getattr(vehicle, "service_time_minutes", 8) or 8),
+        "max_time_hours": parse_work_hours(getattr(vehicle, "max_time_hours", 8)),
+        "service_time_minutes": int(getattr(vehicle, "service_time_minutes", 8)),
         "max_customers_per_route": getattr(vehicle, "max_customers_per_route", None),
         "max_customers_per_day": getattr(vehicle, "max_customers_per_day", None),
         "end_location": _coords_to_text(getattr(vehicle, "end_location", None)),
-        "reload_location": _coords_to_text(getattr(vehicle, "reload_location", None) or getattr(vehicle, "start_location", None)),
+        "reload_location": _coords_to_text(getattr(vehicle, "reload_location", None)),
         "reload_time_minutes": int(getattr(vehicle, "reload_time_minutes", 30) or 0),
-        "start_time_minutes": int(getattr(vehicle, "start_time_minutes", 480) or 480),
+        "start_time_minutes": int(getattr(vehicle, "start_time_minutes", 480)),
     }
     if config_obj is None:
         result["start_location"] = _coords_to_text(getattr(vehicle, "start_location", None))
@@ -2598,7 +2780,8 @@ def _reload_config_from_disk():
     global MainConfig, RoutingEngine, CenterZoneConfig, TrafficZoneConfig, VehicleConfig, VehicleType, CVRP_SOLVER_TYPES, get_named_depots, get_config
 
     with _CONFIG_RELOAD_LOCK:
-        module = importlib.reload(config_module)
+        from config_compat import reload_config_module
+        module = reload_config_module(config_module)
         MainConfig = module.MainConfig
         RoutingEngine = module.RoutingEngine
         CenterZoneConfig = module.CenterZoneConfig
@@ -2611,6 +2794,17 @@ def _reload_config_from_disk():
         return module.get_config()
 
 
+def _web_config_revision(config_obj: MainConfig) -> str:
+    from hashlib import sha256
+    snapshot = {
+        "customer_exclusions": _shared_exclusions(config_obj),
+        "settings": _web_run_settings_from_config(config_obj),
+        "vehicles": [_vehicle_to_web_dict(vehicle, config_obj) for vehicle in config_obj.vehicles],
+        "profile": str(getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""),
+    }
+    return sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True) -> Dict[str, Any]:
     cfg = _reload_config_from_disk() if refresh_from_disk else get_config()
     logger.info("Web GUI config loaded: %s vehicles from config.py", len(cfg.vehicles or []))
@@ -2620,7 +2814,8 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
     cvrp = cfg.cvrp
     api_users = _get_web_auth_service(api_config).credential_store.list_usernames()
     global_web_run_settings = _web_run_settings_from_config(cfg)
-    saved_web_run_settings = _stored_web_run_settings(api_config)
+    saved_web_run_settings = _stored_web_run_settings(api_config, active_only=True)
+    effective_web_settings = _merge_web_run_settings(global_web_run_settings, saved_web_run_settings)
 
     return {
         "status": "ok",
@@ -2645,6 +2840,7 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
             if hasattr(cvrp, field_name)
         },
         "vehicles": [_vehicle_to_web_dict(vehicle, cfg) for vehicle in (cfg.vehicles or [])],
+        "customer_exclusions": _shared_exclusions(cfg),
         "depots": [
             {
                 "name": str(name),
@@ -2657,9 +2853,10 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
             for vehicle_type in VehicleType
             if vehicle_type not in (VehicleType.WAREHOUSE, VehicleType.DISABLED)
         ],
-        "web_run_settings": _redact_web_run_settings(global_web_run_settings),
+        "web_run_settings": _redact_web_run_settings(effective_web_settings),
         "web_run_global_settings": _redact_web_run_settings(global_web_run_settings),
         "web_run_defaults_saved": bool(saved_web_run_settings),
+        "revision": _web_config_revision(cfg),
         "run_status": _run_status_snapshot(),
     }
 
@@ -2725,6 +2922,8 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
         # A preserved config.py can be older than the executable. Insert the
         # known additive fields during the first global Web save instead of
         # silently leaving the external config structurally incompatible.
+        if class_name == "InputConfig" and field_name == "excluded_customer_ids":
+            return class_block.rstrip() + f'\n    excluded_customer_ids: str = {_python_literal(value)}\n\n'
         if class_name == "OutputConfig" and field_name in _OUTPUT_COMPAT_FIELD_SPECS:
             annotation, anchor_name, comment = _OUTPUT_COMPAT_FIELD_SPECS[field_name]
             anchor_pattern = rf'(?m)^(\s*){re.escape(anchor_name)}\s*:.*$'
@@ -2778,18 +2977,20 @@ def _vehicle_config_literal(vehicle: VehicleConfig) -> str:
         f"                count={int(getattr(vehicle, 'count', 0) or 0)},",
         f"                name={_python_literal(getattr(vehicle, 'name', ''))},",
         f"                config_id={_python_literal(getattr(vehicle, 'config_id', ''))},",
+        f"                physical_bus_schedules={getattr(vehicle, 'physical_bus_schedules', None)!r},",
         f"                fixed_cost={int(getattr(vehicle, 'fixed_cost', 0) or 0)},",
         f"                max_distance_km={_optional_int_literal(getattr(vehicle, 'max_distance_km', None))},",
-        f"                max_time_hours={int(getattr(vehicle, 'max_time_hours', 8) or 8)},",
-        f"                service_time_minutes={int(getattr(vehicle, 'service_time_minutes', 8) or 8)},",
+        f"                max_time_hours={parse_work_hours(getattr(vehicle, 'max_time_hours', 8))!r},",
+        f"                service_time_minutes={int(getattr(vehicle, 'service_time_minutes', 8))},",
+        *(f"                {key}={value!r}," for key, value in service_settings(vehicle).items()),
         f"                enabled={'True' if bool(getattr(vehicle, 'enabled', True)) else 'False'},",
         f"                max_customers_per_route={_optional_int_literal(getattr(vehicle, 'max_customers_per_route', None))},",
         f"                max_customers_per_day={_optional_int_literal(getattr(vehicle, 'max_customers_per_day', None))},",
         f"                start_location={_tuple_literal(getattr(vehicle, 'start_location', None))},",
         f"                end_location={_tuple_literal(getattr(vehicle, 'end_location', None))},",
-        f"                reload_location={_tuple_literal(getattr(vehicle, 'reload_location', None) or getattr(vehicle, 'start_location', None))},",
+        f"                reload_location={_tuple_literal(getattr(vehicle, 'reload_location', None))},",
         f"                reload_time_minutes={int(getattr(vehicle, 'reload_time_minutes', 30) or 0)},",
-        f"                start_time_minutes={int(getattr(vehicle, 'start_time_minutes', 480) or 480)},",
+        f"                start_time_minutes={int(getattr(vehicle, 'start_time_minutes', 480))},",
         f"                tsp_depot_location={_tuple_literal(getattr(vehicle, 'tsp_depot_location', None) or getattr(vehicle, 'start_location', None))}",
         "            ),",
     ])
@@ -2818,6 +3019,8 @@ def _persist_web_gui_config(
     include_vehicles: bool = True,
     include_output: bool = False,
     include_set_data: bool = False,
+    include_input: bool = False,
+    include_exclusions: bool = False,
 ) -> str:
     """Atomically persists only the explicitly selected config.py sections."""
     config_path = os.path.abspath(config_module.__file__)
@@ -2840,9 +3043,19 @@ def _persist_web_gui_config(
         for field_name in sorted(_WEB_RUN_SET_DATA_FIELDS):
             if hasattr(config_obj.set_data, field_name):
                 content = _replace_class_field_literal(content, "SetDataConfig", field_name, getattr(config_obj.set_data, field_name))
+    if include_input:
+        for field_name in sorted(_WEB_RUN_INPUT_FIELDS):
+            if hasattr(config_obj.input, field_name):
+                content = _replace_class_field_literal(content, "InputConfig", field_name, getattr(config_obj.input, field_name))
     if include_vehicles:
         content = _replace_vehicles_list_literal(content, list(config_obj.vehicles or []))
+        from config_compat import ensure_vehicle_schema
+        content = ensure_vehicle_schema(content)
 
+    if include_exclusions:
+        content = _replace_class_field_literal(content, "InputConfig", "excluded_customer_ids", config_obj.input.excluded_customer_ids)
+        content = _replace_class_field_literal(content, "SetDataConfig", "set_data_excluded_id_grafik", config_obj.set_data.set_data_excluded_id_grafik)
+        content = _replace_class_field_literal(content, "APIConfig", "web_gui_run_defaults_json", config_obj.api.web_gui_run_defaults_json)
     compile(content, config_path, "exec")
     backup_path = _backup_config_py(config_path)
     fd, tmp_path = tempfile.mkstemp(
@@ -2906,6 +3119,7 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
             applied.append(f"cvrp.{field_name}")
 
     for section_name, allowed_fields in (
+        ("input", _WEB_RUN_INPUT_FIELDS),
         ("output", _WEB_RUN_OUTPUT_FIELDS),
         ("set_data", _WEB_RUN_SET_DATA_FIELDS),
     ):
@@ -2921,6 +3135,8 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
                 f"Unsupported global Web fields in {section_name}: " + ", ".join(unknown_fields)
             )
         for field_name, raw_value in section_payload.items():
+            if (section_name, field_name) in _SHARED_EXCLUSION_FIELDS:
+                continue
             current_value = (
                 _output_config_value(section_obj, field_name)
                 if section_name == "output"
@@ -2945,7 +3161,7 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
         item.startswith("output.") or item.startswith("set_data.")
         for item in applied
     )
-    if saves_operational_settings and str(
+    if saves_operational_settings and not _stored_web_run_settings(config_obj.api, active_only=True) and str(
         getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""
     ):
         # Old builds stored a Web-only preset.  Once the user explicitly saves
@@ -2965,6 +3181,7 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
         include_vehicles=False,
         include_output=any(item.startswith("output.") for item in applied),
         include_set_data=any(item.startswith("set_data.") for item in applied),
+        include_input=any(item.startswith("input.") for item in applied),
     )
     config_module.config_manager.config = config_obj
     return {
@@ -3048,11 +3265,14 @@ def _save_web_run_defaults(payload: Any) -> Dict[str, Any]:
 
 
 def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
-    """Persist a Web-only output/setData preset without changing global runs."""
+    """Save an independent operational profile, never a copy of the fleet."""
     if not isinstance(payload, dict):
         raise ValueError("Web run defaults body must be a JSON object")
 
     config_obj = deepcopy(get_config())
+    common = _shared_exclusions(config_obj)
+    config_obj.input.excluded_customer_ids = common["customer_ids"]
+    config_obj.set_data.set_data_excluded_id_grafik = common["direction"]
     if bool(payload.get("clear", False)):
         config_obj.api.web_gui_run_defaults_json = ""
         applied: list[str] = ["api.web_gui_run_defaults_json.clear"]
@@ -3060,18 +3280,19 @@ def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
         request_settings = _extract_web_run_settings(payload)
         if not request_settings:
             raise ValueError("run_settings cannot be empty when saving Web defaults")
-        canonical = _canonical_web_run_settings(request_settings, base_config=config_obj)
-        existing = _stored_web_run_settings(config_obj.api)
+        existing = _stored_web_run_settings(config_obj.api, strict=True, active_only=True)
+        full_settings = _merge_web_run_settings(_web_run_settings_from_config(config_obj), existing, request_settings)
+        canonical = _canonical_web_run_settings(full_settings, base_config=config_obj)
 
         existing_token = (existing.get("output") or {}).get("route_maps_upload_token")
         output_payload = canonical.setdefault("output", {})
         if bool(payload.get("clear_upload_token", False)):
-            output_payload.pop("route_maps_upload_token", None)
+            output_payload["route_maps_upload_token"] = ""
         elif "route_maps_upload_token" not in output_payload and existing_token is not None:
             output_payload["route_maps_upload_token"] = existing_token
 
         config_obj.api.web_gui_run_defaults_json = json.dumps(
-            canonical,
+            {"version": 2, "settings": canonical},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -3087,6 +3308,7 @@ def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
         include_api=True,
         include_cvrp=False,
         include_vehicles=False,
+        include_exclusions=True,
     )
     config_module.config_manager.config = config_obj
     return {
@@ -3115,23 +3337,40 @@ def _tail_text_file(path: str, max_chars: int = 50000, max_lines: int = 250) -> 
 
 
 def _web_gui_logs_payload() -> Dict[str, Any]:
+    from web_run_progress import progress_reader
     logs_dir = _api_logs_dir()
     run_status = _run_status_snapshot()
     run_id = str(run_status.get("run_id") or "").strip()
     files = {
         "api": os.path.join(logs_dir, "cvrp_api_server.log"),
     }
-    if run_id:
+    # In-process runs use the configured optimiser log; isolated Web runs also
+    # capture stdout in process_log. Never accept log paths from a request.
+    solver_log = str(getattr(get_config().logging, "log_file", "") or "").strip()
+    if solver_log:
+        files["solver"] = solver_log
+    process_log = str(run_status.get("process_log") or "").strip()
+    if process_log:
+        files["run"] = process_log
+    elif run_id:
         files["run"] = os.path.join(logs_dir, f"api_run_{run_id}.log")
+    seen_paths = set()
+    unique_files = {}
+    for name, path in files.items():
+        identity = os.path.normcase(os.path.abspath(path))
+        if identity not in seen_paths:
+            seen_paths.add(identity)
+            unique_files[name] = path
     return {
         "status": "ok",
         "run_status": run_status,
+        "progress": progress_reader.read(run_id, files.get("run"), run_status=run_status),
         "logs": {
             name: {
                 "path": path,
                 "tail": _tail_text_file(path),
             }
-            for name, path in files.items()
+            for name, path in unique_files.items()
         },
     }
 
@@ -3150,7 +3389,7 @@ def _json_for_inline_script(value: Any) -> str:
 
 def _web_gui_login_html(api_config) -> str:
     base_path = _web_gui_endpoint(api_config)
-    title = html.escape(str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"))
+    title = "Bizant"
     storage_unavailable = False
     try:
         has_users = bool(_get_web_auth_service(api_config).credential_store.list_usernames())
@@ -3160,18 +3399,15 @@ def _web_gui_login_html(api_config) -> str:
     if storage_unavailable:
         setup_notice = (
             '<div class="setup">Защитеното хранилище е недостъпно. Възстанови или поправи '
-            'data/web_gui_auth.json, после управлявай потребителите от Desktop Settings.</div>'
+            'данните за достъп с помощта на администратора.</div>'
         )
     elif not has_users:
         setup_notice = (
-            '<div class="setup">Няма настроен Web потребител. Отвори Desktop Settings → API/Web, '
+            '<div class="setup">Няма настроен потребител. Отвори настройките на програмата → API/Web, '
             'добави потребител и после обнови тази страница.</div>'
         )
     else:
         setup_notice = ""
-    transport_warning = "" if str(getattr(api_config, "web_gui_public_url", "") or "").lower().startswith("https://") else (
-        '<div class="warning">Връзката е по HTTP. За достъп извън защитена локална мрежа използвай HTTPS reverse proxy.</div>'
-    )
     return f"""<!doctype html>
 <html lang="bg">
 <head>
@@ -3179,42 +3415,62 @@ def _web_gui_login_html(api_config) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Вход · {title}</title>
   <style>
-    :root {{ color-scheme:light; --ink:#172033; --muted:#64748b; --accent:#2563eb; --line:#d8dee8; }}
+    :root {{ color-scheme:light; --ink:#172c45; --muted:#596d84; --accent:#185de0; --line:#dce4ee; }}
     * {{ box-sizing:border-box; }}
-    body {{ margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; font-family:Segoe UI,Arial,sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#dbeafe 0,transparent 34%),#f1f5f9; }}
-    main {{ width:min(430px,100%); background:#fff; border:1px solid var(--line); border-radius:16px; padding:28px; box-shadow:0 20px 55px rgba(15,23,42,.12); }}
-    h1 {{ margin:0 0 6px; font-size:24px; }} p {{ margin:0 0 20px; color:var(--muted); font-size:13px; }}
-    label {{ display:block; margin:12px 0 5px; color:#475569; font-size:12px; font-weight:700; }}
-    input {{ width:100%; padding:11px 12px; border:1px solid #cbd5e1; border-radius:8px; font:inherit; }}
-    button {{ width:100%; margin-top:18px; padding:11px 14px; border:0; border-radius:8px; color:#fff; background:var(--accent); font-weight:700; cursor:pointer; }}
+    body {{ margin:0; min-height:100vh; min-height:100dvh; display:grid; place-items:center; padding:24px; font:16px/1.5 Segoe UI,Arial,sans-serif; color:var(--ink); background:#eef2f7; }}
+    main {{ width:min(440px,100%); background:#fff; border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 12px 40px #172c4510; }}
+    .brand {{ display:flex; align-items:center; gap:12px; padding:24px 32px; background:#122b47; color:#fff; font-size:26px; font-weight:700; letter-spacing:-.6px; }}
+    .brand-mark {{ display:grid; place-items:center; width:36px; height:36px; border:1px solid #ffffff45; border-radius:9px; font-size:23px; background:#ffffff12; }}
+    .login-content {{ padding:30px 32px 28px; }}
+    h1 {{ margin:0 0 6px; font-size:25px; letter-spacing:-.5px; }}
+    label {{ display:block; margin:16px 0 6px; font-size:14px; font-weight:600; }}
+    input {{ width:100%; min-height:48px; padding:11px 12px; border:1px solid #bfcbd9; border-radius:8px; font:inherit; }}
+    button {{ width:100%; min-height:48px; margin-top:22px; padding:11px 14px; border:0; border-radius:8px; color:#fff; background:var(--accent); font:600 16px/1.5 Segoe UI,Arial,sans-serif; cursor:pointer; }}
+    button:hover {{ background:#124ebf; }}
+    :is(input,button):focus-visible {{ outline:3px solid #79abff; outline-offset:3px; }}
+    .password-field {{ position:relative; }}
+    .password-field input {{ padding-right:92px; }}
+    .password-toggle {{ position:absolute; right:4px; top:4px; width:auto; min-height:40px; margin:0; padding:7px 10px; color:var(--accent); background:transparent; font-size:14px; }}
+    .password-toggle:hover {{ background:#eff5fd; }}
     button:disabled {{ opacity:.6; cursor:wait; }}
-    .error {{ min-height:20px; margin-top:12px; color:#b91c1c; font-size:12px; font-weight:600; }}
-    .warning {{ margin:16px 0 2px; padding:10px 12px; border-radius:8px; background:#fff7ed; color:#9a3412; font-size:11px; line-height:1.4; }}
-    .setup {{ margin:0 0 16px; padding:11px 12px; border-radius:8px; background:#eff6ff; color:#1e40af; font-size:12px; line-height:1.45; }}
+    .error {{ min-height:0; margin-top:12px; color:#b91c1c; font-size:14px; font-weight:600; }}
+    .error:empty {{ display:none; }}
+    .setup {{ margin:0 0 16px; padding:12px; border-radius:8px; background:#eff6ff; color:#1e40af; font-size:14px; }}
+    @media(max-width:480px) {{ body {{ padding:16px; }} .brand {{ padding:20px 24px; }} .login-content {{ padding:24px; }} }}
   </style>
 </head>
 <body>
   <main>
-    <h1>{title}</h1>
-    <p>Влез, за да стартираш рънове и да управляваш Web настройките.</p>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">B</span><span>{title}</span></div>
+    <div class="login-content">
+    <h1>Добре дошли</h1>
     {setup_notice}
     <form id="loginForm">
       <label for="username">Потребител</label>
-      <input id="username" autocomplete="username" required autofocus>
+      <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
       <label for="password">Парола</label>
-      <input id="password" type="password" autocomplete="current-password" required>
-      <button id="loginButton" type="submit">Вход</button>
-      <div id="loginError" class="error"></div>
+      <div class="password-field"><input id="password" name="password" type="password" autocomplete="current-password" required><button class="password-toggle" id="passwordToggle" type="button" aria-controls="password" aria-pressed="false">Покажи</button></div>
+      <button id="loginButton" type="submit">Влез в Bizant</button>
+      <div id="loginError" class="error" role="alert" aria-live="polite"></div>
     </form>
-    {transport_warning}
+    </div>
   </main>
   <script>
     const basePath = {_json_for_inline_script(base_path)};
+    document.getElementById("passwordToggle").addEventListener("click", () => {{
+      const input = document.getElementById("password");
+      const button = document.getElementById("passwordToggle");
+      const visible = input.type === "password";
+      input.type = visible ? "text" : "password";
+      button.textContent = visible ? "Скрий" : "Покажи";
+      button.setAttribute("aria-pressed", String(visible));
+    }});
     document.getElementById("loginForm").addEventListener("submit", async event => {{
       event.preventDefault();
       const button = document.getElementById("loginButton");
       const error = document.getElementById("loginError");
-      button.disabled = true; error.textContent = "";
+      if (button.disabled) return;
+      button.disabled = true; button.textContent = "Влизане…"; error.textContent = "";
       try {{
         const response = await fetch(basePath + "/api/login", {{
           method:"POST", credentials:"same-origin", headers:{{"Content-Type":"application/json"}},
@@ -3224,7 +3480,7 @@ def _web_gui_login_html(api_config) -> str:
         if (!response.ok) throw new Error(data.error || "Неуспешен вход.");
         window.location.replace(basePath);
       }} catch (err) {{ error.textContent = String(err.message || err); }}
-      finally {{ button.disabled = false; }}
+      finally {{ button.disabled = false; button.textContent = "Влез в Bizant"; }}
     }});
   </script>
 </body>
@@ -3232,18 +3488,21 @@ def _web_gui_login_html(api_config) -> str:
 
 
 def _web_gui_html(api_config, host: str, port: int) -> str:
+    from supervisor_ui import supervisor_css, supervisor_toolbar, supervisor_progress, supervisor_script
+    from web_portal import (dispatcher_labels, portal_css, portal_navigation,
+                            portal_heading, portal_input_settings, portal_script, portal_exclusions_dialog)
     base_path = _web_gui_endpoint(api_config)
     data_json = _json_for_inline_script({
         "apiBase": f"{base_path}/api",
         "title": str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"),
     })
     base_path_json = _json_for_inline_script(base_path)
-    return f"""<!doctype html>
+    page = f"""<!doctype html>
 <html lang="bg">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"))}</title>
+  <title>Bizant</title>
   <style>
     :root {{ --bg:#f3f5f8; --surface:#fff; --line:#d8dee8; --text:#172033; --muted:#64748b; --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; }}
     * {{ box-sizing: border-box; }}
@@ -3304,6 +3563,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     .solver-fine-panel {{ margin-top:14px; padding:13px; border:1px solid #bfdbfe; border-radius:9px; background:#fff; }}
     .solver-fine-panel h4 {{ margin:0 0 4px; font-size:13px; color:#1e3a8a; }}
     .solver-fine-panel[hidden] {{ display:none; }}
+    .solver-settings-grid[hidden] {{ display:none; }}
     .settings-card h3 {{ margin:0 0 5px; font-size:14px; }}
     .settings-accordion {{ grid-column:1 / -1; margin:0; padding:0; overflow:hidden; }}
     .settings-accordion > summary {{ display:flex; align-items:center; justify-content:space-between; gap:14px; padding:15px 16px; border:0; cursor:pointer; list-style:none; color:var(--text); user-select:none; }}
@@ -3334,62 +3594,61 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     @media (max-width: 640px) {{ header {{ align-items:flex-start; flex-direction:column; }} main {{ padding:12px; }} .field-grid, .check-grid, .solver-settings-grid {{ grid-template-columns:1fr; }} }}
     pre {{ white-space:pre; overflow:auto; width:100%; max-width:100%; max-height:300px; padding:12px; background:#0f172a; color:#dbeafe; border-radius:6px; font:11px/1.35 Consolas, "Courier New", monospace; }}
     .full {{ grid-column:1 / -1; }}
+    {portal_css()}
+    {supervisor_css()}
   </style>
 </head>
 <body>
-  <header>
+  <header class="workspace-header">
     <div>
-      <h1 id="pageTitle">CVRP Optimizer</h1>
+      <div class="workspace-brand"><h1 id="pageTitle">Bizant</h1><span class="division-path" id="divisionPath" aria-label="Дивизия">{html.escape(base_path)}</span></div>
       <div class="muted" id="serverLine">Зареждам...</div>
     </div>
+    {supervisor_progress()}
     <div class="actions">
-      <span id="statusPill" class="pill">status</span>
+      <button class="quiet" id="excludedCustomersButton" onclick="openExclusions()" aria-haspopup="dialog" disabled>Изключени клиенти <span id="excludedCustomersCount"></span></button>
+      <span id="statusPill" class="pill">Зареждане…</span>
       <button onclick="loadAll()">Обнови</button>
-      <button onclick="saveGlobalSettings()">Запази настройките глобално</button>
-      <button class="primary" onclick="startRun()">Стартирай без запис</button>
-      <button class="danger" onclick="stopRun()">Спри run</button>
-      <button class="danger" onclick="shutdownProgram()">Спри API</button>
+      <button id="stopPlanButton" onclick="stopRun()" hidden>Спри изчислението</button>
       <button onclick="logout()">Изход</button>
     </div>
   </header>
+  {portal_exclusions_dialog()}
   <main>
-    <section class="vehicles-section">
+    <section class="vehicles-section" id="fleetSection">
       <div class="section-head">
         <div>
-          <h2>Превозни средства</h2>
-          <div class="muted">Бусовете са отделна глобална конфигурация. Всеки панел отдолу е самостоятелен тип/група превозни средства.</div>
+          <h2>Бусове</h2>
         </div>
-        <span class="scope-badge">Записват се отделно</span>
-      </div>
-      <div class="actions" style="margin-bottom:10px">
-        <button onclick="addVehicle()">Добави бус</button>
-        <button class="primary" onclick="saveVehicles()">Запази само бусовете глобално</button>
-        <span class="muted">Този бутон не променя solver, output, setData или други настройки.</span>
+        <div class="actions">
+          <span id="fleetChangeCount" class="change-badge" aria-live="polite"></span>
+          <button id="fleetSaveButton" onclick="saveVehicles()" hidden>Запази бусовете</button>
+          <button class="quiet" onclick="addVehicle()">+ Добави бус</button>
+        </div>
       </div>
       <div class="vehicles-wrap">
+        <div class="fleet-columns" id="fleetColumns" aria-hidden="true"><span></span><span>Име</span><span>Брой</span><span>Капацитет (<span class="quantity-unit-label"></span>)</span><span>Обслужване</span><span>Начално депо</span><span></span></div>
         <div id="vehiclesBody" class="vehicle-list"></div>
+        <p id="fleetEmpty" class="vehicle-empty" hidden>Няма добавени бусове. Използвай „Добави бус“, за да създадеш автопарка.</p>
       </div>
       <div id="vehicleSettingsStatus" class="form-status">Зареждане на бусовете…</div>
     </section>
+    <section id="runActionsSection" aria-label="Стартиране">
+      {portal_heading()}
+      {supervisor_toolbar()}
+      <div id="runSettingsStatus" class="form-status" role="status">Зареждане на настройките…</div>
+    </section>
+    <details id="settingsDrawer" class="settings-drawer">
+      <summary><span>Настройки</span></summary>
     <section id="runSettingsSection">
-      <div class="section-head">
-        <div>
-          <h2>Настройки за решаване и изпълнение</h2>
-          <div class="muted">Една и съща форма може да се използва временно за текущия рън или да се запише глобално за цялата програма.</div>
-        </div>
-        <span class="scope-badge">Временен рън или глобален запис</span>
-      </div>
-      <div class="notice" style="margin-bottom:14px">
-        <strong>„Стартирай без запис“</strong> използва стойностите само за този Web рън и не променя <code>config.py</code>.
-        <strong>„Запази глобално“</strong> записва същите стойности в <code>config.py</code> и те важат за Desktop GUI, Web и API <code>/run</code>.
-      </div>
       <div class="settings-grid">
+        {portal_input_settings()}
         <details class="settings-card settings-accordion solver-settings-card" data-settings-panel="solver">
           <summary>
-            <span><span class="settings-accordion-title">Решаване</span><span class="settings-accordion-description">Solver, цел, времеви лимит и фини настройки за качество.</span></span>
+            <span><span class="settings-accordion-title">Маршрути</span></span>
           </summary>
           <div class="settings-accordion-body">
-          <div class="muted">Тези стойности също участват в временния старт; не е необходимо първо да ги записваш.</div>
+          <p class="settings-accordion-description">Цел, време за търсене и допълнителни курсове.</p>
           <div class="solver-settings-grid">
             <div><label for="solverType">Solver</label><select id="solverType" title="VRP-Rust е отделен експериментален sidecar; зоните влияят в distance режим, а pure time минимизира само продължителността. VROOM 1.15 не поддържа свързани повторни курсове."><option value="pyvrp">PyVRP 0.13</option><option value="pyvrp_experimental">PyVRP 0.14</option><option value="or_tools">OR-Tools</option><option value="vroom">VROOM 1.15</option><option value="vrp">VRP-Rust</option></select></div>
             <div><label for="objectiveMetric">Цел</label><select id="objectiveMetric" title="time = оптимизация по време; distance = оптимизация по километри."><option value="time">Време</option><option value="distance">Разстояние</option></select></div>
@@ -3399,7 +3658,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           </div>
           <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental">
             <h4>PyVRP качество</h4>
-            <div class="muted">Тези настройки работят и за 0.13, и за изолирания 0.14 worker.</div>
+            <div class="muted">Допълнителни настройки за задълбочено търсене на по-добър план.</div>
             <div class="solver-settings-grid">
               <div><label for="pyvrpSeed">Seed (празно = база)</label><input id="pyvrpSeed" type="number"></div>
               <div><label for="pyvrpSeedBase">Seed база</label><input id="pyvrpSeedBase" type="number"></div>
@@ -3426,8 +3685,38 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div><label for="pyvrpPenaltyMax">Максимална penalty</label><input id="pyvrpPenaltyMax" type="number" min="0" max="1000000000" step="0.1"></div>
             </div>
           </div>
+          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,or_tools,vroom,vrp">
+            <h4>Пропускане на клиенти</h4>
+            <div class="muted">Избери правило за индивидуалната глоба. Задължителните клиенти не могат да се пропускат. Географският приоритет е наличен само за PyVRP 0.14.</div>
+            <div class="solver-settings-grid">
+              <div class="check-line"><input id="allowCustomerSkipping" type="checkbox"><label for="allowCustomerSkipping">Позволи пропускане</label></div>
+              <div><label for="customerDroppingStrategy">Начин на пропускане</label><select id="customerDroppingStrategy"><option value="legacy">Обем и близост до депо</option><option value="geographic">Географски приоритет</option></select></div>
+              <div><label for="dropBasePenalty">Базова глоба</label><input id="dropBasePenalty" type="number" min="1" max="100000000" title="Основа за географския приоритет. При Обем и близост се използва само ако правилото е изключено — еднаква глоба за всички."></div>
+            </div>
+            <div id="legacyDeferralFields">
+              <h4>Обем и близост до депо</h4>
+              <div class="muted">По-големият обем и по-голямата близост намаляват глобата за пропускане. Използва се най-близкото депо по права линия. Глобата е между минимум и максимум, без добавяне на базовата глоба. При изключено правило всички получават базовата глоба.</div>
+              <div class="solver-settings-grid">
+                <div class="check-line"><input id="priorityDroppingEnabled" type="checkbox"><label for="priorityDroppingEnabled">Правило обем и близост</label></div>
+                <div><label for="dropVolumeWeight">Тежест обем</label><input id="dropVolumeWeight" type="number" min="0" step="0.05" title="По-висока тежест прави големите заявки по-лесни за пропускане. Тежестите се нормализират автоматично."></div>
+                <div><label for="dropClosenessWeight">Тежест близост</label><input id="dropClosenessWeight" type="number" min="0" step="0.05" title="По-висока тежест прави близките до депото заявки по-лесни за пропускане."></div>
+                <div><label for="dropMinPenalty">Минимална глоба</label><input id="dropMinPenalty" type="number" min="1"></div>
+                <div><label for="dropMaxPenalty">Максимална глоба</label><input id="dropMaxPenalty" type="number" min="1"></div>
+              </div>
+            </div>
+            <div id="geographicDeferralFields" hidden>
+              <h4>Географски приоритет — PyVRP 0.14</h4>
+              <div class="muted">Глоба = база × (1 + сила × (пътни км до собствения склад / мащаб)²). Може да остави повече близки клиенти. Обемът и границите на другия режим не участват. Това не е прогноза за утрешния маршрут.</div>
+              <div class="solver-settings-grid">
+              <div><label for="dropGeoReference">Мащаб разстояние (км)</label><input id="dropGeoReference" type="number" min="1" max="1000" step="1"></div>
+              <div><label for="dropGeoStrength">Сила на приоритета</label><input id="dropGeoStrength" type="number" min="0" max="10" step="0.1"></div>
+              <div><label for="dropMaxEjections">Макс. групова замяна</label><input id="dropMaxEjections" type="number" min="1" max="12" title="Горна граница на една пробвана замяна, не фиксиран брой близки клиенти или лимит на всички необслужени."></div>
+              <div><label for="dropRepairBudget">Дял от времето (0.15 = 15%)</label><input id="dropRepairBudget" type="number" min="0.01" max="0.30" step="0.01"></div>
+              </div>
+            </div>
+          </div>
           <div class="solver-fine-panel" data-solvers="pyvrp_experimental">
-            <h4>PyVRP 0.14 worker</h4>
+            <h4>PyVRP 0.14 — изчакване и резервен метод</h4>
             <div class="solver-settings-grid">
               <div><label for="pyvrpNextTimeout">Worker timeout (сек.)</label><input id="pyvrpNextTimeout" type="number" min="0" max="86400" title="0 = solver лимитът плюс автоматичен резерв от 180 секунди за построяване и запис."></div>
               <div class="check-line"><input id="pyvrpNextFallback" type="checkbox"><label for="pyvrpNextFallback">Fallback към PyVRP 0.13</label></div>
@@ -3459,7 +3748,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             </div>
           </div>
           <div class="solver-fine-panel" data-solvers="vrp">
-            <h4>VRP-Rust experimental</h4>
+            <h4>VRP-Rust — пробен метод</h4>
             <div class="solver-settings-grid">
               <div><label for="vrpWorkerTimeout">Worker timeout (сек.)</label><input id="vrpWorkerTimeout" type="number" min="0" max="86400" title="0 = автоматично спрямо solver лимита."></div>
               <div><label for="vrpThreads">Вътрешни threads</label><input id="vrpThreads" type="number" min="0" max="256" title="0 = автоматичен брой нишки."></div>
@@ -3478,13 +3767,22 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         </details>
         <details class="settings-card settings-accordion" data-settings-panel="output">
           <summary>
-            <span><span class="settings-accordion-title">Изходни файлове</span><span class="settings-accordion-description">Карти, Excel, CSV, графики, качване и съботно номериране.</span></span>
+            <span><span class="settings-accordion-title">Карти и отчети</span></span>
           </summary>
           <div class="settings-accordion-body">
-          <div class="muted">Избери какво да се генерира и къде да се запише.</div>
+          <p class="settings-accordion-description">Файлове, папки и качване на карти.</p>
+          <div class="field-grid"><div class="wide"><label for="outVolumeUnit">Как наричате товара?</label><input id="outVolumeUnit" maxlength="40" placeholder="стекове, кашони, оборот"><div class="muted">Променя надписите в картите и отчетите, без да променя числата и капацитета.</div></div></div>
+          <div class="field-grid">
+            <div><label for="outDriverTotalUnit">За общите количества</label><input id="outDriverTotalUnit" maxlength="40" placeholder="Общият надпис"></div>
+            <div><label for="outDriverCustomerUnit">При клиент и заявка</label><input id="outDriverCustomerUnit" maxlength="40" placeholder="Общият надпис"></div>
+          </div>
+          <div class="muted">Важат навсякъде: интерфейс, карти и отчети. Празно поле използва общия надпис.</div>
+          <div class="field-grid"><div class="wide"><label for="outMandatoryComment">Текст за задължителен клиент</label><input id="outMandatoryComment" maxlength="200"><div class="muted">Червен надпис в индивидуалните карти. Коментарът за доставка и правилата за обслужване не се променят.</div></div></div>
+          <label class="check"><input id="outMobileDriverPanel" type="checkbox">Изглед за телефон</label>
           <div class="check-grid">
             <div class="check-line"><input id="outMapEnabled" type="checkbox"><label for="outMapEnabled">HTML карти</label></div>
             <div class="check-line"><input id="outExcelEnabled" type="checkbox"><label for="outExcelEnabled">Excel отчети</label></div>
+            <div class="check-line"><input id="outRoutingQuality" type="checkbox"><label for="outRoutingQuality">Отчет за приблизителни отсечки</label></div>
             <div class="check-line"><input id="outCsvEnabled" type="checkbox"><label for="outCsvEnabled">CSV маршрути</label></div>
             <div class="check-line"><input id="outChartsEnabled" type="checkbox"><label for="outChartsEnabled">Графики</label></div>
           </div>
@@ -3497,10 +3795,14 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             <div><label for="outMapProvider">Карта</label><select id="outMapProvider"><option value="osm">OpenStreetMap</option><option value="google">Google</option></select></div>
             <div><label for="outFoliumTiles">OSM слой</label><input id="outFoliumTiles"></div>
           </div>
-          <details>
-            <summary>Качване на route карти</summary>
+          <div class="field-grid">
+            <div><label for="outBusNumberStart">Начален номер</label><input id="outBusNumberStart" type="number" min="1" max="999999999" step="1" title="Общ за SetData, Excel и картите. При 5 номерацията започва от 05. Отделната номерация за Център се запазва."></div>
+          </div>
+          <div class="check-line"><input id="outUploadEnabled" type="checkbox"><label for="outUploadEnabled">Качвай картите за шофьорите</label></div>
+          <details class="connection-settings">
+            <summary>Връзка за качване</summary>
             <div class="field-grid">
-              <div><label for="outUploadMode">Режим</label><select id="outUploadMode"><option value="disabled">Не качвай</option><option value="legacy">Legacy</option><option value="effect_upload">Effect upload</option></select></div>
+              <div><label for="outUploadMode">Режим</label><select id="outUploadMode"><option value="disabled">Без качване</option><option value="legacy">Предишната връзка</option><option value="effect_upload">Към зададения адрес</option></select></div>
               <div><label for="outUploadTimeout">Timeout (сек.)</label><input id="outUploadTimeout" type="number" min="1" max="3600"></div>
               <div class="wide"><label for="outUploadUrl">Upload URL</label><input id="outUploadUrl" type="url"></div>
               <div class="wide"><label for="outUploadToken">Нов upload token</label><input id="outUploadToken" type="password" autocomplete="new-password" placeholder="Празно = използвай запазения"></div>
@@ -3525,18 +3827,19 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         </details>
         <details class="settings-card settings-accordion" data-settings-panel="set-data">
           <summary>
-            <span><span class="settings-accordion-title">setData</span><span class="settings-accordion-description">Обслужени, необслужени, IdSkld, шаблони и makeGroup.</span></span>
+            <span><span class="settings-accordion-title">Изпращане</span></span>
           </summary>
           <div class="settings-accordion-body">
-          <div class="muted">Изпращането променя данни във външната система и винаги се потвърждава преди старт.</div>
+          <p class="settings-accordion-description">Променя заявките в свързаната система. Изисква потвърждение преди старт.</p>
           <div class="check-grid">
             <div class="check-line wide"><input id="setDataEnabled" type="checkbox"><label for="setDataEnabled">Изпращай обслужените клиенти</label></div>
             <div class="check-line"><input id="setDataUnserved" type="checkbox"><label for="setDataUnserved" title="Изпращат се с отделния DoneFlag преди makeGroup; след него получават общия DoneFlag.">Изпращай необслужените</label></div>
             <div class="check-line"><input id="setDataMakeGroup" type="checkbox"><label for="setDataMakeGroup">Изпрати makeGroup</label></div>
           </div>
+          <details class="connection-settings"><summary>Връзка и статуси</summary>
           <div class="field-grid">
             <div class="wide"><label for="setDataUrl">setData URL</label><input id="setDataUrl" type="url"></div>
-            <div><label for="setDataMethod">HTTP метод</label><select id="setDataMethod"><option value="GET">GET</option><option value="POST">POST</option></select></div>
+            <div><label for="setDataMethod">HTTP метод</label><select id="setDataMethod"><option value="GET">Чрез адрес</option><option value="POST">Чрез изпращане на данни</option></select></div>
             <div><label for="setDataTimeout">Timeout (сек.)</label><input id="setDataTimeout" type="number" min="1" max="3600"></div>
             <div><label for="setDataCommand">cmd</label><input id="setDataCommand"></div>
             <div><label for="setDataDoneFlag">DoneFlag</label><input id="setDataDoneFlag"></div>
@@ -3553,7 +3856,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             </div>
           </details>
           <details>
-            <summary>Необслужени клиенти и makeGroup</summary>
+            <summary>Необслужени клиенти и групиране</summary>
             <div class="field-grid">
               <div><label for="setDataUnservedDoneFlag" title="Начален DoneFlag за необслужените преди makeGroup.">Начален DoneFlag</label><input id="setDataUnservedDoneFlag"></div>
               <div class="check-line wide"><input id="setDataUnservedFinalEnabled" type="checkbox"><label for="setDataUnservedFinalEnabled" title="Изключи, за да останат необслужените с началния DoneFlag.">Задавай финален DoneFlag след makeGroup</label></div>
@@ -3564,25 +3867,39 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div class="wide"><label for="setDataMakeGroupCommand">makeGroup cmd</label><input id="setDataMakeGroupCommand"></div>
             </div>
           </details>
-          <div class="notice warning" style="margin-top:12px">При включено setData ще видиш потвърждение непосредствено преди старта.</div>
+          <details id="missingGpsSettings">
+            <summary>Заявки без GPS</summary>
+            <div class="field-grid">
+              <div class="check-line wide"><input id="setDataMissingGpsEnabled" type="checkbox"><label for="setDataMissingGpsEnabled">Изпращай заявките без GPS</label></div>
+              <div><label for="setDataMissingGpsGrafik">Направление</label><input id="setDataMissingGpsGrafik"></div>
+              <div><label for="setDataMissingGpsBukva">Буква</label><input id="setDataMissingGpsBukva" title="Може да използвате {{stop_number}} за пореден номер."></div>
+              <div><label for="setDataMissingGpsDoneFlag">Статус (DoneFlag)</label><input id="setDataMissingGpsDoneFlag" placeholder="0" title="Изпраща се директно. Не се променя с финалния статус на необслужените."></div>
+            </div>
+          </details>
+          </details>
+          <div class="notice warning" style="margin-top:12px">При включено изпращане заявките в свързаната система ще бъдат променени. Преди старт ще поискаме потвърждение.</div>
           </div>
         </details>
       </div>
       <div class="actions run-actions">
-        <button class="primary" onclick="startRun()">Стартирай без запис</button>
-        <button onclick="saveGlobalSettings()">Запази глобално в config.py</button>
-        <button onclick="useGlobalRunSettings()">Отхвърли промените и зареди глобалните</button>
+        <button onclick="resetActiveProfile()">Върни записаните настройки</button>
+        <details class="advanced-actions" id="globalStartActions" hidden><summary>Допълнителни действия</summary><div class="actions">
+          <button id="globalPlanButton" onclick="startRun(true)">Стартирай с основните настройки</button>
+          <button class="danger" onclick="shutdownProgram()">Изключи програмата</button>
+        </div></details>
       </div>
-      <div id="runSettingsStatus" class="form-status">Зареждане на настройките…</div>
     </section>
-    <section class="full logs-panel">
-      <h2>Прогрес и логове</h2>
-      <div class="actions" style="margin-bottom:10px">
-        <button onclick="loadLogs()">Обнови последните редове</button>
-        <span class="muted" id="lastSaved"></span>
+    </details>
+    <section class="full logs-panel" id="progressSection">
+      <div class="section-head">
+        <div><h2>Логове</h2><span class="log-state" id="logsState" role="status"></span></div>
+        <button class="quiet" onclick="loadLogs()">Обнови</button>
       </div>
-      <div class="muted" id="runDetails" style="margin-bottom:10px"></div>
-      <pre id="logsBox">Няма заредени логове.</pre>
+      <span class="muted" id="lastSaved"></span>
+      <div class="execution-logs" id="executionLogs">
+        <div class="muted" id="runDetails" style="margin:10px 0"></div>
+        <pre id="logsBox" tabindex="0" aria-label="Логове от изпълнението">Зареждане на логовете…</pre>
+      </div>
     </section>
   </main>
   <script>
@@ -3594,6 +3911,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     let vehicleTypes = ["internal_bus", "center_bus", "external_bus", "special_bus", "vratza_bus"];
     let depotOptions = [];
     let logsTimer = null;
+    let logsLoading = false;
+    let logsRefreshPending = false;
     let globalRunSettings = null;
     let renderingRunSettings = false;
     let runSettingsDirty = false;
@@ -3620,24 +3939,27 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     function intOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; }}
     function numberOrNull(v) {{ if (v === "" || v === null || v === undefined) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }}
     function requiredInt(id, label, minimum=1, maximum=3600) {{
+      label = fieldLabel(id, label);
       const raw = value(id).trim();
       const parsed = Number(raw);
       if (!raw || !Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {{
-        throw new Error(label + " трябва да е цяло число между " + minimum + " и " + maximum + ".");
+        throw fieldError(id,label + " трябва да е цяло число между " + minimum + " и " + maximum + ".");
       }}
       return parsed;
     }}
     function requiredNumber(id, label, minimum, maximum) {{
+      label = fieldLabel(id, label);
       const raw = value(id).trim();
       const parsed = Number(raw);
       if (!raw || !Number.isFinite(parsed) || parsed < minimum || parsed > maximum) {{
-        throw new Error(label + " трябва да е число между " + minimum + " и " + maximum + ".");
+        throw fieldError(id,label + " трябва да е число между " + minimum + " и " + maximum + ".");
       }}
       return parsed;
     }}
     function requiredStringList(id, label) {{
+      label = fieldLabel(id, label);
       const items = value(id).split(/[,;\\r\\n]+/).map(item => item.trim()).filter(Boolean);
-      if (!items.length) throw new Error(label + " трябва да съдържа поне една стойност.");
+      if (!items.length) throw fieldError(id,label + " трябва да съдържа поне една стойност.");
       return items;
     }}
     function bool(id) {{ return !!$(id).checked; }}
@@ -3664,14 +3986,25 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       return response.json();
     }}
 
-    function setStatus(runStatus) {{
+    function setStatus(runStatus, fromLogs=false) {{
+      const wasRunning = !!(state && state.run_status && state.run_status.running);
       const running = !!(runStatus && runStatus.running);
-      $("statusPill").textContent = running ? "работи" : "idle";
-      $("statusPill").className = "pill " + (running ? "ok" : "");
+      const names = {{idle:"Готовност",running:"Изчисляване…",completed:"Готово",success:"Готово",failed:"Грешка при изпълнение",error:"Грешка при изпълнение",stopped:"Спряно",shutting_down:"Изключване…"}};
+      $("statusPill").textContent = running ? "Изчисляване…" : names[(runStatus || {{}}).status] || "Готовност";
+      const statusName = (runStatus || {{}}).status;
+      $("statusPill").className = "pill " + (running || ["idle", "completed", "success"].includes(statusName) ? "ok" : ["failed", "error"].includes(statusName) ? "bad" : "");
       $("runDetails").textContent = runStatus
-        ? `status=${{runStatus.status || "idle"}} | run_id=${{runStatus.run_id || "-"}} | start=${{runStatus.started_at || "-"}} | finish=${{runStatus.finished_at || "-"}} | error=${{runStatus.error || "-"}}`
+        ? [runStatus.started_at ? "Начало: " + new Date(runStatus.started_at).toLocaleString('bg-BG') : "", runStatus.finished_at ? "Край: " + new Date(runStatus.finished_at).toLocaleString('bg-BG') : "", runStatus.error ? "Изпълнението не завърши. Виж логовете по-долу." : ""].filter(Boolean).join(" · ")
         : "";
+      if (state) state.run_status = runStatus;
+      $("planButton").disabled = running || !state;
+      $("stopPlanButton").hidden = !running;
       setLogsLive(running);
+      $("logsState").textContent = "";
+      $("logsState").className = "log-state";
+      if (wasRunning && !running && !fromLogs) loadLogs(false);
+      updateExecutionProgress(runStatus);
+      syncSupervisorActions();
     }}
 
     function setLogsLive(active) {{
@@ -3695,7 +4028,20 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const output = (settings && settings.output) || {{}};
       const setData = (settings && settings.set_data) || {{}};
       renderingRunSettings = true;
+      renderInputSettings((settings && settings.input) || {{}});
       put("solverType", cvrp.solver_type || "pyvrp");
+      put("customerDroppingStrategy", cvrp.customer_dropping_strategy || "legacy");
+      put("allowCustomerSkipping", cvrp.allow_customer_skipping !== false);
+      put("priorityDroppingEnabled", cvrp.enable_priority_dropping !== false);
+      put("dropVolumeWeight", cvrp.drop_volume_weight ?? 0.70);
+      put("dropClosenessWeight", cvrp.drop_closeness_weight ?? 0.30);
+      put("dropMinPenalty", cvrp.min_customer_drop_penalty ?? 45000);
+      put("dropMaxPenalty", cvrp.max_customer_drop_penalty ?? 500000);
+      put("dropBasePenalty", cvrp.distance_penalty_disjunction ?? 45000);
+      put("dropGeoReference", cvrp.drop_geo_reference_km ?? 20);
+      put("dropGeoStrength", cvrp.drop_geo_strength ?? 1);
+      put("dropMaxEjections", cvrp.drop_repair_max_ejections ?? 6);
+      put("dropRepairBudget", cvrp.drop_repair_budget_fraction ?? 0.15);
       put("objectiveMetric", cvrp.objective_metric || "time");
       put("timeObjectiveIncludeWaiting", cvrp.time_objective_include_waiting !== false);
       put("multiTripEnabled", !!cvrp.enable_multiple_trips);
@@ -3746,9 +4092,16 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("vrpLogProgress", cvrp.vrp_log_progress !== false);
       put("outMapEnabled", output.enable_interactive_map);
       put("outExcelEnabled", output.enable_excel_output);
+      put("outRoutingQuality", !!output.enable_routing_quality_report);
       put("outCsvEnabled", output.enable_csv_output);
       put("outChartsEnabled", output.enable_charts);
       put("outMapFile", output.map_output_file);
+      put("outVolumeUnit", output.volume_unit_label || "стекове");
+      put("outMandatoryComment", output.mandatory_customer_comment ?? "Задължителен клиент — не пропускайте доставката.");
+      put("outMobileDriverPanel", output.mobile_driver_panel ?? false);
+      put("outDriverTotalUnit", output.driver_total_volume_label ?? "");
+      put("outDriverCustomerUnit", output.driver_customer_volume_label ?? "");
+      updateVolumeUnitLabels();
       put("outRoutesDir", output.routes_output_dir);
       put("outExcelDir", output.excel_output_dir);
       put("outCsvFile", output.csv_output_file);
@@ -3756,6 +4109,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("outMapProvider", output.map_provider || "osm");
       put("outFoliumTiles", output.folium_tiles);
       put("outUploadMode", output.route_maps_upload_mode || "disabled");
+      put("outUploadEnabled", (output.route_maps_upload_mode || "disabled") !== "disabled");
       put("outUploadUrl", output.route_maps_upload_url);
       put("outUploadTimeout", output.route_maps_upload_timeout_seconds);
       put("outUploadToken", "");
@@ -3767,10 +4121,11 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("outRoutesExcel", output.routes_excel_file);
       put("outEfficiencyExcel", output.efficiency_excel_file);
       put("outSaturdayBusPrefix", output.saturday_excel_bus_number_prefix);
+      put("outBusNumberStart", output.excel_bus_number_start ?? 1);
       put("outSaturdayBusDigits", output.saturday_excel_bus_number_digits);
       $("outUploadTokenState").textContent = output.route_maps_upload_token_configured
-        ? "Има запазен token. Остави полето празно, за да го използваш."
-        : "Няма запазен Web token; при нужда ще се използва глобалният token.";
+        ? "Има запазен код за достъп. Остави полето празно, за да го използваш."
+        : "Няма запазен код за достъп за тези настройки.";
 
       put("setDataEnabled", setData.enable_set_data_upload);
       put("setDataUnserved", setData.enable_unserved_set_data_upload);
@@ -3792,6 +4147,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       put("setDataUnservedGrafik", setData.set_data_unserved_id_grafik);
       put("setDataUnservedGrafikTemplate", setData.set_data_unserved_id_grafik_template);
       put("setDataUnservedBukvaTemplate", setData.set_data_unserved_bukva_template);
+      put("setDataMissingGpsEnabled", setData.enable_missing_gps_set_data_upload !== false);
+      put("setDataMissingGpsGrafik", setData.set_data_missing_gps_id_grafik);
+      put("setDataMissingGpsBukva", setData.set_data_missing_gps_bukva_template);
+      put("setDataMissingGpsDoneFlag", setData.set_data_missing_gps_done_flag ?? "0");
       put("setDataMakeGroupCommand", setData.set_data_make_group_command);
       updateTimeObjectiveFieldState();
       updateSolverFinePanels();
@@ -3800,7 +4159,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       updateRunFieldStates();
       renderingRunSettings = false;
       runSettingsDirty = false;
-      setRunSettingsMessage("Заредени са текущите глобални стойности.", "ok");
+      syncStrategyChoices();
+      captureProfileBaseline();
+      updatePlanSummary();
+      setRunSettingsMessage("");
     }}
 
     function setRunSettingsMessage(text, kind="") {{
@@ -3830,14 +4192,16 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const vroomSelected = value("solverType") === "vroom";
       updateSolverFinePanels();
       updatePyvrpPenaltyFields();
+      updateDeferralFields();
       $("multiTripEnabled").title = vroomSelected
         ? "VROOM 1.15 не поддържа свързани повторни курсове. Изключи опцията преди старт."
-        : "Разрешава връщане и презареждане според възможностите на избрания solver.";
+        : "Разрешава връщане и презареждане според възможностите на избрания метод.";
       setDisabled(["outMapFile", "outRoutesDir", "outMapProvider", "outFoliumTiles", "outUploadMode"], !bool("outMapEnabled"));
-      setDisabled(["outExcelDir", "outWarehouseExcel", "outRoutesExcel", "outEfficiencyExcel", "outSaturdayBusPrefix", "outSaturdayBusDigits"], !bool("outExcelEnabled"));
+      setDisabled(["outExcelDir", "outWarehouseExcel", "outRoutesExcel", "outEfficiencyExcel", "outSaturdayBusPrefix", "outSaturdayBusDigits", "outRoutingQuality"], !bool("outExcelEnabled"));
       setDisabled(["outCsvFile"], !bool("outCsvEnabled"));
       setDisabled(["outChartsDir"], !bool("outChartsEnabled"));
       const uploadEnabled = bool("outMapEnabled") && value("outUploadMode") === "effect_upload";
+      $("outUploadEnabled").disabled = !bool("outMapEnabled");
       setDisabled(["outUploadUrl", "outUploadTimeout", "outUploadToken", "outClearUploadToken", "outUploadTokenField", "outUploadFileField", "outUploadBusField"], !uploadEnabled);
       const setDataEnabled = bool("setDataEnabled");
       setDisabled([
@@ -3848,14 +4212,38 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         "setDataUnservedGrafikTemplate", "setDataUnservedBukvaTemplate", "setDataMakeGroupCommand"
       ], !setDataEnabled);
       setDisabled(["setDataUnservedFinalDoneFlag"], !setDataEnabled || !bool("setDataUnservedFinalEnabled"));
+      refreshCorrectionFields();
+    }}
+
+    function updateDeferralFields() {{
+      const supportsGeographic = value("solverType") === "pyvrp_experimental";
+      $("customerDroppingStrategy").querySelector('[value="geographic"]').disabled = !supportsGeographic;
+      if (!supportsGeographic) put("customerDroppingStrategy", "legacy");
+      const geographic = value("customerDroppingStrategy") === "geographic";
+      const skipping = bool("allowCustomerSkipping");
+      const priority = bool("priorityDroppingEnabled");
+      $("geographicDeferralFields").hidden = !geographic;
+      $("legacyDeferralFields").hidden = geographic;
+      setDisabled(["customerDroppingStrategy"], !skipping);
+      setDisabled(["dropBasePenalty"], !skipping || (!geographic && priority));
+      setDisabled(["priorityDroppingEnabled"], !skipping || geographic);
+      setDisabled(["dropVolumeWeight", "dropClosenessWeight", "dropMinPenalty", "dropMaxPenalty"], !skipping || geographic || !priority);
+      setDisabled(["dropGeoReference", "dropGeoStrength", "dropMaxEjections", "dropRepairBudget"], !skipping || !geographic);
     }}
 
     function collectOutputSettings() {{
       const output = {{
+        volume_unit_label: value("outVolumeUnit"),
+        mandatory_customer_comment: value("outMandatoryComment"),
+        mobile_driver_panel: bool("outMobileDriverPanel"),
+        driver_total_volume_label: value("outDriverTotalUnit"),
+        driver_customer_volume_label: value("outDriverCustomerUnit"),
         enable_interactive_map: bool("outMapEnabled"), map_output_file:value("outMapFile"), routes_output_dir:value("outRoutesDir"),
         enable_excel_output:bool("outExcelEnabled"), excel_output_dir:value("outExcelDir"),
+        enable_routing_quality_report:bool("outRoutingQuality"),
         warehouse_excel_file:value("outWarehouseExcel"), routes_excel_file:value("outRoutesExcel"), efficiency_excel_file:value("outEfficiencyExcel"),
         saturday_excel_bus_number_prefix:value("outSaturdayBusPrefix"), saturday_excel_bus_number_digits:requiredInt("outSaturdayBusDigits", "Цифри за събота", 1, 9),
+        excel_bus_number_start:requiredInt("outBusNumberStart", "Начален номер", 1, 999999999),
         enable_csv_output:bool("outCsvEnabled"), csv_output_file:value("outCsvFile"),
         enable_charts:bool("outChartsEnabled"), charts_output_dir:value("outChartsDir"),
         map_provider:value("outMapProvider"), folium_tiles:value("outFoliumTiles"),
@@ -3879,6 +4267,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         set_data_unserved_final_done_flag:value("setDataUnservedFinalDoneFlag"),
         set_data_unserved_id_grafik:value("setDataUnservedGrafik"), set_data_unserved_id_grafik_template:value("setDataUnservedGrafikTemplate"),
         set_data_unserved_bukva_template:value("setDataUnservedBukvaTemplate"), enable_make_group:bool("setDataMakeGroup"),
+        enable_missing_gps_set_data_upload:bool("setDataMissingGpsEnabled"),
+        set_data_missing_gps_id_grafik:value("setDataMissingGpsGrafik"),
+        set_data_missing_gps_bukva_template:value("setDataMissingGpsBukva"),
+        set_data_missing_gps_done_flag:value("setDataMissingGpsDoneFlag") || "0",
         set_data_make_group_command:value("setDataMakeGroupCommand"), set_data_timeout_seconds:requiredInt("setDataTimeout", "setData timeout")
       }};
     }}
@@ -3887,6 +4279,18 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const pyvrpSeedRaw = value("pyvrpSeed").trim();
       const settings = {{
         solver_type:value("solverType"),
+        customer_dropping_strategy:value("solverType") === "pyvrp_experimental" ? value("customerDroppingStrategy") : "legacy",
+        allow_customer_skipping:bool("allowCustomerSkipping"),
+        enable_priority_dropping:bool("priorityDroppingEnabled"),
+        drop_volume_weight:requiredNumber("dropVolumeWeight", "Тежест обем", 0, Number.MAX_VALUE),
+        drop_closeness_weight:requiredNumber("dropClosenessWeight", "Тежест близост", 0, Number.MAX_VALUE),
+        min_customer_drop_penalty:requiredInt("dropMinPenalty", "Минимална глоба", 1, Number.MAX_SAFE_INTEGER),
+        max_customer_drop_penalty:requiredInt("dropMaxPenalty", "Максимална глоба", 1, Number.MAX_SAFE_INTEGER),
+        distance_penalty_disjunction:requiredInt("dropBasePenalty", "Базова глоба", 1, 100000000),
+        drop_geo_reference_km:requiredNumber("dropGeoReference", "Мащаб разстояние", 1, 1000),
+        drop_geo_strength:requiredNumber("dropGeoStrength", "Сила на приоритета", 0, 10),
+        drop_repair_max_ejections:requiredInt("dropMaxEjections", "Макс. групова замяна", 1, 12),
+        drop_repair_budget_fraction:requiredNumber("dropRepairBudget", "Дял от времето", 0.01, 0.30),
         objective_metric:value("objectiveMetric"),
         time_objective_include_waiting:bool("timeObjectiveIncludeWaiting"),
         enable_multiple_trips:bool("multiTripEnabled"),
@@ -3936,22 +4340,26 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         vrp_max_generations:requiredInt("vrpMaxGenerations", "VRP-Rust maximum generations", 1, 1000000000000),
         vrp_log_progress:bool("vrpLogProgress")
       }};
-      if (settings.num_workers === 0) throw new Error("Брой solver workers трябва да бъде -1 или положително число.");
-      if (settings.pyvrp_min_perturbations > settings.pyvrp_max_perturbations) throw new Error("PyVRP максималните perturbations трябва да са поне колкото минималните.");
-      if (settings.pyvrp_penalty_min > settings.pyvrp_penalty_max) throw new Error("PyVRP максималната penalty трябва да е поне колкото минималната.");
+      if (settings.num_workers === 0) throw fieldError("solverNumWorkers","Броят едновременни варианти трябва да бъде -1 или положително число.");
+      if (settings.customer_dropping_strategy === "legacy" && settings.enable_priority_dropping && settings.min_customer_drop_penalty > settings.max_customer_drop_penalty) throw fieldError("dropMaxPenalty","Максималната глоба за пропускане трябва да е поне колкото минималната.");
+      if (settings.pyvrp_min_perturbations > settings.pyvrp_max_perturbations) throw fieldError("pyvrpMaxPerturbations","Максималният брой промени трябва да е поне колкото минималния.");
+      if (settings.pyvrp_penalty_min > settings.pyvrp_penalty_max) throw fieldError("pyvrpPenaltyMax","Максималната тежест на ограниченията трябва да е поне колкото минималната.");
       return settings;
     }}
 
     function collectRunSettings() {{
-      return {{cvrp:collectCvrpSettings(), output:collectOutputSettings(), set_data:collectSetDataSettings()}};
+      clearFieldErrors($("runSettingsSection"));
+      validateRunBasics();
+      return {{input:collectInputSettings(), cvrp:collectCvrpSettings(), output:collectOutputSettings(), set_data:collectSetDataSettings()}};
     }}
 
     function applyCommonState(data) {{
       state = data;
+      updateExclusionButton();
       vehicleTypes = data.vehicle_types || vehicleTypes;
       depotOptions = data.depots || [];
-      $("pageTitle").textContent = data.app_name || bootstrap.title;
-      $("serverLine").textContent = (data.web_gui && data.web_gui.url ? data.web_gui.url : "") + " | users: " + ((data.web_gui && data.web_gui.users || []).join(", ") || "-");
+      $("pageTitle").textContent = "Bizant";
+      $("serverLine").textContent = "";
       setStatus(data.run_status || {{}});
     }}
 
@@ -3964,7 +4372,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     function renderConfig(data) {{
       renderVehicleState(data);
       globalRunSettings = data.web_run_global_settings || null;
-      renderRunSettings(data.web_run_global_settings || data.web_run_settings || {{}}, false);
+      profileDrafts.web = null; profileDrafts.global = null;
+      profileDirty.web = false; profileDirty.global = false;
+      renderRunSettings(savedProfileSettings(activeProfile), false);
+      updateProfileSurface();
     }}
 
     function renderVehicles(vehicles) {{
@@ -3973,7 +4384,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       vehicles.forEach((vehicle, index) => tbody.appendChild(vehicleRow(vehicle, index)));
       renumberVehicleCards();
       vehicleSettingsDirty = false;
-      setVehicleSettingsMessage("Заредени са " + vehicles.length + " конфигурации на превозни средства.", "ok");
+      captureFleetBaseline();
+      setVehicleSettingsMessage("");
     }}
 
     function setVehicleSettingsMessage(text, kind="") {{
@@ -3983,12 +4395,15 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     function markVehicleSettingsDirty() {{
-      vehicleSettingsDirty = true;
-      setVehicleSettingsMessage("Има незаписани промени по бусовете. Те не участват в „Запази глобално настройките“.");
+      refreshFleetChanges();
+      setVehicleSettingsMessage("");
+      updatePlanSummary();
     }}
 
     function updateVehicleTripFields() {{
-      const disabled = !bool("multiTripEnabled");
+      // Reload settings belong to the shared fleet even when one profile
+      // does not use additional courses.
+      const disabled = false;
       for (const row of $("vehiclesBody").querySelectorAll(".vehicle-row")) {{
         for (const field of ["reload_location", "reload_time_minutes"]) {{
           const input = row.querySelector(`[data-field="${{field}}"]`);
@@ -4002,10 +4417,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const vroomSelected = value("solverType") === "vroom";
       checkbox.disabled = value("objectiveMetric") !== "time" || vroomSelected;
       checkbox.title = vroomSelected
-        ? "VROOM отчита пълното време във fitness и спазва чакането, но native objective-ът му не може директно да цени waiting time."
+        ? "Този метод спазва времето за чакане, но не може пряко да търси план с по-малко чакане."
         : (checkbox.disabled
-          ? "Опцията важи само при цел time."
-          : "Включва пътуване, обслужване, чакане и презареждане; fitness е само времето в секунди, а реалните метри остават за ограничения и отчети.");
+          ? "Опцията важи само когато намаляваме времето."
+          : "Включва пътуване, обслужване, чакане и презареждане. Километрите продължават да участват в ограниченията и отчетите.");
     }}
 
     function vehicleRow(vehicle, index) {{
@@ -4020,26 +4435,39 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
             <strong class="vehicle-card-title"></strong>
             <span class="vehicle-type-badge"></span>
           </div>
-          <button class="danger" type="button" onclick="removeVehicle(this)">Изтрий този бус</button>
+          <button class="danger remove-vehicle" type="button" onclick="removeVehicle(this)">Изтрий</button>
         </div>
-        <div class="vehicle-field type"><label>Тип</label><select data-field="vehicle_type">${{vehicleTypes.map(t => `<option value="${{t}}">${{t}}</option>`).join("")}}</select></div>
+        <div class="vehicle-field type"><label>Тип</label><select data-field="vehicle_type">${{vehicleTypes.map(t => `<option value="${{t}}">${{vehicleNames[t] || t}}</option>`).join("")}}</select></div>
         <div class="vehicle-field name"><label>Име</label><input data-field="name"></div>
         <div class="vehicle-field name"><label>Стабилно ID</label><input data-field="config_id"></div>
         <div class="vehicle-field checkbox active"><input data-field="enabled" type="checkbox"><label>Активен</label></div>
         <div class="vehicle-field small"><label>Брой</label><input data-field="count" type="number" min="0"></div>
-        <div class="vehicle-field medium"><label>Капацитет</label><input data-field="capacity" type="number" min="0"></div>
+        <div class="vehicle-field medium"><label>Капацитет (<span class="quantity-unit-label"></span>)</label><input data-field="capacity" type="number" min="0"></div>
         <div class="vehicle-field medium"><label>Цена</label><input data-field="fixed_cost" type="number"></div>
-        <div class="vehicle-field medium"><label>Макс. часове</label><input data-field="max_time_hours" type="number"></div>
+        <div class="vehicle-field medium"><label>Работно време (ч)</label><input data-field="max_time_hours" type="text" inputmode="decimal" placeholder="7,5" title="7,5 = 7 ч 30 мин"><small>7,5 = 7 ч 30 мин</small></div>
         <div class="vehicle-field medium"><label>Макс. км/ден</label><input data-field="max_distance_km" type="number" min="0" placeholder="без лимит"></div>
         <div class="vehicle-field service"><label>Клиенти/ден</label><input data-field="max_customers_per_day" type="number" min="1" placeholder="без лимит"></div>
-        <div class="vehicle-field service"><label>Обслужване</label><input data-field="service_time_minutes" type="number"></div>
-        <div class="vehicle-field medium"><label>Старт (мин)</label><input data-field="start_time_minutes" type="number" min="0"></div>
+        <div class="vehicle-field service"><label>Обслужване (мин)</label><input data-field="service_time_minutes" type="number"></div>
+        <div class="vehicle-field service"><label>Обслужване</label><select data-field="service_time_mode"><option value="fixed">Фиксирано</option><option value="formula">Формула</option></select></div>
+        <div class="vehicle-field service"><label>Начални секунди</label><input data-field="service_base_seconds" type="number" min="0" step="any" title="Време за всеки клиент. Въведи 0, ако няма такова."></div>
+        <div class="vehicle-field service"><label>Добави секунди</label><input data-field="service_seconds_per_unit" type="number" min="0" step="any"></div>
+        <div class="vehicle-field service"><label>За всеки … единици</label><input data-field="service_quantity_units" type="number" min="0" step="any" title="Количество от входните данни: стекове, оборот и др."></div>
+        <div class="vehicle-field service"><label>Не повече от (сек)</label><input data-field="service_max_seconds" type="number" min="0" step="any" title="Например: 900 секунди = 15 минути."></div>
+        <div class="vehicle-field medium"><label>Тръгване в</label><input data-field="start_time_minutes" type="time" required></div>
         <div class="vehicle-field gps"><label>Начално депо</label><select data-field="start_depot_name"></select></div>
-        <div class="vehicle-field gps"><label>Край GPS</label><input data-field="end_location" placeholder="празно = депо"></div>
-        <div class="vehicle-field gps"><label>Презареждане GPS</label><input data-field="reload_location" placeholder="празно = стартово депо"></div>
+        <div class="vehicle-field gps"><label>Крайна точка (координати)</label><input data-field="end_location" placeholder="празно = депо"></div>
+        <div class="vehicle-field gps"><label>Място за презареждане</label><select data-field="reload_location"></select></div>
         <div class="vehicle-field service"><label>Презареждане (мин)</label><input data-field="reload_time_minutes" type="number" min="0"></div>
       `;
+      const extra = document.createElement("details"); extra.className = "vehicle-extra";
+      const summary = document.createElement("summary"); summary.textContent = "Още настройки";
+      const extraFields = document.createElement("div"); extraFields.className = "vehicle-extra-fields";
+      for (const field of ["vehicle_type", "fixed_cost", "max_distance_km", "max_customers_per_day", "end_location", "reload_location", "reload_time_minutes", "service_time_minutes", "service_base_seconds", "service_seconds_per_unit", "service_quantity_units", "service_max_seconds"]) {{
+        extraFields.append(row.querySelector(`[data-field="${{field}}"]`).closest(".vehicle-field"));
+      }}
+      extra.append(summary, extraFields); row.append(extra);
       const startDepotSelect = row.querySelector('[data-field="start_depot_name"]');
+      row.querySelector(".quantity-unit-label").textContent = totalQuantityLabel();
       const placeholder = document.createElement("option");
       placeholder.value = "";
       placeholder.textContent = "-- избери депо --";
@@ -4059,13 +4487,31 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
         missing.disabled = true;
         startDepotSelect.appendChild(missing);
       }}
+      const reloadSelect = row.querySelector('[data-field="reload_location"]');
+      const followStart = document.createElement("option");
+      followStart.value = ""; followStart.textContent = "Като началното депо";
+      reloadSelect.appendChild(followStart);
+      depotOptions.forEach(depot => {{
+        const option = document.createElement("option");
+        option.value = depot.coordinates; option.textContent = depot.name;
+        reloadSelect.appendChild(option);
+      }});
+      if (vehicle.reload_location && !depotOptions.some(depot => depot.coordinates === vehicle.reload_location)) {{
+        const saved = document.createElement("option");
+        saved.value = vehicle.reload_location;
+        saved.textContent = "Запазено място (извън списъка)";
+        saved.title = vehicle.reload_location;
+        reloadSelect.appendChild(saved);
+      }}
+      vehicle = {{service_time_mode:"fixed", service_base_seconds:0, service_seconds_per_unit:12, service_quantity_units:1, service_max_seconds:900, ...vehicle}};
       for (const [key, val] of Object.entries(vehicle)) {{
         const input = row.querySelector(`[data-field="${{key}}"]`);
         if (!input) continue;
         if (input.type === "checkbox") input.checked = !!val;
+        else if (key === "start_time_minutes") input.value = minutesToClock(val ?? 480);
         else input.value = val ?? "";
       }}
-      for (const fieldName of ["name", "vehicle_type", "enabled"]) {{
+      for (const fieldName of ["name", "vehicle_type", "enabled", "count"]) {{
         const input = row.querySelector(`[data-field="${{fieldName}}"]`);
         if (input) input.addEventListener("change", () => updateVehicleCard(row));
         if (input && input.type !== "checkbox") input.addEventListener("input", () => updateVehicleCard(row));
@@ -4073,7 +4519,48 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       row.addEventListener("input", markVehicleSettingsDirty);
       row.addEventListener("change", markVehicleSettingsDirty);
       updateVehicleCard(row);
+      enhanceVehicleRow(row);
+      addBusSchedules(row, vehicle.physical_bus_schedules || []);
       return row;
+    }}
+
+    function addBusSchedules(row, saved) {{
+      row.busSchedules = saved.map(item => ({{...item}}));
+      const panel = document.createElement('details');
+      panel.className = 'bus-schedules';
+      panel.style.cssText = 'grid-column:1/-1;width:100%;padding:10px 16px;box-sizing:border-box;border-top:1px solid #dde5ee';
+      const title = document.createElement('summary'); title.textContent = 'Направления за всеки бус';
+      const body = document.createElement('div');
+      panel.append(title,body); row.append(panel);
+      function draw() {{
+        body.replaceChildren();
+        const count = Math.max(0,Number(row.querySelector('[data-field="count"]').value)||0);
+        while(row.busSchedules.length < count) row.busSchedules.push({{bus_id:globalThis.crypto?.randomUUID?.() || ('bus_'+Date.now()+'_'+Math.random().toString(36).slice(2)),start_id:'',max_trips:null}});
+        const hint=document.createElement('p');hint.textContent='Начално ID и максимум курсове. Празни полета = автоматично.';body.append(hint);
+        row.busSchedules.forEach((item,index)=>{{
+          const line=document.createElement('div');line.style.cssText='display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:10px 0';
+          const name=document.createElement('strong');
+          name.textContent=(row.querySelector('[data-field="name"]').value || 'Бус')+' '+(index+1)+(index>=count?' (неактивен)':'');
+          const startLabel=document.createElement('label');startLabel.textContent='Начално ID ';
+          const start=document.createElement('input');start.type='text';start.inputMode='numeric';start.value=item.start_id||'';start.style.width='160px';startLabel.append(start);
+          const limitLabel=document.createElement('label');limitLabel.textContent='Максимум курсове ';
+          const limit=document.createElement('input');limit.type='number';limit.min='1';limit.max='1000';limit.step='1';limit.value=item.max_trips??'';limit.style.width='85px';limitLabel.append(limit);
+          const preview=document.createElement('span');
+          function update() {{
+            item.start_id=start.value.trim();item.max_trips=limit.value===''?null:limit.value;
+            try {{
+              if(!item.start_id) preview.textContent=item.max_trips?'До '+item.max_trips+' курса · автоматични номера':'Автоматично';
+              else if(!/^[0-9]+$/.test(item.start_id)||!Number.isInteger(Number(item.max_trips))||Number(item.max_trips)<1||Number(item.max_trips)>1000) preview.textContent='Провери номера и броя';
+              else preview.textContent=item.start_id+' – '+(BigInt(item.start_id)+BigInt(item.max_trips)-1n).toString().padStart(item.start_id.length,'0');
+            }} catch(e) {{preview.textContent='Провери номера и броя';}}
+          }}
+          start.addEventListener('input',update);limit.addEventListener('input',update);update();
+          line.append(name,startLabel,limitLabel,preview);body.append(line);
+        }});
+      }}
+      row.querySelector('[data-field="count"]').addEventListener('change',draw);
+      row.querySelector('[data-field="name"]').addEventListener('change',draw);
+      draw();
     }}
 
     function updateVehicleCard(row) {{
@@ -4081,8 +4568,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const typeInput = row.querySelector('[data-field="vehicle_type"]');
       const enabledInput = row.querySelector('[data-field="enabled"]');
       row.querySelector(".vehicle-card-title").textContent = (nameInput && nameInput.value.trim()) || "Без име";
-      row.querySelector(".vehicle-type-badge").textContent = (typeInput && typeInput.value) || "vehicle";
+      row.querySelector(".vehicle-type-badge").textContent = vehicleNames[typeInput && typeInput.value] || "Бус";
       row.classList.toggle("inactive", !!enabledInput && !enabledInput.checked);
+      const countInput = row.querySelector('[data-field="count"]');
+      row.classList.toggle("unavailable", Number(countInput && countInput.value) === 0);
     }}
 
     function renumberVehicleCards() {{
@@ -4096,7 +4585,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     function removeVehicle(button) {{
       const row = button.closest(".vehicle-row");
       const label = row.querySelector(".vehicle-card-title").textContent || "този бус";
-      if (!confirm(`Да изтрия ли ${{label}} от списъка? Промяната се записва едва след „Запази само бусовете глобално“. `)) return;
+      if (!confirm(`Да премахна ли ${{label}} от списъка? Промяната влиза в сила след „Запази бусовете“. `)) return;
       row.remove();
       renumberVehicleCards();
       markVehicleSettingsDirty();
@@ -4115,25 +4604,33 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     function collectVehicles() {{
+      clearFieldErrors($("fleetSection"));
       return Array.from($("vehiclesBody").querySelectorAll(".vehicle-row")).map(row => {{
+        validateVehicleRow(row);
         const get = name => row.querySelector(`[data-field="${{name}}"]`);
         return {{
           _original_index: row.dataset.originalIndex,
           vehicle_type: get("vehicle_type").value,
           name: get("name").value,
           config_id: get("config_id").value.trim(),
+          physical_bus_schedules: row.busSchedules || [],
           enabled: get("enabled").checked,
           count: intOrNull(get("count").value) || 0,
           capacity: intOrNull(get("capacity").value) || 0,
           fixed_cost: intOrNull(get("fixed_cost").value) || 0,
-          max_time_hours: intOrNull(get("max_time_hours").value) || 8,
+          max_time_hours: Number(get("max_time_hours").value.trim().replace(",", ".")),
           max_distance_km: intOrNull(get("max_distance_km").value),
           max_customers_per_day: intOrNull(get("max_customers_per_day").value),
-          service_time_minutes: intOrNull(get("service_time_minutes").value) || 8,
-          start_time_minutes: intOrNull(get("start_time_minutes").value) || 480,
+          service_time_minutes: intOrNull(get("service_time_minutes").value) ?? 8,
+          service_time_mode: get("service_time_mode").value,
+          service_base_seconds: Number(get("service_base_seconds").value),
+          service_seconds_per_unit: Number(get("service_seconds_per_unit").value),
+          service_quantity_units: Number(get("service_quantity_units").value),
+          service_max_seconds: Number(get("service_max_seconds").value),
+          start_time_minutes: clockToMinutes(get("start_time_minutes").value),
           start_depot_name: get("start_depot_name").value,
           end_location: get("end_location").value || null,
-          reload_location: get("reload_location").value || get("start_depot_name").value,
+          reload_location: get("reload_location").value || null,
           reload_time_minutes: intOrNull(get("reload_time_minutes").value) ?? 30,
         }};
       }});
@@ -4150,8 +4647,9 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     async function loadAll() {{
+      if(settingsSaveBusy)return;
       const dirtyParts = [];
-      if (runSettingsDirty) dirtyParts.push("настройките за решаване/изпълнение");
+      if (runSettingsDirty || profileDirty.web || profileDirty.global) dirtyParts.push("настройките за планиране");
       if (vehicleSettingsDirty) dirtyParts.push("бусовете");
       if (state && dirtyParts.length && !confirm("Има незаписани промени в " + dirtyParts.join(" и ") + ". Да ги отхвърля и да обновя всичко?")) return;
       const data = await apiFetch("/config");
@@ -4160,56 +4658,55 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     async function saveGlobalSettings() {{
-      if (!confirm("Да запиша ли всички показани настройки глобално в config.py? Те ще важат за Desktop GUI, Web и външния API /run. Списъкът с бусове няма да бъде променен.")) return;
+      if (activeProfile !== "global" || settingsSaveBusy) return;
+      if (!confirm("Да запазя ли основните настройки? Те ще важат за програмата и автоматичните стартирания. Записаните настройки за планиране от портала и бусовете няма да се променят.")) return;
       try {{
+        const payload=collectConfigPayload();
+        if(!beginSettingsSave("profile"))return;
         const result = await apiFetch("/config", {{
           method:"POST",
           headers:{{"Content-Type":"application/json"}},
-          body:JSON.stringify(collectConfigPayload())
+          body:JSON.stringify(payload)
         }});
-        $("lastSaved").textContent = "Глобалните настройки са запазени: " + new Date().toLocaleTimeString() + " | backup: " + (result.backup_file || "");
+        $("lastSaved").textContent = "Основните настройки са запазени в " + new Date().toLocaleTimeString();
         if (result.config) {{
           applyCommonState(result.config);
           globalRunSettings = result.config.web_run_global_settings || null;
           renderRunSettings(globalRunSettings || result.config.web_run_settings || {{}}, false);
         }}
-        setRunSettingsMessage("Настройките са записани глобално в config.py и вече важат навсякъде. Незапазените промени по бусовете са запазени във формата.", "ok");
+        profileDrafts.global = null; profileDirty.global = false;
+        updateProfileSurface();
+        setRunSettingsMessage("Основните настройки са запазени. Автопаркът и записаните настройки за портала не са променени.", "ok");
         await loadLogs(false);
       }} catch (err) {{ setRunSettingsMessage(String(err.message || err), "bad"); }}
+      finally {{ finishSettingsSave(); }}
     }}
 
     async function saveConfig() {{ return saveGlobalSettings(); }}
 
     async function saveVehicles() {{
-      if (!confirm("Да запиша ли само списъка с бусове в config.py? Solver-ът и всички други настройки няма да бъдат променени.")) return;
+      if(settingsSaveBusy)return;
       try {{
+        const payload=collectVehiclePayload();
+        if (!confirm("Да запазя ли бусовете? Промените ще важат за всички следващи стартирания, без да променят останалите настройки.")) return;
+        if(!beginSettingsSave("fleet"))return;
         const result = await apiFetch("/vehicles", {{
           method:"POST",
           headers:{{"Content-Type":"application/json"}},
-          body:JSON.stringify(collectVehiclePayload())
+          body:JSON.stringify(payload)
         }});
-        $("lastSaved").textContent = "Бусовете са запазени отделно: " + new Date().toLocaleTimeString() + " | backup: " + (result.backup_file || "");
+        $("lastSaved").textContent = "Бусовете са запазени в " + new Date().toLocaleTimeString();
         if (result.config) renderVehicleState(result.config);
-        setVehicleSettingsMessage("Бусовете са записани глобално. Незапазените настройки за текущия рън са запазени във формата.", "ok");
+        setVehicleSettingsMessage("Бусовете са запазени.", "ok");
+        updatePlanSummary();
         await loadLogs(false);
       }} catch (err) {{ setVehicleSettingsMessage(String(err.message || err), "bad"); }}
+      finally {{ finishSettingsSave(); }}
     }}
 
-    async function startRun() {{
+    async function startRun(useGlobal=false) {{
       try {{
-        const runSettings = collectRunSettings();
-        if (runSettings.set_data.enable_set_data_upload && !confirm(
-          "setData е ВКЛЮЧЕНО. Този рън ще изпраща реални промени към външната система. Да стартирам ли?"
-        )) return;
-        setRunSettingsMessage("Стартиране на временен Web рън без запис в config.py…");
-        const result = await apiFetch("/run", {{
-          method:"POST", headers:{{"Content-Type":"application/json"}},
-          body:JSON.stringify({{run_settings:runSettings}})
-        }});
-        setStatus(result.run || {{}});
-        setLogsLive(true);
-        setRunSettingsMessage("Рънът е стартиран. Тези настройки важат само за него; config.py не е променен.", "ok");
-        await loadLogs();
+        await submitPlan(useGlobal);
       }} catch (err) {{ setRunSettingsMessage(String(err.message || err), "bad"); }}
     }}
 
@@ -4226,49 +4723,77 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     async function stopRun() {{
-      if (!confirm("Да спра ли само активния run? API сървърът ще остане включен.")) return;
+      if (!confirm("Да прекратя ли текущото изчисление? Порталът и автоматичните стартирания ще останат достъпни.")) return;
       const result = await apiFetch("/stop-run", {{method:"POST"}});
-      $("lastSaved").textContent = result.message || "Заявено е спиране на активния run.";
+      $("lastSaved").textContent = "Заявено е спиране на текущото изчисление.";
       setStatus(result.run || {{}});
       await loadLogs(false);
     }}
 
     async function shutdownProgram() {{
-      if (!confirm("Сигурен ли си, че искаш да спреш API сървъра и активния run, ако има такъв?")) return;
+      if (!confirm("Да изключа ли програмата? Порталът, автоматичните стартирания и текущото изчисление ще спрат.")) return;
       const result = await apiFetch("/shutdown", {{method:"POST"}});
-      $("lastSaved").textContent = result.message || "Спирането е заявено.";
+      $("lastSaved").textContent = "Изключването на програмата е заявено.";
       setStatus({{status:"shutting_down", running:false}});
     }}
 
     async function loadLogs(showErrors=true) {{
+      if (logsLoading) {{ logsRefreshPending = true; return; }}
+      logsLoading = true;
       try {{
         const data = await apiFetch("/logs");
-        setStatus(data.run_status || {{}});
+        setStatus(data.run_status || {{}}, true);
+        updateExecutionProgress(data.run_status || {{}},data.progress || null);
         const parts = [];
+        const names = {{api:"Съобщения на програмата", solver:"Изчисления", run:"Текущо изпълнение"}};
         for (const [name, info] of Object.entries(data.logs || {{}})) {{
-          parts.push("===== " + name + " | " + info.path + " =====\\n" + (info.tail || ""));
+          if (info.tail) parts.push("── " + (names[name] || name) + " ──\\n" + info.tail);
         }}
         const logsBox = $("logsBox");
-        logsBox.textContent = parts.join("\\n\\n") || "Няма логове.";
+        const text = parts.join("\\n\\n") || "Все още няма записани съобщения.";
+        if (logsBox.textContent !== text) logsBox.textContent = text;
         logsBox.scrollTop = logsBox.scrollHeight;
-        logsBox.scrollLeft = 0;
       }} catch (err) {{
-        if (showErrors) $("logsBox").textContent = String(err);
+        $("logsState").textContent = "Логовете не се обновиха. Опитай „Обнови“.";
+        $("logsState").className = "log-state";
+        if (showErrors) $("logsState").textContent += " " + String(err.message || err);
+      }} finally {{
+        logsLoading = false;
+        if (logsRefreshPending) {{ logsRefreshPending = false; loadLogs(false); }}
       }}
     }}
 
+    function updateVolumeUnitLabels() {{
+      document.querySelectorAll(".quantity-unit-label").forEach(label => {{ label.textContent = totalQuantityLabel(); }});
+    }}
+    function totalQuantityLabel() {{
+      return value("outDriverTotalUnit").trim() || value("outVolumeUnit").trim() || "стекове";
+    }}
+    {portal_script()}
+    {supervisor_script()}
+    initialiseDispatcherControls();
+    initialiseSupervisorUI();
+    $("outUploadEnabled").addEventListener("change", () => {{
+      put("outUploadMode", bool("outUploadEnabled") ? (value("outUploadMode") === "disabled" ? "effect_upload" : value("outUploadMode")) : "disabled");
+    }});
+    $("outUploadMode").addEventListener("change", () => put("outUploadEnabled", value("outUploadMode") !== "disabled"));
+    $("outVolumeUnit").addEventListener("input", updateVolumeUnitLabels);
+    $("outDriverTotalUnit").addEventListener("input", updateVolumeUnitLabels);
+    $("outDriverTotalUnit").addEventListener("change", updateVolumeUnitLabels);
     for (const eventName of ["input", "change"]) {{
       $("runSettingsSection").addEventListener(eventName, () => {{
         updateRunFieldStates();
         if (!renderingRunSettings) {{
-          runSettingsDirty = true;
-          setRunSettingsMessage("Променена форма — още не е записана. Избери временен старт или глобален запис.");
+          const changes=refreshProfileChanges();
+          setRunSettingsMessage(changes ? "Има незаписани промени. Можеш да ги използваш веднъж или да ги запазиш." : "Няма незаписани промени в този раздел.",changes ? "" : "ok");
         }}
+        updatePlanSummary();
       }});
     }}
     $("multiTripEnabled").addEventListener("change", updateVehicleTripFields);
     $("objectiveMetric").addEventListener("change", updateTimeObjectiveFieldState);
     $("solverType").addEventListener("change", () => {{ updateRunFieldStates(); updateTimeObjectiveFieldState(); }});
+    $("customerDroppingStrategy").addEventListener("change", updateDeferralFields);
 
     loadAll().catch(err => {{
       $("serverLine").textContent = String(err);
@@ -4280,6 +4805,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
   </script>
 </body>
 </html>"""
+    return dispatcher_labels(page)
 
 
 def _auth_error(api_config, query: Optional[Dict[str, list[str]]], headers) -> Optional[str]:
@@ -4335,8 +4861,11 @@ def _summarise_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_status_snapshot() -> Dict[str, Any]:
+    from web_run_progress import elapsed_seconds
     with _RUN_LOCK:
-        return deepcopy(_RUN_STATUS)
+        status = deepcopy(_RUN_STATUS)
+    status["elapsed_seconds"] = elapsed_seconds(status)
+    return status
 
 
 def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
@@ -5027,10 +5556,17 @@ def _start_default_run(
 
 def _start_web_run(payload: Any) -> tuple[bool, Dict[str, Any], list[str], list[str]]:
     """Start an isolated Web GUI run without touching the API/global config."""
-    effective_config, applied_settings, ignored_settings = _build_web_run_config_override(payload)
+    with _CONFIG_TRANSACTION_LOCK:
+        expected = (payload or {}).get("expected_revision")
+        if expected is not None and expected != _web_config_revision(get_config()):
+            raise ValueError("Настройките или бусовете са променени след отварянето на страницата. Натисни „Обнови“ и провери плана отново.")
+        effective_config, applied_settings, ignored_settings = _build_web_run_config_override(payload)
     worker_request = {
         "run_settings": _web_run_settings_from_config(effective_config),
         "source": "web_gui",
+        # The effective settings are already snapshotted; do not merge a later
+        # edit of the Web profile when the subprocess reads this request.
+        "profile": "global",
     }
 
     with _RUN_LOCK:
@@ -5056,6 +5592,7 @@ def _start_web_run(payload: Any) -> tuple[bool, Dict[str, Any], list[str], list[
                 "process_log": None,
                 "stop_requested": False,
                 "source": "web_gui",
+                "search_time_limit_seconds": int(effective_config.cvrp.time_limit_seconds),
             }
         )
         status_snapshot = deepcopy(_RUN_STATUS)
@@ -5643,6 +6180,11 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 host = self.server.server_address[0]
                 port = self.server.server_address[1]
                 result["config"] = _web_gui_config_payload(host, port)
+                self._send_json(200, result)
+                return
+            if subpath == "/api/customer-exclusions":
+                result = _save_shared_exclusions(payload)
+                result["config"] = _web_gui_config_payload(self.server.server_address[0], self.server.server_address[1])
                 self._send_json(200, result)
                 return
             if subpath == "/api/vehicles":

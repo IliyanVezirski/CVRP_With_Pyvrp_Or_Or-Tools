@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
+from copy import copy
 import logging
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
 
 from cvrp_solver import CVRPSolution
+from input_handler import customer_has_missing_gps
+from missing_gps_settings import missing_gps_setting
 from vehicle_numbering import (
     format_route_bus_number,
     order_routes_for_output,
     route_identifier,
+    route_output_number,
     route_trip_number,
     route_vehicle_key,
 )
@@ -145,7 +149,7 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
 
     routes = order_routes_for_output(solution.routes)
     for route_index, route in enumerate(routes):
-        route_number = route_index + 1
+        route_number = route_output_number(output, route_index, route, routes)
         bus_number = _format_bus_number(output, route_index, route, routes)
         trip_number = route_trip_number(route)
         route_id = route_identifier(route, route_number)
@@ -186,6 +190,8 @@ def build_set_data_rows(solution: CVRPSolution, config: Any) -> List[Dict[str, s
                     if id_grafik_template
                     else str(getattr(set_data, "set_data_id_grafik", "") or "")
                 )
+                # A per-bus reserved direction is authoritative for every output.
+                id_grafik = str(getattr(route, 'schedule_id', '') or id_grafik)
                 context["id_grafik"] = id_grafik
                 rows.append(
                     {
@@ -274,6 +280,8 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
     rows: List[Dict[str, str]] = []
 
     stop_number = 0
+    from input_handler import shared_customer_exclusions
+    excluded_direction = shared_customer_exclusions(config)["direction"]
     for customer in _unique_customers(customers):
         for doc in _customer_set_data_documents(customer):
             stop_number += 1
@@ -310,6 +318,10 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
                 if id_grafik_template
                 else str(getattr(set_data, "set_data_unserved_id_grafik", "") or "")
             )
+            if getattr(customer, "manually_excluded", False) and excluded_direction:
+                # An explicit exclusion destination wins over the ordinary
+                # unserved template, including documents that also lack GPS.
+                id_grafik = excluded_direction
             context["id_grafik"] = id_grafik
             rows.append(
                 {
@@ -323,6 +335,54 @@ def build_unserved_set_data_rows(customers: List[Any], config: Any) -> List[Dict
             )
 
     return rows
+
+
+def build_missing_gps_set_data_rows(customers: List[Any], config: Any) -> List[Dict[str, str]]:
+    """One direct update per missing-GPS document; also the Excel source of truth."""
+    local_config = copy(config)
+    local_config.set_data = copy(config.set_data)
+    settings = local_config.set_data
+    settings.set_data_unserved_done_flag = str(
+        missing_gps_setting(config.set_data, "set_data_missing_gps_done_flag")
+    ).strip() or "0"
+    settings.set_data_unserved_id_grafik = missing_gps_setting(config.set_data, "set_data_missing_gps_id_grafik")
+    settings.set_data_unserved_id_grafik_template = "{id_grafik}"
+    settings.set_data_unserved_bukva_template = missing_gps_setting(config.set_data, "set_data_missing_gps_bukva_template")
+    return build_unserved_set_data_rows(customers, local_config)
+
+
+def _unserved_report_records(customers, config, row_builder, comment, only_excluded=False):
+    """Report the exact per-document destination, including leading zeroes."""
+    customers = _unique_customers(customers)
+    documents = [(customer, doc) for customer in customers
+                 for doc in _customer_set_data_documents(customer)]
+    rows = row_builder(customers, config)
+    return [
+        {
+            "ID": customer.id, "Име": customer.name,
+            "Номер поръчка": str(doc.get("document", "") or customer.document),
+            "IdPlasDoc": row["IdPlasDoc"],
+            "Обем": doc.get("volume", customer.volume),
+            "Коментар": comment(customer),
+            "GPS координати": getattr(customer, "original_gps_data", ""),
+            "Latitude": customer.coordinates[0] if customer.coordinates else "",
+            "Longitude": customer.coordinates[1] if customer.coordinates else "",
+            "Склад": row["IdSkld"], "Направление": row["IdGrafik"],
+            "Буква": row["Bukva"], "DoneFlag": row["DoneFlag"],
+        }
+        for (customer, doc), row in zip(documents, rows, strict=True)
+        if not only_excluded or getattr(customer, "manually_excluded", False)
+    ]
+
+
+def build_missing_gps_report_records(customers: List[Any], config: Any) -> List[Dict[str, Any]]:
+    return _unserved_report_records(customers, config, build_missing_gps_set_data_rows, lambda c: "Без GPS")
+
+
+def build_excluded_report_records(customers: List[Any], config: Any) -> List[Dict[str, Any]]:
+    return _unserved_report_records(customers, config, build_unserved_set_data_rows,
+        lambda c: "; ".join(filter(None, ["Ръчно изключен от маршрутите", getattr(c, "delivery_comment", "")])),
+        only_excluded=True)
 
 
 def build_unserved_done_flag_rows(
@@ -413,6 +473,12 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
     unserved_customers = list(getattr(solution, "dropped_customers", []) or [])
     if warehouse_allocation is not None:
         unserved_customers.extend(list(getattr(warehouse_allocation, "warehouse_customers", []) or []))
+    missing_gps_customers = [c for c in unserved_customers if customer_has_missing_gps(c)]
+    unserved_customers = [c for c in unserved_customers if not customer_has_missing_gps(c)]
+    missing_gps_rows = (
+        build_missing_gps_set_data_rows(missing_gps_customers, config)
+        if missing_gps_customers and missing_gps_setting(set_data, "enable_missing_gps_set_data_upload") else []
+    )
     unserved_rows = (
         build_unserved_set_data_rows(unserved_customers, config)
         if getattr(set_data, "enable_unserved_set_data_upload", True)
@@ -422,11 +488,12 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
     unserved_done_flag_rows = build_unserved_done_flag_rows(unserved_rows, set_data)
     result = {
         "enabled": True,
-        "attempted": len(rows),
+        "attempted": len(rows) + len(missing_gps_rows),
         "succeeded": 0,
         "failed": 0,
         "served_attempted": len(served_rows),
         "unserved_attempted": len(unserved_rows),
+        "missing_gps_attempted": len(missing_gps_rows),
         "errors": [],
     }
     logger.info("Изпращам %s setData заявки към Bizant", len(rows))
@@ -504,6 +571,23 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
                     params.get("IdPlasDoc", ""),
                     exc,
                 )
+
+    # Send these AFTER ordinary grouping/final updates. makeGroup is warehouse-
+    # wide, so merely excluding their rows from its input is not sufficient.
+    result["missing_gps"] = {"attempted": len(missing_gps_rows), "succeeded": 0, "failed": 0}
+    for params in missing_gps_rows:
+        try:
+            send_set_data_row(params, set_data)
+            result["succeeded"] += 1
+            result["missing_gps"]["succeeded"] += 1
+        except Exception as exc:
+            result["failed"] += 1
+            result["missing_gps"]["failed"] += 1
+            if len(result["errors"]) < 20:
+                result["errors"].append({"IdPlasDoc": params.get("IdPlasDoc", ""), "error": str(exc)})
+            else:
+                result["errors_truncated"] = True
+            logger.error("setData грешка за заявка без GPS IdPlasDoc=%s: %s", params.get("IdPlasDoc", ""), exc)
 
     logger.info("setData резултат: %s", json.dumps(result, ensure_ascii=False))
     return result

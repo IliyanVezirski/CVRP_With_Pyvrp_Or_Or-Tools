@@ -12,6 +12,7 @@ PyVRP е специализирана библиотека за VRP оптими
 from __future__ import annotations
 
 import logging
+from service_time import customer_service_seconds, minimum_service_seconds, service_signature, service_description
 import math
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import List, Dict, Tuple, Optional
@@ -24,20 +25,32 @@ try:
     from pyvrp.search import (
         NeighbourhoodParams,
         PerturbationParams,
-        Exchange10,
-        Exchange11,
-        Exchange20,
-        Exchange21,
-        Exchange22,
-        Exchange30,
-        Exchange31,
-        Exchange32,
-        Exchange33,
         RelocateWithDepot,
         SwapTails,
     )
+    PYVRP_LOCATION_API = hasattr(Model, "add_location")
+    if PYVRP_LOCATION_API:
+        # Stable 0.14 split Exchange(N, M) into Relocate(N) and Swap(N, M).
+        # Keep adapter aliases so the 0.13 branch and extended-op toggle retain
+        # the same move sizes. Logs expose the real native class names.
+        from pyvrp.search import (
+            Relocate1 as Exchange10,
+            Relocate2 as Exchange20,
+            Relocate3 as Exchange30,
+            Swap11 as Exchange11,
+            Swap21 as Exchange21,
+            Swap22 as Exchange22,
+            Swap31 as Exchange31,
+            Swap32 as Exchange32,
+            Swap33 as Exchange33,
+        )
+    else:
+        from pyvrp.search import (
+            Exchange10, Exchange11, Exchange20, Exchange21, Exchange22,
+            Exchange30, Exchange31, Exchange32, Exchange33,
+        )
     # Route-level operators exist in the stable 0.13 API, but were folded into
-    # the unified operator API on the experimental 0.14 line.
+    # the unified operator API on the stable 0.14 line.
     SwapRoutes = getattr(pyvrp.search, "SwapRoutes", None)
     SwapStar = getattr(pyvrp.search, "SwapStar", None)
     PYVRP_DEFAULT_OPERATORS = list(getattr(pyvrp.search, "OPERATORS", []))
@@ -85,6 +98,8 @@ from cvrp_solver import (
     calculate_distance_km,
 )
 
+
+from vehicle_schedules import route_schedule_fields
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +151,8 @@ class PyVRPSolver:
             location_config: Географски настройки
         """
         self.config = config
-        self.vehicle_configs = vehicle_configs
+        from vehicle_schedules import expand_physical_vehicles
+        self.vehicle_configs = expand_physical_vehicles(vehicle_configs)
         self.customers = customers
         self.distance_matrix = distance_matrix
         self.unique_depots = unique_depots
@@ -179,6 +195,14 @@ class PyVRPSolver:
     def _multiple_trips_enabled(self) -> bool:
         return bool(getattr(self.config, "enable_multiple_trips", False))
 
+    def _available_vehicle_configs(self) -> List[VehicleConfig]:
+        """One stable order for model profiles, vehicle types and extraction.
+
+        Keep the original fleet and matrix/depot ordering untouched: an enabled
+        row with count zero is a saved configuration, not an available vehicle.
+        """
+        return [vehicle for vehicle in self.vehicle_configs if vehicle.enabled and vehicle.count > 0]
+
     def _annotate_solution(
         self,
         solution: CVRPSolution,
@@ -207,7 +231,7 @@ class PyVRPSolver:
         native field for a real-kilometre cap. OR-Tools models both cumulative
         daily limits exactly.
         """
-        enabled = [vehicle for vehicle in self.vehicle_configs if vehicle.enabled and vehicle.count > 0]
+        enabled = self._available_vehicle_configs()
         for vehicle in enabled:
             daily_limit = getattr(vehicle, "max_customers_per_day", None)
             if daily_limit is None:
@@ -233,13 +257,15 @@ class PyVRPSolver:
         return None
 
     def _dynamic_max_reloads(self, vehicle_config: VehicleConfig) -> int:
-        """Finite solver-only upper bound; the user never configures trip count."""
+        """Finite resource bound, additionally capped by the physical bus limit."""
         if not self._multiple_trips_enabled() or not self.customers:
             return 0
 
         # A useful trip serves at least one customer, so more than N - 1
         # reloads can never improve a solution with N customers.
         bounds = [max(0, len(self.customers) - 1)]
+        if getattr(vehicle_config, '_max_trips', None) is not None:
+            bounds.append(vehicle_config._max_trips - 1)
 
         daily_limit = getattr(vehicle_config, "max_customers_per_day", None)
         if daily_limit is None:
@@ -248,23 +274,9 @@ class PyVRPSolver:
             bounds.append(max(0, int(daily_limit) - 1))
 
         shift_minutes = max(0, int(round(float(vehicle_config.max_time_hours or 0) * 60)))
-        default_service_minutes = max(
-            0,
-            float(getattr(vehicle_config, "service_time_minutes", 0) or 0),
-        )
-        effective_service_minutes = []
-        for customer in self.customers:
-            override = getattr(customer, "service_time_minutes", None)
-            if override is None or (isinstance(override, str) and not override.strip()):
-                effective_service_minutes.append(default_service_minutes)
-            else:
-                try:
-                    effective_service_minutes.append(max(0.0, float(override)))
-                except (TypeError, ValueError, OverflowError):
-                    effective_service_minutes.append(default_service_minutes)
         # Use the smallest effective service time to keep this a conservative
         # upper bound: it may allow extra reload candidates, but never too few.
-        service_minutes = min(effective_service_minutes, default=default_service_minutes)
+        service_minutes = minimum_service_seconds(self.customers, vehicle_config) / 60
         reload_minutes = max(0, int(getattr(vehicle_config, "reload_time_minutes", 0) or 0))
         if shift_minutes > 0 and service_minutes + reload_minutes > 0:
             # k * service + (k - 1) * reload <= shift. Travel is ignored so
@@ -440,7 +452,14 @@ class PyVRPSolver:
         Returns:
             CVRPSolution със списък маршрути и метрики
         """
+        from customer_deferral import geographic_enabled, validate_deferral_config
+        validate_deferral_config(self.config)
+        geographic = geographic_enabled(self.config)
         fallback_reason = self._exact_ortools_fallback_reason()
+        if geographic and fallback_reason:
+            raise ValueError("Географският тестов режим не допуска скрит OR-Tools fallback: " + fallback_reason)
+        if geographic and not PYVRP_VERSION.startswith("0.14"):
+            raise ValueError("Географският режим изисква инсталиран PyVRP 0.14 worker.")
         if fallback_reason and ORTOOLS_AVAILABLE:
             logger.warning(
                 "Using the full OR-Tools solver to enforce %s exactly for this "
@@ -464,8 +483,7 @@ class PyVRPSolver:
             )
 
         if not PYVRP_AVAILABLE:
-            logger.error("PyVRP is not installed")
-            return self._annotate_solution(self._create_empty_solution())
+            raise RuntimeError("PyVRP не е инсталиран или не може да бъде зареден.")
 
         try:
             # 1. Създаване на PyVRP модел
@@ -491,13 +509,33 @@ class PyVRPSolver:
             
             # Използваме MaxRuntime като stop критерий
             stop_criterion = MaxRuntime(self.config.time_limit_seconds)
-            result = solve(
-                problem_data,
-                stop=stop_criterion,
-                seed=seed,
-                params=params,
-                display=display_progress,
-            )
+            repair_stats = {}
+            if geographic:
+                from pyvrp_deferral_search import solve_geographic
+                from types import SimpleNamespace
+
+                def audit_candidate(candidate):
+                    native = SimpleNamespace(best=candidate, cost=lambda: 0,
+                                             is_feasible=candidate.is_feasible)
+                    extracted = self._extract_solution(model, problem_data, native, log_summary=False)
+                    # Extraction must not silently clip optional visits, either.
+                    served = sum(len(route.customers) for route in extracted.routes)
+                    return (extracted.is_feasible and served == candidate.num_clients()
+                            and not self._validate_extracted_solution_constraints(extracted))
+
+                result, repair_stats = solve_geographic(
+                    problem_data, seed=seed, params=params, display=display_progress,
+                    seconds=self.config.time_limit_seconds, config=self.config,
+                    original_indices=self._pyvrp_client_to_customer_idx, audit=audit_candidate,
+                )
+            else:
+                result = solve(
+                    problem_data,
+                    stop=stop_criterion,
+                    seed=seed,
+                    params=params,
+                    display=display_progress,
+                )
 
             # 4. Обработка на решението
             logger.info(f"PyVRP solution found")
@@ -517,6 +555,20 @@ class PyVRPSolver:
                 return self._annotate_solution(self._create_empty_solution())
             
             solution = self._extract_solution(model, problem_data, result)
+            if geographic:
+                solution.deferral_strategy = "geographic"
+                solution.deferral_selection_score = result_cost
+                solution.deferral_repair_stats = repair_stats
+                deferred = solution.dropped_customers
+                solution.deferral_summary = {
+                    "count": len(deferred),
+                    "volume": sum(float(c.volume) for c in deferred),
+                    "mean_depot_distance_km": (sum(getattr(c, "_deferral_distance_km", 0)
+                                                   for c in deferred) / len(deferred) if deferred else 0),
+                    "max_depot_distance_km": max((getattr(c, "_deferral_distance_km", 0)
+                                                  for c in deferred), default=0),
+                }
+                logger.info("Geographic result: selection score=%s; deferred=%s", result_cost, solution.deferral_summary)
             logger.info(
                 "  - Public fitness score (%s): %s",
                 "pure time seconds" if self._objective_metric() == "time" else "distance cost",
@@ -537,7 +589,9 @@ class PyVRPSolver:
 
         except Exception as e:
             logger.error(f"Error in PyVRP solver: {e}", exc_info=True)
-            return self._annotate_solution(self._create_empty_solution())
+            # A technical failure is not a solution with dropped customers.
+            # Preserve its type/message/traceback through the worker envelope.
+            raise
 
     def _validate_extracted_solution_constraints(self, solution: CVRPSolution) -> List[str]:
         """Audit reportable routes against configured hard limits.
@@ -559,14 +613,14 @@ class PyVRPSolver:
 
         def config_for_route(route: Route) -> Optional[VehicleConfig]:
             key_base = str(getattr(route, "vehicle_key", "") or "").rsplit("#", 1)[0]
-            for vehicle in self.vehicle_configs:
-                if vehicle.enabled and str(getattr(vehicle, "config_id", "") or "") == key_base:
+            for vehicle in self._available_vehicle_configs():
+                if str(getattr(vehicle, "config_id", "") or "") == key_base:
                     return vehicle
 
             route_type = getattr(route.vehicle_type, "value", route.vehicle_type)
-            for vehicle in self.vehicle_configs:
+            for vehicle in self._available_vehicle_configs():
                 vehicle_type = getattr(vehicle.vehicle_type, "value", vehicle.vehicle_type)
-                if vehicle.enabled and vehicle_type == route_type:
+                if vehicle_type == route_type:
                     return vehicle
             return None
 
@@ -597,6 +651,8 @@ class PyVRPSolver:
                 continue
 
             daily_customers = 0
+            if getattr(vehicle, '_max_trips', None) is not None and len(vehicle_routes) > vehicle._max_trips:
+                violations.append(f'{vehicle_key}: надвишен максимум {vehicle._max_trips} курса')
             daily_distance_km = 0.0
             planned_starts: List[float] = []
             planned_ends: List[float] = []
@@ -855,8 +911,10 @@ class PyVRPSolver:
         Returns:
             PyVRP Model инстанция
         """
+        enabled_vehicles = self._available_vehicle_configs()
+        if not enabled_vehicles:
+            raise ValueError("Няма активни бусове с брой над 0. Провери автопарка.")
         model = Model()
-        enabled_vehicles = [v for v in self.vehicle_configs if v.enabled]
         
         # Всички локации (депа + клиенти) в списък за лесен достъп
         all_locations = []  # List of (depot/client objects)
@@ -962,6 +1020,11 @@ class PyVRPSolver:
             self.unique_depots,
             self.config,
         )
+        from customer_deferral import geographic_enabled, geographic_penalties
+        if geographic_enabled(self.config):
+            drop_penalties = geographic_penalties(
+                self.customers, self.unique_depots, self.distance_matrix, self.config,
+            )
         
         logger.info(
             f"Customer dropping: {'enabled' if allow_dropping else 'disabled'}, "
@@ -1049,6 +1112,7 @@ class PyVRPSolver:
                 service_time_seconds,
                 vehicle_type_value,
                 center_zone_profile_signature(vehicle_type_value, self.location_config),
+                service_signature(v_config),
             )
 
         compressed_profiles = {}
@@ -1065,6 +1129,11 @@ class PyVRPSolver:
                     "vehicle_type": signature[1],
                     "center_behavior": signature[2],
                     "vehicle_types": [],
+                    "service_label": service_description(v_config),
+                    "customer_service_seconds": [
+                        self._ceil_nonnegative_seconds(customer_service_seconds(customer, v_config), "service duration")
+                        for customer in self.customers
+                    ],
                 }
                 compressed_profiles[signature] = spec
                 profile_specs.append(spec)
@@ -1085,7 +1154,7 @@ class PyVRPSolver:
             logger.info(
                 "  - profile #%s: service=%s sec, center_rules=%s, vehicles=%s",
                 idx,
-                spec["service_time_seconds"],
+                spec["service_label"],
                 spec["center_behavior"],
                 ", ".join(spec["vehicle_types"]),
             )
@@ -1185,22 +1254,10 @@ class PyVRPSolver:
                     vehicle_duration = duration
                     if i >= num_depots:
                         customer_index = matrix_i - len(self.unique_depots)
-                        service_override = (
-                            getattr(self.customers[customer_index], "service_time_minutes", None)
-                            if 0 <= customer_index < len(self.customers)
-                            else None
+                        service_seconds = (
+                            profile_spec["customer_service_seconds"][customer_index]
+                            if 0 <= customer_index < len(self.customers) else 0
                         )
-                        if service_override is None or (
-                            isinstance(service_override, str) and not service_override.strip()
-                        ):
-                            service_seconds = int(profile_spec["service_time_seconds"])
-                        else:
-                            try:
-                                service_seconds = self._canonical_service_seconds(
-                                    service_override
-                                )
-                            except (TypeError, ValueError, OverflowError):
-                                service_seconds = int(profile_spec["service_time_seconds"])
                         vehicle_duration += service_seconds
                     profile_objective_cost = self._objective_arc_cost(
                         base_distance,
@@ -1304,7 +1361,7 @@ class PyVRPSolver:
 
             vehicle_profile = vehicle_profiles_by_config_index[enabled_idx]
             profile_name = vehicle_profile_names_by_config_index[enabled_idx]
-            profile_name = f"{v_config.vehicle_type.value} ({v_config.service_time_minutes} мин service)"
+            profile_name = f"{v_config.vehicle_type.value} ({service_description(v_config)})"
 
             # Model.add_vehicle_type с двумерен capacity: [volume, max_stops]
             model.add_vehicle_type(
@@ -1515,8 +1572,13 @@ class PyVRPSolver:
 
         return solution
 
-    def _extract_solution(self, model: Model, problem_data, result) -> CVRPSolution:
-        """Flattens native PyVRP routes/trips into reportable physical courses."""
+    def _extract_solution(self, model: Model, problem_data, result, *, log_summary: bool = True) -> CVRPSolution:
+        """Flatten native routes, reporting totals only for the final result.
+
+        Candidate audits use the same extraction and validation, but must not
+        print final-looking summaries during the search. Warnings and errors
+        remain enabled regardless of this flag.
+        """
         routes_list: List[Route] = []
         dropped_customer_indices = set(range(len(self.customers)))
         total_distance_km = 0.0
@@ -1791,6 +1853,7 @@ class PyVRPSolver:
                     total_volume=route_volume,
                     is_feasible=True,
                     schedule_entries=schedule_entries,
+                    **route_schedule_fields(vehicle_config, trip_number),
                     vehicle_key=vehicle_key,
                     trip_number=trip_number,
                     trip_count=trip_count,
@@ -1805,7 +1868,8 @@ class PyVRPSolver:
             if idx in dropped_customer_indices
         ]
         allow_dropping = bool(getattr(self.config, "allow_customer_skipping", True))
-        if postprocess_clipped and not allow_dropping:
+        from customer_deferral import geographic_enabled
+        if postprocess_clipped and (not allow_dropping or geographic_enabled(self.config)):
             logger.error(
                 "PyVRP post-processing would remove required customers; rejecting "
                 "the partial result instead of returning it as a valid route plan."
@@ -1828,14 +1892,15 @@ class PyVRPSolver:
             second_trips_count=sum(1 for route in routes_list if route.trip_number > 1),
         )
 
-        logger.info("Reshenie obraboteno:")
-        logger.info("  - Fizicheski prevozni sredstva: %s", total_physical_vehicles)
-        logger.info("  - Kursove: %s", len(routes_list))
-        logger.info("  - Vtori i sledvashti kursove: %s", solution.second_trips_count)
-        logger.info("  - Propushcheni klienti: %s", len(dropped_customers_list))
-        logger.info("  - Obshto razstoyanie: %.1f km", total_distance_km)
-        logger.info("  - Obshto vreme: %.1f min", total_time_minutes)
-        logger.info("  - Obsluzhden obem: %.1f", total_volume)
+        if log_summary:
+            logger.info("Reshenie obraboteno:")
+            logger.info("  - Fizicheski prevozni sredstva: %s", total_physical_vehicles)
+            logger.info("  - Kursove: %s", len(routes_list))
+            logger.info("  - Vtori i sledvashti kursove: %s", solution.second_trips_count)
+            logger.info("  - Propushcheni klienti: %s", len(dropped_customers_list))
+            logger.info("  - Obshto razstoyanie: %.1f km", total_distance_km)
+            logger.info("  - Obshto vreme: %.1f min", total_time_minutes)
+            logger.info("  - Obsluzhden obem: %.1f", total_volume)
         return solution
 
     def _get_depot_index_for_location(self, location: Optional[Tuple[float, float]], fallback_index: int = 0) -> int:
@@ -1911,9 +1976,6 @@ class PyVRPSolver:
 
         depot_index = self._get_depot_index_for_location(depot_location, 0)
         end_depot_index = self._get_depot_index_for_location(end_location, depot_index)
-        default_service_time_seconds = self._canonical_service_seconds(
-            vehicle_config.service_time_minutes if vehicle_config else 15
-        )
         effective_start_seconds = (
             float(start_time_seconds)
             if start_time_seconds is not None
@@ -1939,23 +2001,7 @@ class PyVRPSolver:
                 float(self.distance_matrix.distances[current_node][customer_matrix_idx]),
             )
             travel_time_seconds = self._travel_time_seconds(current_node, customer_matrix_idx, location_coords)
-            service_override = getattr(customer, "service_time_minutes", None)
-            if service_override is None or (
-                isinstance(service_override, str) and not service_override.strip()
-            ):
-                service_time_seconds = default_service_time_seconds
-            else:
-                try:
-                    service_time_seconds = self._canonical_service_seconds(
-                        service_override
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    logger.warning(
-                        "Invalid service_time_minutes=%r for customer %s; using vehicle default.",
-                        service_override,
-                        customer.id,
-                    )
-                    service_time_seconds = default_service_time_seconds
+            service_time_seconds = self._ceil_nonnegative_seconds(customer_service_seconds(customer, vehicle_config), "service duration")
             cumulative_distance_m += distance_m
 
             raw_arrival_seconds = current_clock_seconds + travel_time_seconds
@@ -2032,18 +2078,16 @@ class PyVRPSolver:
 
     def _get_vehicle_config_for_type(self, vehicle_type) -> Optional[VehicleConfig]:
         vehicle_type_value = getattr(vehicle_type, "value", str(vehicle_type))
-        for v_config in self.vehicle_configs:
-            if v_config.enabled and v_config.vehicle_type.value == vehicle_type_value:
+        enabled_vehicle_configs = self._available_vehicle_configs()
+        for v_config in enabled_vehicle_configs:
+            if v_config.vehicle_type.value == vehicle_type_value:
                 return v_config
-        for v_config in self.vehicle_configs:
-            if v_config.enabled:
-                return v_config
-        return None
+        return enabled_vehicle_configs[0] if enabled_vehicle_configs else None
 
     def _get_vehicle_config_for_type_index(self, vehicle_type_index) -> Optional[VehicleConfig]:
         if not isinstance(vehicle_type_index, int):
             return None
-        enabled_vehicle_configs = [v_config for v_config in self.vehicle_configs if v_config.enabled]
+        enabled_vehicle_configs = self._available_vehicle_configs()
         if 0 <= vehicle_type_index < len(enabled_vehicle_configs):
             return enabled_vehicle_configs[vehicle_type_index]
         return None

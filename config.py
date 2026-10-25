@@ -15,8 +15,8 @@ from enum import Enum
 # Public solver identifiers shared by the desktop GUI, Web/API validation and
 # the runtime dispatcher.  The stable PyVRP backend intentionally remains the
 # default; the experimental backend is executed by an isolated sidecar.
-CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "or_tools", "vroom", "vrp")
-PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental"})
+CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "pyvrp_one", "or_tools", "vroom", "vrp")
+PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental", "pyvrp_one"})
 
 
 # --- Path Configuration ---
@@ -100,11 +100,17 @@ class VehicleConfig:
     capacity: int              # Максимален капацитет/обем (в стекове, грамове или друга единица)
     count: int                 # Брой налични превозни средства от този тип
     config_id: str = ""        # Stable unique key for this configuration row and its physical vehicles.
+    physical_bus_schedules: Optional[List[Dict]] = None  # Per bus: bus_id, start_id, max_trips.
     name: str = ""             # Име на буса за отчети и карти. При count > 1 се показва като "Име 1", "Име 2"...
     fixed_cost: int = 40000    # Цена/глоба за използване на един бус. По-висока стойност намалява броя използвани бусове.
     max_distance_km: Optional[int] = None  # Максимален дневен пробег на физическия бус. None означава без лимит.
-    max_time_hours: int = 8    # Максимално дневно работно време (включва пътуване, обслужване и презареждане).
+    max_time_hours: float = 8.0    # Часове за деня; 7.5 = 7 ч 30 мин (пътуване, обслужване и презареждане).
     service_time_minutes: int = 15 # Средно време за обслужване на един клиент в минути. Добавя се към общото време на маршрута.
+    service_time_mode: str = "fixed"  # fixed or formula; old configurations stay unchanged.
+    service_base_seconds: float = 0.0
+    service_seconds_per_unit: float = 12.0
+    service_quantity_units: float = 1.0
+    service_max_seconds: float = 900.0
     enabled: bool = True       # Дали този тип превозно средство е активно и може да се използва от solver-а.
     start_location: Optional[Tuple[float, float]] = None  # Персонална начална точка (депо) за този тип. Ако е None, използва се главното депо.
     end_location: Optional[Tuple[float, float]] = None  # Персонална крайна точка за този тип. Ако е None, маршрутът завършва в стартовото депо.
@@ -790,6 +796,7 @@ class InputConfig:
     delivery_comment_column: str = "Коментар доставка"  # Excel колона с коментар/инструкция за доставката.
     mandatory_column: str = "Задължителен"  # Optional Excel колона: true/false, 1/0 или да/не.
     enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
+    excluded_customer_ids: str = ""  # Клиентски номера, изпращани директно към необслужените.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
 
@@ -871,6 +878,13 @@ class CVRPConfig:
     min_customer_drop_penalty: int = 45000
     max_customer_drop_penalty: int = 500000
 
+    # A/B alternative, PyVRP 0.14 only. Existing deployments remain legacy.
+    customer_dropping_strategy: str = "legacy"
+    drop_geo_reference_km: float = 20.0
+    drop_geo_strength: float = 1.0
+    drop_repair_max_ejections: int = 6
+    drop_repair_budget_fraction: float = 0.15
+
     enable_parallel_solving: bool = True  # Keep disabled for PyVRP stability
     # Описание: Дали да се стартират няколко solver-а паралелно с различни стратегии.
     
@@ -924,7 +938,7 @@ class CVRPConfig:
     pyvrp_exhaustive_on_best: bool = True
     # Описание: По-скъпо локално търсене при ново най-добро решение.
     pyvrp_use_extended_operators: bool = True
-    # Описание: Добавя по-тежки PyVRP move operators (Exchange30/31/32/33, SwapStar, SwapRoutes).
+    # 0.13: Exchange30/31/32/33, SwapStar, SwapRoutes; 0.14: Relocate3, Swap31/32/33.
     pyvrp_min_perturbations: int = 1
     pyvrp_max_perturbations: int = 25
     # Описание: Сила на perturbation при restart-и. По-високо помага да излезе от лош локален оптимум.
@@ -946,6 +960,8 @@ class CVRPConfig:
 
     # --- Experimental PyVRP 0.14 sidecar ---
     pyvrp_next_worker_path: str = ""
+    # Isolated, pinned 1.x alpha. Never replaces either existing PyVRP runtime.
+    pyvrp_one_worker_path: str = ""
     # Празно = runtime-ът търси стандартния companion worker до приложението.
     pyvrp_next_worker_timeout_seconds: int = 0
     # 0 = time_limit_seconds плюс автоматичен 180-секунден резерв за startup, model build, validation и IPC.
@@ -1010,6 +1026,11 @@ class CVRPConfig:
 @dataclass
 class OutputConfig:
     """Конфигурации за генериране на изходни файлове (карти, Excel отчети, графики)."""
+    volume_unit_label: str = "стекове" # Само текст: стекове, кашони, оборот и т.н.; числата и API полетата не се променят.
+    mandatory_customer_comment: str = "Задължителен клиент — не пропускайте доставката." # Текст в индивидуалните карти; не променя solver флага.
+    mobile_driver_panel: bool = False # Алтернативен компактен панел с един разгънат клиент.
+    driver_total_volume_label: str = "" # Надпис за капацитети и общи количества навсякъде; празно = общата единица.
+    driver_customer_volume_label: str = "" # Единица при клиентите и заявките навсякъде; празно = общата единица.
     # Интерактивна карта
     enable_interactive_map: bool = True # Дали да се генерира HTML файл с интерактивна карта на маршрутите.
     map_output_file: str = _abs_path("D:\\Iliyan\\bizant_source\\output/interactive_map.html") # Път и име на файла за картата.
@@ -1017,7 +1038,7 @@ class OutputConfig:
     route_maps_upload_mode: str = "disabled" # disabled = не качва; legacy = старото поведение; effect_upload = качва route HTML файловете към upload endpoint.
     route_maps_upload_url: str = "https://effect.bg/dragon/hellbizant/upload-files.php" # Endpoint за качване на индивидуалните HTML карти.
     route_maps_upload_token_field: str = "pData" # POST поле за token-а при upload.
-    route_maps_upload_token: str = "Effect-Bizant-Token" # Token стойност за upload endpoint-а.
+    route_maps_upload_token: str = os.environ.get("BIZANT_MAP_UPLOAD_TOKEN", "") # Token стойност за upload endpoint-а.
     route_maps_upload_file_field: str = "files[]" # Multipart file поле. За PHP $_FILES['files'] с много файлове се използва files[].
     route_maps_upload_bus_id_field: str = "pData2[]" # Multipart POST поле за ID-та на бусовете, подредени като files[].
     route_maps_upload_timeout_seconds: int = 60 # Таймаут за качване на route HTML файловете.
@@ -1030,12 +1051,14 @@ class OutputConfig:
     
     # Excel файлове
     enable_excel_output: bool = True # Дали да се генерира Excel CVRP отчет.
+    enable_routing_quality_report: bool = False # Допълнителен Excel отчет за приблизителни отсечки и неизвестен произход.
     excel_output_dir: str = _abs_path("D:\\Iliyan\\bizant_source\\output/excel") # Директория за запис на Excel отчетите.
     warehouse_excel_file: str = "warehouse_orders.xlsx" # Име на файла с необслужените клиенти (за склада).
     routes_excel_file: str = "vehicle_routes.xlsx" # Име на файла с детайли за всеки маршрут.
     efficiency_excel_file: str = "efficiency_report.xlsx" # Име на файла с отчет за ефективността.
     excel_bus_number_prefix: str = "10045010" # Префикс за номерата на бусове в Excel отчета.
     excel_bus_number_digits: int = 2 # Брой цифри след префикса: 01, 02, 03...
+    excel_bus_number_start: int = 1 # Начален пореден номер за SetData, Excel и картите.
     saturday_excel_bus_number_prefix: str = "100450121" # Префикс за бусове при HTTP /run_saturday.
     saturday_excel_bus_number_digits: int = 1 # Брой цифри след съботния префикс.
     center_bus_numbering_enabled: bool = True # Ако е включено, CENTER_BUS започва от ID 1004501015 нагоре, а другите бусове си тръгват от 1004501001 нагоре.
@@ -1180,8 +1203,13 @@ class SetDataConfig:
     enable_unserved_final_done_flag_update: bool = True  # Дали след makeGroup да се задава отделен финален DoneFlag.
     set_data_unserved_final_done_flag: str = "1973"  # Финален DoneFlag само за необслужените; празно = общият set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
+    set_data_excluded_id_grafik: str = ""  # Отделно направление за ръчно изключените; празно = текущото за необслужени.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
     set_data_unserved_bukva_template: str = "HOF1-{stop_number}"  # Шаблон за Bukva на необслужени клиенти.
+    enable_missing_gps_set_data_upload: bool = True  # Отделно изпращане на заявките без въведени GPS.
+    set_data_missing_gps_done_flag: str = "0"  # Изпраща се директно, без финална промяна на DoneFlag.
+    set_data_missing_gps_id_grafik: str = "1004501000"  # Направление за заявките без GPS.
+    set_data_missing_gps_bukva_template: str = "HOF1-{stop_number}"  # Буква за заявките без GPS.
     enable_make_group: bool = False  # След първоначалния setData изпраща makeGroup; после необслужените получават общия DoneFlag.
     set_data_make_group_command: str = "makeGroup"  # cmd за групиране след успешни setData заявки.
     set_data_timeout_seconds: int = 30  # Таймаут за setData заявка.

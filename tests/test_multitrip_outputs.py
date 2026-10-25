@@ -377,8 +377,10 @@ class MultiTripOutputTests(unittest.TestCase):
         self.assertEqual(result, "HTTP 200: OK")
 
     def test_planned_start_and_physical_course_totals_reach_reports(self):
-        first = _route("A", 1, planned_start_minutes=480, planned_end_minutes=600)
-        second = _route("A", 2, planned_start_minutes="10:30", planned_end_minutes="12:15")
+        first = _route("A", 1, planned_start_minutes=480, planned_end_minutes=600,
+                       customers=[Customer("a", "First", (42.1, 23.1), 1, "42.1,23.1")])
+        second = _route("A", 2, planned_start_minutes="10:30", planned_end_minutes="12:15",
+                        customers=[Customer("b", "Second", (42.2, 23.2), 1, "42.2,23.2")])
         self.assertEqual(_route_start_time_minutes(first), 480)
         self.assertEqual(_route_start_time_minutes(second), 630)
 
@@ -409,6 +411,7 @@ class MultiTripOutputTests(unittest.TestCase):
         }
         self.assertEqual(stats["Брой физически бусове"], 1)
         self.assertEqual(stats["Брой курсове"], 2)
+        self.assertEqual(stats["Общо време (ч)"], 4.25)
 
     def test_multitrip_csv_has_course_identity_and_second_course_start(self):
         customer = Customer("c2", "Second", (42.1, 23.1), 1.0, "42.1,23.1")

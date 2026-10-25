@@ -11,6 +11,12 @@ import shutil
 import argparse
 from pathlib import Path
 import importlib.util
+from config_compat import compile_external_config
+
+
+def _compile_external_config(source: str, filename: str):
+    """Supply new vehicle schema defaults in memory, never rewrite user settings."""
+    return compile_external_config(source, filename)
 
 
 def _configure_stdio():
@@ -149,7 +155,7 @@ def load_config():
         if spec and spec.loader:
             config = importlib.util.module_from_spec(spec)
             sys.modules['config'] = config
-            spec.loader.exec_module(config)
+            exec(_compile_external_config(config_path.read_text(encoding="utf-8-sig"), str(config_path)), config.__dict__)
             
             # В EXE режим относителните пътища се връзват към папката на exe-то,
             # а абсолютните стойности от Settings се запазват без промяна.
@@ -351,6 +357,35 @@ def tsp_worker_exe():
         sys.exit(1)
 
 
+def self_check_exe():
+    """Import/configuration smoke check: never starts a solver or HTTP server."""
+    import json
+    setup_exe_environment()
+    load_config()
+    import config
+    import config_gui
+    import cvrp_api_server
+    from customer_deferral import DEFERRAL_FIELDS, validate_deferral_config
+    cfg = config.get_config()
+    validate_deferral_config(cfg.cvrp)
+    missing = sorted(field for field in DEFERRAL_FIELDS if not hasattr(cfg.cvrp, field))
+    if missing:
+        raise ValueError("Runtime config lacks deferral fields: " + ", ".join(missing))
+    page = cvrp_api_server._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
+    assert 'id="customerDroppingStrategy"' in page
+    assert hasattr(config_gui.ConfigGUI, "_validate_values")
+    from main import vehicle_config_to_worker_dict, vehicle_configs_from_worker_dicts
+    import multiprocessing
+    vehicles = [vehicle_config_to_worker_dict(v) for v in cfg.vehicles]
+    with multiprocessing.Pool(1) as pool:
+        restored = pool.apply(vehicle_configs_from_worker_dicts, (vehicles,))
+    assert [vehicle_config_to_worker_dict(v) for v in restored] == vehicles
+    print(json.dumps({"ok": True, "kind": "self_check", "app": "Bizant",
+                      "deferral_strategy": cfg.cvrp.customer_dropping_strategy,
+                      "legacy_parallel_schema_verified": True,
+                      "desktop_settings_import": True, "web_settings_render": True}))
+
+
 def web_run_worker_exe():
     """Runs one web-triggered CVRP request in a separate EXE process."""
     try:
@@ -374,14 +409,28 @@ def web_run_worker_exe():
 
 if __name__ == "__main__":
     import multiprocessing
+    if getattr(sys, "frozen", False) and "--multiprocessing-fork" in sys.argv:
+        # freeze_support dispatches directly into the pool worker and never
+        # reaches load_config(). Install the same compatible schema BEFORE
+        # unpickling/importing main; do not rewrite settings or create outputs.
+        worker_config_path = Path(sys.executable).parent / "config.py"
+        if worker_config_path.exists():
+            worker_spec = importlib.util.spec_from_file_location("config", str(worker_config_path))
+            worker_config = importlib.util.module_from_spec(worker_spec)
+            sys.modules["config"] = worker_config
+            exec(_compile_external_config(worker_config_path.read_text(encoding="utf-8-sig"),
+                                          str(worker_config_path)), worker_config.__dict__)
     multiprocessing.freeze_support()
     
-    if "--web-run-worker" in sys.argv:
+    if "--self-check" in sys.argv:
+        self_check_exe()
+    elif "--web-run-worker" in sys.argv:
         web_run_worker_exe()
     elif "--tsp-worker" in sys.argv:
         tsp_worker_exe()
     elif "--settings" in sys.argv or "--config" in sys.argv:
         # Стартираме GUI за настройки
+        load_config()
         from config_gui import main as gui_main
         gui_main()
     elif "--server" in sys.argv or "--api" in sys.argv:

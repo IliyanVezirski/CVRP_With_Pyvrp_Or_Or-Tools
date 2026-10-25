@@ -16,6 +16,10 @@ from datetime import datetime, timedelta
 from config import get_config, OSRMConfig
 from input_handler import Customer
 from tqdm import tqdm
+from routing_quality import (
+    OSRM, UNKNOWN, RoutingResponseError, error_reason, numeric,
+    quality_at, quality_code, quality_grid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,7 @@ class DistanceMatrix:
     locations: List[Tuple[float, float]]  # координати
     sources: List[int]  # индекси на източниците
     destinations: List[int]  # индекси на дестинациите
+    quality: Optional[List[List[str]]] = None  # distance source | time source | reason
 
 
 @dataclass
@@ -107,7 +112,8 @@ class OSRMCache:
                     durations=cached_item['durations'],
                     locations=cached_item['locations'],
                     sources=cached_item['sources'],
-                    destinations=cached_item['destinations']
+                    destinations=cached_item['destinations'],
+                    quality=cached_item.get('quality'),
                 )
             except Exception as e:
                 logger.warning(f"Грешка при четене от кеш: {e}")
@@ -127,6 +133,7 @@ class OSRMCache:
             'locations': matrix.locations,
             'sources': matrix.sources,
             'destinations': matrix.destinations,
+            'quality': getattr(matrix, 'quality', None),
             'timestamp': datetime.now().isoformat()
         }
         
@@ -151,7 +158,8 @@ class OSRMCache:
                         durations=cached_item['durations'],
                         locations=cached_item['locations'],
                         sources=cached_item['sources'],
-                        destinations=cached_item['destinations']
+                        destinations=cached_item['destinations'],
+                        quality=cached_item.get('quality'),
                     )
             except Exception as e:
                 logger.warning(f"Грешка при четене на кеширан запис: {e}")
@@ -190,6 +198,7 @@ class OSRMCache:
         n = len(location_indices)
         sub_distances = [[0.0 for _ in range(n)] for _ in range(n)]
         sub_durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        sub_quality = quality_grid(n)
         
         for i in range(n):
             for j in range(n):
@@ -197,12 +206,14 @@ class OSRMCache:
                 central_j = location_indices[j]
                 sub_distances[i][j] = central_matrix.distances[central_i][central_j]
                 sub_durations[i][j] = central_matrix.durations[central_i][central_j]
+                sub_quality[i][j] = quality_at(central_matrix, central_i, central_j)
         
         logger.info(f"📊 Извлечена подматрица {n}x{n} от централната матрица")
         
         return DistanceMatrix(
             distances=sub_distances,
             durations=sub_durations,
+            quality=sub_quality,
             locations=required_locations,
             sources=list(range(n)),
             destinations=list(range(n))
@@ -349,7 +360,10 @@ class OSRMClient:
             data = response.json()
             
             if data['code'] != 'Ok':
-                raise Exception(f"OSRM грешка: {data.get('message', 'Неизвестна грешка')}")
+                raise RoutingResponseError(
+                    f"OSRM грешка: {data.get('code', 'Unknown')}",
+                    "no_route" if data.get('code') in {'NoRoute', 'NoTable', 'NoSegment'} else "request_error",
+                )
             
             server_type = "локален" if "localhost" in server_url else "публичен"
             logger.info(f"✅ Успешен Table API към {server_type} сървър за {len(locations)} локации")
@@ -361,36 +375,12 @@ class OSRMClient:
             logger.info(f"OSRM връща разстояния: {has_distances}, времена: {has_durations}")
             
             # Обработка на данните
-            distances = data.get('distances', [])
-            durations = data.get('durations', [])
-            
-            if not distances and durations:
-                # Изчисляваме разстояния от времето с подобрена точност
-                distances = []
-                # Фактор за превръщане: средна скорост + корекционен фактор
-                speed_factor = self.config.average_speed_kmh * 1000 / 3600  # m/s
-                correction_factor = 1.1  # Разстоянията са по-дълги от идеалната права
-                
-                for i, row in enumerate(durations):
-                    dist_row = []
-                    for j, duration in enumerate(row):
-                        if i == j:
-                            # Разстоянието до себе си е 0
-                            dist_row.append(0.0)
-                        elif duration > 0:
-                            # Реалистично разстояние: време * средна скорост * корекция
-                            approx_distance = duration * speed_factor * correction_factor
-                            dist_row.append(approx_distance)
-                        else:
-                            # Ако има проблем с времето, използваме haversine за приблизителна оценка
-                            haversine_dist = self._haversine_distance(locations[i], locations[j]) * 1.3
-                            dist_row.append(haversine_dist)
-                    distances.append(dist_row)
-                logger.info("⚠️ OSRM не връща разстояния! Изчислени разстояния от времето с повишена точност.")
+            distances, durations, quality = self._normalise_table_values(data, locations)
             
             matrix = DistanceMatrix(
                 distances=distances,
                 durations=durations,
+                quality=quality,
                 locations=locations,
                 sources=list(range(len(locations))),
                 destinations=list(range(len(locations)))
@@ -410,6 +400,48 @@ class OSRMClient:
     def _try_table_api_direct(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Опитва директно Table API за малки datasets (wrapper за съвместимост)"""
         return self._try_table_api_to_server(locations, self.config.base_url)
+
+    def _approximate_values(self, origin, destination, reason="request_error"):
+        distance = self._haversine_distance(origin, destination) * 1.3
+        duration = distance / 1000 / self.config.average_speed_kmh * 3600
+        return distance, duration, quality_code("approx", "approx", reason)
+
+    def _normalise_table_values(self, data, locations):
+        """Validate every directed cell; a successful HTTP response is not enough."""
+        n = len(locations)
+        distances = [[0.0] * n for _ in range(n)]
+        durations = [[0.0] * n for _ in range(n)]
+        quality = quality_grid(n, value=OSRM)
+        missing = object()
+
+        def cell(name, i, j):
+            try:
+                return data[name][i][j]
+            except (KeyError, IndexError, TypeError):
+                return missing
+
+        estimated = {tuple(pair) for pair in (data.get("fallback_speed_cells") or [])
+                     if isinstance(pair, (list, tuple)) and len(pair) == 2
+                     and all(isinstance(index, int) for index in pair)}
+        for i, origin in enumerate(locations):
+            for j, destination in enumerate(locations):
+                if i == j:
+                    continue
+                raw_distance, raw_duration = cell("distances", i, j), cell("durations", i, j)
+                distance, duration = numeric(raw_distance), numeric(raw_duration)
+                if distance is None and duration is None:
+                    reason = "no_route" if raw_distance is None and raw_duration is None else "invalid_value"
+                    distance, duration, quality[i][j] = self._approximate_values(origin, destination, reason)
+                elif distance is None:
+                    distance = duration * self.config.average_speed_kmh * 1000 / 3600 * 1.1
+                    quality[i][j] = quality_code("derived", "osrm", "distance_from_duration")
+                elif duration is None:
+                    duration = distance / 1000 / self.config.average_speed_kmh * 3600
+                    quality[i][j] = quality_code("osrm", "approx", "invalid_value")
+                if (i, j) in estimated:
+                    quality[i][j] = quality_code("approx", "approx", "server_estimate")
+                distances[i][j], durations[i][j] = distance, duration
+        return distances, durations, quality
     
     def _build_matrix_via_table_batches(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Изгражда матрица използвайки Table API batches с правилна логика"""
@@ -431,6 +463,7 @@ class OSRMClient:
         # Инициализация на резултатни матрици  
         full_distances = [[0.0 for _ in range(n)] for _ in range(n)]
         full_durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n)
         
         successful_batches = 0
         failed_batches = 0
@@ -483,7 +516,7 @@ class OSRMClient:
                             logger.debug(f"Прескачам batch {i}-{end_i}, {j}-{end_j}: {len(batch_locations)} локации")
                             # Използваме Route API директно за този batch
                             self._fill_batch_with_routes(sources_batch, destinations_batch, 
-                                                       full_distances, full_durations, i, j)
+                                                       full_distances, full_durations, i, j, quality)
                             failed_batches += 1
                         else:
                             # Table API заявка за този batch
@@ -498,6 +531,7 @@ class OSRMClient:
                                         global_dest = j + dest_idx
                                         full_distances[global_src][global_dest] = batch_matrix.distances[src_idx][dest_idx]
                                         full_durations[global_src][global_dest] = batch_matrix.durations[src_idx][dest_idx]
+                                        quality[global_src][global_dest] = quality_at(batch_matrix, src_idx, dest_idx)
                             else:
                                 # Различни блокове - mapване
                                 for src_idx, src_loc in enumerate(sources_batch):
@@ -510,16 +544,19 @@ class OSRMClient:
                                             batch_dest_idx = location_map[dest_loc]
                                             full_distances[global_src][global_dest] = batch_matrix.distances[batch_src_idx][batch_dest_idx]
                                             full_durations[global_src][global_dest] = batch_matrix.durations[batch_src_idx][batch_dest_idx]
+                                            quality[global_src][global_dest] = quality_at(batch_matrix, batch_src_idx, batch_dest_idx)
                                         else:
                                             # Fallback към Route API за тази конкретна двойка
                                             try:
                                                 route_matrix = self._single_route_request(src_loc, dest_loc)
                                                 full_distances[global_src][global_dest] = route_matrix['distance']
                                                 full_durations[global_src][global_dest] = route_matrix['duration']
-                                            except:
+                                                quality[global_src][global_dest] = OSRM
+                                            except Exception as exc:
                                                 approx_distance = self._haversine_distance(src_loc, dest_loc) * 1.3
                                                 full_distances[global_src][global_dest] = approx_distance
                                                 full_durations[global_src][global_dest] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                                                quality[global_src][global_dest] = quality_code("approx", "approx", error_reason(exc))
                             
                             successful_batches += 1
                         
@@ -541,7 +578,7 @@ class OSRMClient:
                         # Fallback към Route API за този batch
                         logger.debug(f"🛣️ Fallback към Route API за batch {i}-{end_i}, {j}-{end_j}")
                         self._fill_batch_with_routes(sources_batch, destinations_batch, 
-                                                   full_distances, full_durations, i, j)
+                                                   full_distances, full_durations, i, j, quality)
                         
                         pbar.update(1)
                         pbar.set_postfix({
@@ -560,6 +597,7 @@ class OSRMClient:
         matrix = DistanceMatrix(
             distances=full_distances,
             durations=full_durations,
+            quality=quality,
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -573,7 +611,7 @@ class OSRMClient:
         return matrix
     
     def _fill_batch_with_routes(self, sources_batch, destinations_batch, 
-                               full_distances, full_durations, i, j):
+                               full_distances, full_durations, i, j, quality=None):
         """Помощен метод за попълване на batch с Route API заявки"""
         for src_idx, src_loc in enumerate(sources_batch):
             for dest_idx, dest_loc in enumerate(destinations_batch):
@@ -588,10 +626,14 @@ class OSRMClient:
                         route_matrix = self._single_route_request(src_loc, dest_loc)
                         full_distances[global_src][global_dest] = route_matrix['distance']
                         full_durations[global_src][global_dest] = route_matrix['duration']
-                    except:
+                        if quality is not None:
+                            quality[global_src][global_dest] = OSRM
+                    except Exception as exc:
                         approx_distance = self._haversine_distance(src_loc, dest_loc) * 1.3
                         full_distances[global_src][global_dest] = approx_distance
                         full_durations[global_src][global_dest] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                        if quality is not None:
+                            quality[global_src][global_dest] = quality_code("approx", "approx", error_reason(exc))
     
     def _get_matrix_via_routes(self, locations: List[Tuple[float, float]], base_url: str) -> DistanceMatrix:
         """Използва Route API за получаване на distance matrix (за локални сървъри)"""
@@ -600,10 +642,11 @@ class OSRMClient:
         # За големи матрици използваме приблизителни стойности
         if n > 100:  # Максимум 100 локации за Route API
             logger.warning(f"🚀 {n} локации е твърде много за Route API -> използвам приблизителни стойности")
-            return self._create_approximate_matrix(locations)
+            return self._create_approximate_matrix(locations, "size_limit")
         
         distances = [[0.0 for _ in range(n)] for _ in range(n)]
         durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n, value=OSRM)
         
         logger.info(f"Изчисляване на matrix чрез Route API за {n} локации ({n*n} заявки)")
         
@@ -629,6 +672,8 @@ class OSRMClient:
                         data = response.json()
                         if data['code'] == 'Ok' and data['routes']:
                             route = data['routes'][0]
+                            if numeric(route.get('distance')) is None or numeric(route.get('duration')) is None:
+                                raise RoutingResponseError("OSRM Route API върна невалидни стойности")
                             distances[i][j] = route['distance']  # в метри
                             durations[i][j] = route['duration']   # в секунди
                         else:
@@ -636,6 +681,7 @@ class OSRMClient:
                             approx_distance = self._haversine_distance(locations[i], locations[j]) * 1.3
                             distances[i][j] = approx_distance
                             durations[i][j] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                            quality[i][j] = quality_code("approx", "approx", "no_route" if data.get('code') in {'NoRoute', 'NoTable', 'NoSegment'} else "request_error")
                             
                     except Exception as e:
                         logger.warning(f"Route заявка {i}->{j} неуспешна: {e}")
@@ -643,6 +689,7 @@ class OSRMClient:
                         approx_distance = self._haversine_distance(locations[i], locations[j]) * 1.3
                         distances[i][j] = approx_distance
                         durations[i][j] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                        quality[i][j] = quality_code("approx", "approx", error_reason(e))
                     
                     # Обновяване на прогрес бара
                     pbar.update(1)
@@ -655,6 +702,7 @@ class OSRMClient:
         matrix = DistanceMatrix(
             distances=distances,
             durations=durations,
+            quality=quality,
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -677,18 +725,24 @@ class OSRMClient:
         data = response.json()
         if data['code'] == 'Ok' and data['routes']:
             route = data['routes'][0]
+            if numeric(route.get('distance')) is None or numeric(route.get('duration')) is None:
+                raise RoutingResponseError("OSRM Route API върна невалидни стойности")
             return {
                 'distance': route['distance'],
                 'duration': route['duration']
             }
         else:
-            raise Exception(f"Route API грешка: {data.get('code', 'Unknown')}")
+            raise RoutingResponseError(
+                f"Route API грешка: {data.get('code', 'Unknown')}",
+                "no_route" if data.get('code') in {'NoRoute', 'NoTable', 'NoSegment'} else "request_error",
+            )
     
     def _build_matrix_via_routes_only(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Изгражда пълна матрица използвайки САМО Route API заявки"""
         n = len(locations)
         distances = [[0.0 for _ in range(n)] for _ in range(n)]
         durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n, value=OSRM)
         
         total_requests = n * (n - 1)
         logger.info(f"🚀 Започвам изграждане на матрица: {n}×{n} = {total_requests} Route API заявки")
@@ -705,16 +759,16 @@ class OSRMClient:
                         route_matrix = self._single_route_request(locations[i], locations[j])
                         distances[i][j] = route_matrix['distance']
                         durations[i][j] = route_matrix['duration']
-                    except:
-                        approx_distance = self._haversine_distance(locations[i], locations[j]) * 1.3
-                        distances[i][j] = approx_distance
-                        durations[i][j] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                    except Exception as exc:
+                        distances[i][j], durations[i][j], quality[i][j] = self._approximate_values(
+                            locations[i], locations[j], error_reason(exc))
                     
                     pbar.update(1)
         
         matrix = DistanceMatrix(
             distances=distances,
             durations=durations,
+            quality=quality,
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -725,7 +779,7 @@ class OSRMClient:
         
         return matrix
     
-    def _create_approximate_matrix(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
+    def _create_approximate_matrix(self, locations: List[Tuple[float, float]], reason="request_error") -> DistanceMatrix:
         """Създава приблизителна матрица с разстояния когато OSRM не работи"""
         n = len(locations)
         distances = [[0.0 for _ in range(n)] for _ in range(n)]
@@ -744,6 +798,7 @@ class OSRMClient:
         return DistanceMatrix(
             distances=distances,
             durations=durations,
+            quality=quality_grid(n, value=quality_code("approx", "approx", reason)),
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -933,6 +988,7 @@ class OSRMClient:
         matrix = DistanceMatrix(
             distances=distances,
             durations=durations,
+            quality=quality_grid(n, value=quality_code("approx", "approx", "match_estimate" if matchings else "no_route")),
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -955,6 +1011,7 @@ class OSRMClient:
         # Инициализация на резултатни матрици
         full_distances = [[0.0 for _ in range(n)] for _ in range(n)]
         full_durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n)
         
         successful_batches = 0
         failed_batches = 0
@@ -985,6 +1042,7 @@ class OSRMClient:
                             global_dest = i + dest_idx
                             full_distances[global_src][global_dest] = batch_matrix.distances[src_idx][dest_idx]
                             full_durations[global_src][global_dest] = batch_matrix.durations[src_idx][dest_idx]
+                            quality[global_src][global_dest] = quality_at(batch_matrix, src_idx, dest_idx)
                     
                     successful_batches += 1
                     
@@ -1016,9 +1074,10 @@ class OSRMClient:
                                 global_dest = i + dest_idx
                                 full_distances[global_src][global_dest] = batch_matrix.distances[src_idx][dest_idx]
                                 full_durations[global_src][global_dest] = batch_matrix.durations[src_idx][dest_idx]
-                    except:
+                                quality[global_src][global_dest] = quality_at(batch_matrix, src_idx, dest_idx)
+                    except Exception as exc:
                         # Последен fallback към приблизителни стойности
-                        self._fill_batch_with_approximations(batch_locations, full_distances, full_durations, i)
+                        self._fill_batch_with_approximations(batch_locations, full_distances, full_durations, i, quality, error_reason(exc))
                     
                     pbar.update(1)
                     pbar.set_postfix({
@@ -1029,7 +1088,7 @@ class OSRMClient:
             
             # Попълваме междубbatch разстоянията
             logger.info(f"🔗 Попълвам междубbatch разстояния...")
-            self._fill_inter_batch_distances(locations, full_distances, full_durations, batch_size)
+            self._fill_inter_batch_distances(locations, full_distances, full_durations, batch_size, quality)
         
         # Финален отчет
         success_rate = (successful_batches / total_batch_requests) * 100 if total_batch_requests > 0 else 0
@@ -1041,6 +1100,7 @@ class OSRMClient:
         matrix = DistanceMatrix(
             distances=full_distances,
             durations=full_durations,
+            quality=quality,
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -1053,7 +1113,7 @@ class OSRMClient:
         
         return matrix
     
-    def _fill_batch_with_approximations(self, batch_locations, full_distances, full_durations, start_idx):
+    def _fill_batch_with_approximations(self, batch_locations, full_distances, full_durations, start_idx, quality=None, reason="request_error"):
         """Попълва batch с приблизителни стойности като fallback"""
         for i, loc1 in enumerate(batch_locations):
             for j, loc2 in enumerate(batch_locations):
@@ -1067,8 +1127,10 @@ class OSRMClient:
                     approx_distance = self._haversine_distance(loc1, loc2) * 1.3
                     full_distances[global_i][global_j] = approx_distance
                     full_durations[global_i][global_j] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                    if quality is not None:
+                        quality[global_i][global_j] = quality_code("approx", "approx", reason)
     
-    def _fill_inter_batch_distances(self, locations, full_distances, full_durations, batch_size):
+    def _fill_inter_batch_distances(self, locations, full_distances, full_durations, batch_size, quality=None):
         """Попълва разстоянията между различни batch-ове"""
         n = len(locations)
         
@@ -1092,13 +1154,17 @@ class OSRMClient:
                             full_distances[dest_idx][src_idx] = reverse_result['distance']
                             full_durations[src_idx][dest_idx] = forward_result['duration']
                             full_durations[dest_idx][src_idx] = reverse_result['duration']
-                        except:
+                            if quality is not None:
+                                quality[src_idx][dest_idx] = quality[dest_idx][src_idx] = OSRM
+                        except Exception as exc:
                             # Fallback към приблизителни стойности
                             approx_distance = self._haversine_distance(src_loc, dest_loc) * 1.3
                             full_distances[src_idx][dest_idx] = approx_distance
                             full_distances[dest_idx][src_idx] = approx_distance
                             full_durations[src_idx][dest_idx] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
                             full_durations[dest_idx][src_idx] = full_durations[src_idx][dest_idx]
+                            if quality is not None:
+                                quality[src_idx][dest_idx] = quality[dest_idx][src_idx] = quality_code("approx", "approx", error_reason(exc))
 
     def _build_optimized_table_batches(self, locations: List[Tuple[float, float]]) -> DistanceMatrix:
         """Оптимизиран batch Table API метод."""
@@ -1113,6 +1179,7 @@ class OSRMClient:
         # Инициализация на резултатни матрици
         full_distances = [[0.0 for _ in range(n)] for _ in range(n)]
         full_durations = [[0.0 for _ in range(n)] for _ in range(n)]
+        quality = quality_grid(n)
         
         successful_batches = 0
         failed_batches = 0
@@ -1144,6 +1211,7 @@ class OSRMClient:
                             global_j = start_idx + j
                             full_distances[global_i][global_j] = batch_matrix.distances[i][j]
                             full_durations[global_i][global_j] = batch_matrix.durations[i][j]
+                            quality[global_i][global_j] = quality_at(batch_matrix, i, j)
                     
                     successful_batches += 1
                     
@@ -1176,6 +1244,7 @@ class OSRMClient:
                                 approx_distance = self._haversine_distance(batch_locations[i], batch_locations[j]) * 1.3
                                 full_distances[global_i][global_j] = approx_distance
                                 full_durations[global_i][global_j] = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
+                                quality[global_i][global_j] = quality_code("approx", "approx", error_reason(e))
                     
                     pbar.update(1)
                     pbar.set_postfix({
@@ -1186,7 +1255,7 @@ class OSRMClient:
         
         # Попълваме междубbatch разстоянията с Route API
         logger.info(f"🔗 Попълвам междубbatch разстояния...")
-        self._fill_inter_batch_connections(locations, full_distances, full_durations, batch_requests)
+        self._fill_inter_batch_connections(locations, full_distances, full_durations, batch_requests, quality)
         
         # Финален отчет
         success_rate = (successful_batches / total_batch_requests) * 100 if total_batch_requests > 0 else 0
@@ -1198,6 +1267,7 @@ class OSRMClient:
         matrix = DistanceMatrix(
             distances=full_distances,
             durations=full_durations,
+            quality=quality,
             locations=locations,
             sources=list(range(len(locations))),
             destinations=list(range(len(locations)))
@@ -1210,7 +1280,7 @@ class OSRMClient:
         
         return matrix
     
-    def _fill_inter_batch_connections(self, locations, full_distances, full_durations, batch_requests):
+    def _fill_inter_batch_connections(self, locations, full_distances, full_durations, batch_requests, quality=None):
         """Попълва разстоянията между различни batch-ове с оптимизирани Table API заявки"""
         n = len(locations)
         logger.info(f"🔗 Попълвам междубbatch връзки с Table API batch заявки...")
@@ -1255,6 +1325,9 @@ class OSRMClient:
                             full_distances[global_dest][global_src] = reverse_distance
                             full_durations[global_src][global_dest] = forward_duration
                             full_durations[global_dest][global_src] = reverse_duration
+                            if quality is not None:
+                                quality[global_src][global_dest] = quality_at(inter_batch_matrix, inter_src_idx, inter_dest_idx)
+                                quality[global_dest][global_src] = quality_at(inter_batch_matrix, reverse_src_idx, reverse_dest_idx)
                     
                     logger.debug(f"✅ Table API успешна за batch {i}-{j}")
                     
@@ -1267,23 +1340,18 @@ class OSRMClient:
                             src_loc = locations[src_idx]
                             dest_loc = locations[dest_idx]
                             
-                            try:
-                                forward_result = self._single_route_request(src_loc, dest_loc)
-                                reverse_result = self._single_route_request(dest_loc, src_loc)
-                                full_distances[src_idx][dest_idx] = forward_result['distance']
-                                full_distances[dest_idx][src_idx] = reverse_result['distance']
-                                full_durations[src_idx][dest_idx] = forward_result['duration']
-                                full_durations[dest_idx][src_idx] = reverse_result['duration']
-                                continue
-                            except Exception:
-                                approx_distance = self._haversine_distance(src_loc, dest_loc) * 1.3
-                                approx_duration = (approx_distance / 1000) / self.config.average_speed_kmh * 3600
-                            
-                            # Last-resort approximation has no directionality.
-                            full_distances[src_idx][dest_idx] = approx_distance
-                            full_distances[dest_idx][src_idx] = approx_distance
-                            full_durations[src_idx][dest_idx] = approx_duration
-                            full_durations[dest_idx][src_idx] = approx_duration
+                            # Keep a successful direction even if the reverse fails.
+                            for source, target in ((src_idx, dest_idx), (dest_idx, src_idx)):
+                                try:
+                                    result = self._single_route_request(locations[source], locations[target])
+                                    distance, duration, code = result['distance'], result['duration'], OSRM
+                                except Exception as exc:
+                                    distance, duration, code = self._approximate_values(
+                                        locations[source], locations[target], error_reason(exc))
+                                full_distances[source][target] = distance
+                                full_durations[source][target] = duration
+                                if quality is not None:
+                                    quality[source][target] = code
 
 
 def create_osrm_client() -> OSRMClient:

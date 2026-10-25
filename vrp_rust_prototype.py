@@ -7,6 +7,7 @@ tools continue to work.  The application-facing import is :mod:`vrp_solver`.
 from __future__ import annotations
 
 import logging
+from service_time import customer_service_seconds
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,8 @@ from osrm_client import DistanceMatrix
 from vroom_solver import VROOMSolver, VROOMSolverError
 from vrp_runtime import run_vrp_problem, vrp_max_generations, vrp_thread_count
 
+
+from vehicle_schedules import route_schedule_fields
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +261,10 @@ class VRPRustPrototype(VROOMSolver):
                 },
             }
             if bool(getattr(self.config, "enable_multiple_trips", False)):
+                if getattr(vehicle_config, '_max_trips', None) is not None:
+                    raise VRPRustPrototypeError(
+                        'VRP-Rust не поддържа индивидуален максимум курсове. Избери PyVRP или OR-Tools.'
+                    )
                 shift["reloads"] = [
                     {
                         "location": {"index": reload_index},
@@ -382,17 +389,9 @@ class VRPRustPrototype(VROOMSolver):
         size = len(matrix_coords)
         travel_times: List[int] = []
         objective_distances: List[int] = []
-        default_service_seconds = self._canonical_service_seconds(
-            getattr(vehicle_config, "service_time_minutes", 0) or 0
-        )
-
         service_by_source = [0 for _ in range(size)]
         for customer_index, customer in enumerate(self.customers):
-            override = getattr(customer, "service_time_minutes", None)
-            if override is None or (isinstance(override, str) and not override.strip()):
-                service_seconds = default_service_seconds
-            else:
-                service_seconds = self._canonical_service_seconds(override)
+            service_seconds = self._ceil_nonnegative_seconds(customer_service_seconds(customer, vehicle_config), "service duration")
             service_by_source[len(self.unique_depots) + customer_index] = service_seconds
 
         for from_index in range(size):
@@ -496,6 +495,7 @@ class VRPRustPrototype(VROOMSolver):
                         ),
                         is_feasible=True,
                         schedule_entries=schedule_entries,
+                        **route_schedule_fields(info.config, trip_index),
                         vehicle_key=info.vehicle_key,
                         trip_number=trip_index,
                         trip_count=trip_count,

@@ -1,7 +1,7 @@
 """Build the isolated PyVRP 0.14 worker sidecar with PyInstaller.
 
 Run this script with ``.venv-pyvrp-next``.  It refuses every PyVRP version
-outside 0.14.*, writes only build artifacts and ``dist/pyvrp-next``, and never
+other than stable 0.14.0, writes only build artifacts and ``dist/pyvrp-next``, and never
 copies or modifies the application's runtime ``config.py``.
 """
 
@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from pyvrp_next_version import PYVRP_NEXT_VERSION
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -27,7 +28,6 @@ SPEC_DIR = BUILD_DIR / "spec"
 WORKER_SCRIPT = PROJECT_DIR / "pyvrp_next_worker.py"
 WORKER_NAME = "CVRP_PyVRP_Next_Worker"
 WORKER_PACKAGE_DIR = DIST_DIR / WORKER_NAME
-REQUIRED_VERSION_PREFIX = "0.14"
 
 
 def _require_experimental_environment() -> str:
@@ -39,9 +39,9 @@ def _require_experimental_environment() -> str:
             ".venv-pyvrp-next\\Scripts\\python.exe."
         ) from exc
 
-    if not version.startswith(REQUIRED_VERSION_PREFIX):
+    if version != PYVRP_NEXT_VERSION:
         raise SystemExit(
-            f"Refusing to build with PyVRP {version}. This sidecar requires 0.14.*. "
+            f"Refusing to build with PyVRP {version}. This sidecar requires stable {PYVRP_NEXT_VERSION}. "
             "Run it with .venv-pyvrp-next\\Scripts\\python.exe."
         )
     if importlib.util.find_spec("PyInstaller") is None:
@@ -88,6 +88,9 @@ def _build_command() -> list[str]:
 
     for module in (
         "pyvrp_solver",
+        "service_time",
+        "customer_deferral",
+        "pyvrp_deferral_search",
         "pyvrp.stop",
         "pyvrp.stop.MaxRuntime",
         "ortools.constraint_solver.pywrapcp",
@@ -131,7 +134,7 @@ def _verify_executable(executable: Path, expected_version: str) -> None:
         or metadata.get("protocol_version") != 1
         or metadata.get("solver_backend") != "pyvrp_next"
         or metadata.get("solver_version") != expected_version
-        or not expected_version.startswith(REQUIRED_VERSION_PREFIX)
+        or expected_version != PYVRP_NEXT_VERSION
     ):
         executable.unlink(missing_ok=True)
         raise SystemExit(f"Frozen worker returned invalid self-check data: {metadata!r}")

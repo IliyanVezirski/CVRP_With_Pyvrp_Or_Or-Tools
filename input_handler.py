@@ -6,6 +6,7 @@
 import pandas as pd
 import re
 import os
+import sys
 import json
 import urllib.request
 import urllib.error
@@ -20,6 +21,65 @@ import importlib
 import config
 
 logger = logging.getLogger(__name__)
+
+
+def _gps_value_is_empty(value) -> bool:
+    """Only absent/blank values count as missing, not malformed coordinates."""
+    if value is None or value is pd.NA or value is pd.NaT:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return isinstance(value, float) and math.isnan(value)
+
+
+def customer_has_missing_gps(customer) -> bool:
+    return (
+        getattr(customer, "coordinates", None) is None
+        and _gps_value_is_empty(getattr(customer, "original_gps_data", "<unknown>"))
+    )
+
+
+def _gps_input_text(value) -> str:
+    return "" if _gps_value_is_empty(value) else str(value).strip()
+
+
+def normalise_excluded_customer_ids(value) -> str:
+    """Exact business IDs: retain leading zeroes and never interpret as numbers."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Клиентските номера трябва да са текст, разделен с нов ред или запетая.")
+    return "\n".join(dict.fromkeys(part for part in re.split(r"[\s,;]+", value.strip()) if part))
+
+
+def mark_excluded_customers(customers, input_config):
+    excluded = set(normalise_excluded_customer_ids(
+        getattr(input_config, "excluded_customer_ids", "")
+    ).splitlines())
+    for customer in customers:
+        customer.manually_excluded = str(customer.id).strip() in excluded
+
+
+def shared_customer_exclusions(config):
+    """Read the common list, retaining old profile entries until explicit save."""
+    legacy = {}
+    try:
+        stored = json.loads(getattr(getattr(config, "api", None), "web_gui_run_defaults_json", "") or "{}")
+        if isinstance(stored, dict) and stored.get("version") == 2:
+            legacy = stored.get("settings", {}) or {}
+    except (TypeError, ValueError):
+        pass
+    if not isinstance(legacy, dict):
+        legacy = {}
+    old_input = legacy.get("input") if isinstance(legacy.get("input"), dict) else {}
+    old_send = legacy.get("set_data") if isinstance(legacy.get("set_data"), dict) else {}
+    ids = normalise_excluded_customer_ids(getattr(getattr(config, "input", None), "excluded_customer_ids", ""))
+    old_ids = normalise_excluded_customer_ids(old_input.get("excluded_customer_ids", ""))
+    direction = str(getattr(getattr(config, "set_data", None), "set_data_excluded_id_grafik", "") or "").strip()
+    old_direction = str(old_send.get("set_data_excluded_id_grafik", "") or "").strip()
+    return {"customer_ids": normalise_excluded_customer_ids(ids + "\n" + old_ids),
+            "direction": direction or old_direction,
+            "direction_conflict": bool(direction and old_direction and direction != old_direction)}
 
 
 class MandatoryCustomerError(ValueError):
@@ -48,6 +108,7 @@ class Customer:
     grouped_documents: List[Dict[str, object]] = field(default_factory=list)
     service_time_minutes: Optional[float] = None
     mandatory: bool = False
+    manually_excluded: bool = False
 
 
 TIME_WINDOW_FIELD_ALIASES = (
@@ -668,10 +729,13 @@ class InputHandler:
     
     def __init__(self, main_config=None):
         if main_config is None:
-            importlib.reload(config)
+            if not getattr(sys, "frozen", False):
+                importlib.reload(config)
             main_config = config.get_config()
         self.main_config = main_config
-        self.config = main_config.input
+        from copy import copy
+        self.config = copy(main_config.input)
+        self.config.excluded_customer_ids = shared_customer_exclusions(main_config)["customer_ids"]
     
     def load_data(self, file_path: Optional[str] = None) -> InputData:
         """Зарежда данни от файл или HTTP JSON"""
@@ -719,10 +783,11 @@ class InputHandler:
             
             # Обработка на данните
             customers = self._process_dataframe(df)
+            mark_excluded_customers(customers, self.config)
             self._validate_mandatory_coordinates(customers)
             
-            # Филтриране на валидни клиенти
-            valid_customers = [c for c in customers if c.coordinates is not None]
+            # Запазваме и липсващия GPS за направлението на необслужените.
+            valid_customers = [c for c in customers if c.coordinates is not None or customer_has_missing_gps(c) or c.manually_excluded]
             
             # Получаване на депо координати
             depot_location = self.main_config.locations.depot_location
@@ -744,8 +809,9 @@ class InputHandler:
         records = self._extract_json_records(payload)
         logger.info(f"Получени {len(records)} JSON записа от POST payload")
         customers = self._process_json_records(records)
+        mark_excluded_customers(customers, self.config)
         self._validate_mandatory_coordinates(customers)
-        valid_customers = [c for c in customers if c.coordinates is not None]
+        valid_customers = [c for c in customers if c.coordinates is not None or customer_has_missing_gps(c) or c.manually_excluded]
         depot_location = self.main_config.locations.depot_location
 
         return InputData(
@@ -837,8 +903,9 @@ class InputHandler:
             
             # Конвертиране в Customer обекти
             customers = self._process_json_records(data)
+            mark_excluded_customers(customers, self.config)
             self._validate_mandatory_coordinates(customers)
-            valid_customers = [c for c in customers if c.coordinates is not None]
+            valid_customers = [c for c in customers if c.coordinates is not None or customer_has_missing_gps(c) or c.manually_excluded]
             
             depot_location = self.main_config.locations.depot_location
             
@@ -945,7 +1012,7 @@ class InputHandler:
                     record_context,
                 )
 
-                gps_data = str(record.get(gps_field, "")).strip()
+                gps_data = _gps_input_text(record.get(gps_field))
                 client_name = str(record.get(name_field, "")).strip()
                 volume = _parse_volume_value(
                     record.get(vol_field, 0),
@@ -1032,7 +1099,7 @@ class InputHandler:
                 client_id = str(row[self.config.client_id_column]).strip()
                 record_context = f" (Excel ред {index}, клиент {client_id})"
                 client_name = str(row[self.config.client_name_column]).strip()
-                gps_data = str(row[self.config.gps_column]).strip()
+                gps_data = _gps_input_text(row.get(self.config.gps_column))
                 volume = _parse_volume_value(
                     row[self.config.volume_column],
                     record_context,
@@ -1267,6 +1334,8 @@ class InputHandler:
             customer
             for customer in customers
             if is_mandatory_customer(customer) and not customer.coordinates
+            and not customer_has_missing_gps(customer)
+            and not getattr(customer, "manually_excluded", False)
         ]
         if not missing:
             return

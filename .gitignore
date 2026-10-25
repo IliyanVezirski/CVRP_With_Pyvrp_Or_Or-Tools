@@ -88,3 +88,7 @@ data/*.xls
 
 # Windows
 desktop.ini
+
+# Local configuration snapshots may contain deployment credentials.
+config_backups/
+.venv-pyvrp-one/

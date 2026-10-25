@@ -255,6 +255,8 @@ class CVRPConfig:
             result = api._save_web_run_defaults(payload)
 
         stored = json.loads(fake_manager.config.api.web_gui_run_defaults_json)
+        self.assertEqual(2, stored["version"])
+        stored = stored["settings"]
         self.assertEqual(stored["output"]["enable_excel_output"], not original_output)
         self.assertEqual(base.output.enable_excel_output, original_output)
         self.assertEqual(result["scope"], "web_gui_runs_only")
@@ -271,15 +273,16 @@ class CVRPConfig:
         cfg = get_config()
         page = api._web_gui_html(cfg.api, "127.0.0.1", 8084)
         self.assertIn('id="runSettingsSection"', page)
-        self.assertIn("Стартирай без запис", page)
-        self.assertIn("Запази глобално в config.py", page)
-        self.assertIn("Запази само бусовете глобално", page)
+        self.assertIn("Стартирай тест", page)
+        self.assertIn("Запази основните настройки", page)
+        self.assertIn("Запази бусовете", page)
         self.assertNotIn("Запази като Web defaults", page)
         self.assertIn("cvrp:collectCvrpSettings()", page)
-        self.assertIn("const runSettings = collectRunSettings()", page)
+        self.assertIn("await submitPlan(useGlobal)", page)
+        self.assertNotIn("planConfirmation", page)
         self.assertIn('id="setDataUnservedFinalEnabled"', page)
         self.assertIn('id="setDataUnservedFinalDoneFlag"', page)
-        self.assertIn("run_settings:runSettings", page)
+        self.assertIn("run_settings:collectRunSettings()", page)
         self.assertIn(
             "stringList(cvrp.parallel_first_solution_strategies).join",
             page,
@@ -319,7 +322,7 @@ class CVRPConfig:
         self.assertNotIn("web_gui_run_defaults_json", api._WEB_GUI_API_FIELDS)
         self.assertIn("web_gui_run_defaults_json", api._WEB_GUI_PERSIST_API_FIELDS)
 
-    def test_clearing_saved_upload_token_falls_back_to_global_token(self):
+    def test_clearing_web_upload_token_does_not_restore_global_secret(self):
         base = deepcopy(get_config())
         base.api.web_gui_run_defaults_json = json.dumps({
             "output": {"route_maps_upload_token": "saved-secret"}
@@ -336,7 +339,7 @@ class CVRPConfig:
             })
 
         stored = json.loads(fake_manager.config.api.web_gui_run_defaults_json)
-        self.assertNotIn("route_maps_upload_token", stored["output"])
+        self.assertEqual("", stored["settings"]["output"]["route_maps_upload_token"])
 
     def test_session_cookie_uses_wall_clock_expiry_and_worker_path_is_absolute(self):
         api_config = deepcopy(get_config().api)

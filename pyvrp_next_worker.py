@@ -1,7 +1,7 @@
 """Worker entry point for the process-isolated PyVRP 0.14 runtime.
 
 This process must be started by a Python environment (or PyInstaller sidecar)
-that contains PyVRP 0.14.*.  It intentionally does not read ``config.py`` to
+that contains the pinned stable PyVRP 0.14.0. It intentionally does not read ``config.py`` to
 choose a solver: every solve input is provided by the parent in the trusted
 local request envelope.
 """
@@ -26,13 +26,20 @@ from pyvrp_next_runtime import (
     HARD_MANDATORY_CUSTOMERS_CAPABILITY,
     validate_mandatory_customer_solution,
 )
+from customer_deferral import GEOGRAPHIC_CAPABILITY
+from service_time import SERVICE_FORMULA_CAPABILITY
+from pyvrp_next_version import PYVRP_NEXT_VERSION
+from pyvrp_backends import STABLE
 
 
 PROTOCOL_VERSION = 1
 WORKER_PROTOCOL_BACKEND = "pyvrp_next"
 REQUIRED_PYVRP_VERSION_PREFIX = "0.14"
 WORKER_CAPABILITIES = {
+    'physical_bus_schedules_v1': True,
+    SERVICE_FORMULA_CAPABILITY: True,
     HARD_MANDATORY_CUSTOMERS_CAPABILITY: True,
+    GEOGRAPHIC_CAPABILITY: True,
 }
 
 
@@ -77,7 +84,7 @@ def _configure_stdio() -> None:
             pass
 
 
-def _pyvrp_version() -> str:
+def _pyvrp_version(backend=STABLE) -> str:
     try:
         version = importlib.metadata.version("pyvrp")
     except importlib.metadata.PackageNotFoundError as exc:
@@ -88,27 +95,39 @@ def _pyvrp_version() -> str:
     except Exception as exc:
         raise WorkerValidationError(f"PyVRP cannot be imported: {exc}") from exc
 
-    if not version.startswith(REQUIRED_PYVRP_VERSION_PREFIX):
+    if version != backend.version:
         raise WorkerValidationError(
-            f"This worker requires PyVRP 0.14.*, but found {version}"
+            f"This worker requires pinned PyVRP {backend.version}, but found {version}. "
+            "Run setup_pyvrp_next.py and rebuild the worker."
         )
+    if backend.source_commit:
+        provenance = importlib.metadata.distribution("pyvrp").read_text("direct_url.json")
+        commit = json.loads(provenance or "{}").get("vcs_info", {}).get("commit_id")
+        if commit != backend.source_commit:
+            raise WorkerValidationError("PyVRP 1.x source provenance does not match the pinned commit")
     return version
 
 
-def _metadata(version: str) -> Dict[str, Any]:
+def _metadata(version: str, backend=STABLE) -> Dict[str, Any]:
     return {
         "protocol_version": PROTOCOL_VERSION,
-        "solver_backend": WORKER_PROTOCOL_BACKEND,
+        "solver_backend": backend.protocol,
+        "source_commit": backend.source_commit,
         "solver_version": version,
         "capabilities": dict(WORKER_CAPABILITIES),
     }
 
 
-def self_check() -> int:
+def self_check(backend=STABLE) -> int:
     try:
-        version = _pyvrp_version()
+        version = _pyvrp_version(backend)
+        # Advertise the capability only after its module/native imports work.
+        importlib.import_module("pyvrp_deferral_search")
+        adapter = importlib.import_module("pyvrp_solver")
+        if not adapter.PYVRP_AVAILABLE or adapter.PYVRP_VERSION != version:
+            raise WorkerValidationError("PyVRP solver adapter is not compatible with this runtime")
         payload = {
-            **_metadata(version),
+            **_metadata(version, backend),
             "kind": "self_check",
             "ok": True,
             "python_version": sys.version.split()[0],
@@ -118,7 +137,7 @@ def self_check() -> int:
         return 0
     except Exception as exc:
         payload = {
-            **_metadata(""),
+            **_metadata("", backend),
             "kind": "self_check",
             "ok": False,
             "error": str(exc),
@@ -143,7 +162,7 @@ def _atomic_pickle_dump(path: Path, value: Any) -> None:
             pass
 
 
-def _read_request(path: Path) -> Dict[str, Any]:
+def _read_request(path: Path, backend=STABLE) -> Dict[str, Any]:
     try:
         with path.open("rb") as file_handle:
             request = pickle.load(file_handle)
@@ -161,14 +180,18 @@ def _read_request(path: Path) -> Dict[str, Any]:
         raise WorkerValidationError(
             f"Unexpected worker request kind: {request.get('kind')!r}"
         )
-    if request.get("solver_backend") != WORKER_PROTOCOL_BACKEND:
+    if request.get("solver_backend") != backend.protocol:
         raise WorkerValidationError(
             f"Unexpected worker request backend: {request.get('solver_backend')!r}"
         )
-    if request.get("required_version_prefix") != REQUIRED_PYVRP_VERSION_PREFIX:
+    if request.get("required_version_prefix") != backend.prefix:
         raise WorkerValidationError(
             "Parent and worker disagree about the required PyVRP version prefix"
         )
+    if request.get("required_version", backend.version) != backend.version:
+        raise WorkerValidationError("Parent and worker disagree about the pinned PyVRP release")
+    if backend.source_commit and request.get("source_commit") != backend.source_commit:
+        raise WorkerValidationError("Parent and worker disagree about the PyVRP source commit")
 
     required_capabilities = request.get("required_capabilities")
     if not isinstance(required_capabilities, (list, tuple, set)):
@@ -231,12 +254,14 @@ def _configure_worker_logging() -> None:
     pyvrp_logger.setLevel(logging.INFO)
 
 
-def run_worker(input_path: str, output_path: str) -> int:
+def run_worker(input_path: str, output_path: str, backend=STABLE) -> int:
     output = Path(output_path).resolve()
     version = ""
     try:
-        version = _pyvrp_version()
-        payload = _read_request(Path(input_path).resolve())
+        version = _pyvrp_version(backend)
+        payload = _read_request(Path(input_path).resolve(), backend)
+        if backend.source_commit and getattr(payload["config"], "solver_type", "") != backend.public:
+            raise WorkerValidationError("Payload solver does not match the selected worker")
 
         # Import only after the runtime and request have passed strict checks.
         # The adapter may provide conditional compatibility for PyVRP 0.14,
@@ -258,7 +283,7 @@ def run_worker(input_path: str, output_path: str) -> int:
             context="experimental PyVRP worker result validation",
         )
         envelope = {
-            **_metadata(version),
+            **_metadata(version, backend),
             "kind": "solve_result",
             "ok": True,
             "solution": solution,
@@ -268,7 +293,7 @@ def run_worker(input_path: str, output_path: str) -> int:
         return 0
     except Exception as exc:
         envelope = {
-            **_metadata(version),
+            **_metadata(version, backend),
             "kind": "solve_result",
             "ok": False,
             "error": str(exc),
@@ -298,15 +323,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, backend=STABLE) -> int:
     _configure_stdio()
     args = _build_parser().parse_args(argv)
     if args.self_check:
-        return self_check()
+        return self_check(backend)
     if not args.input_pickle or not args.output_pickle:
         print("input_pickle and output_pickle are required", file=sys.stderr)
         return 2
-    return run_worker(args.input_pickle, args.output_pickle)
+    return run_worker(args.input_pickle, args.output_pickle, backend)
 
 
 if __name__ == "__main__":

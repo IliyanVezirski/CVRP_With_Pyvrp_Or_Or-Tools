@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from pyvrp_next_version import PYVRP_NEXT_VERSION
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -37,7 +38,6 @@ PYVRP_NEXT_WORKER = (
     / "pyvrp-next"
     / "CVRP_PyVRP_Next_Worker.exe"
 )
-PYVRP_NEXT_VERSION_PREFIX = "0.14"
 VROOM_PYTHON = PROJECT_DIR / ".venv-vroom" / "Scripts" / "python.exe"
 VROOM_BUILD_SCRIPT = PROJECT_DIR / "build_vroom_worker.py"
 VROOM_WORKER = (
@@ -233,10 +233,13 @@ explicit_hiddenimports = [
     "tsp_daily_report",
     "input_handler",
     "warehouse_manager",
+    "service_time",
+    "vehicle_schedules",
     "cvrp_solver",
     "pyvrp_solver",
     "output_handler",
     "osrm_client",
+    "routing_quality",
     "valhalla_client",
     "run_main",
     "pyvrp_next_runtime",
@@ -465,7 +468,7 @@ def verify_pyvrp_next_worker() -> str:
         or metadata.get("kind") != "self_check"
         or metadata.get("protocol_version") != 1
         or metadata.get("solver_backend") != "pyvrp_next"
-        or not version.startswith(PYVRP_NEXT_VERSION_PREFIX)
+        or version != PYVRP_NEXT_VERSION
     ):
         raise RuntimeError(f"Invalid experimental worker self-check: {metadata!r}")
     return version

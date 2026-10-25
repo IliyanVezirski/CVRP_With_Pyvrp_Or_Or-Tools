@@ -83,9 +83,14 @@ class MandatoryInputTests(unittest.TestCase):
 
         self.assertEqual(["valid-optional"], [customer.id for customer in data.customers])
 
-    def test_mandatory_customer_without_gps_fails_before_solver(self):
+    def test_mandatory_customer_without_gps_is_kept_for_unserved(self):
+        data = self.handler.load_data_from_json_records([self.record("no-gps", GPS="", Mandatory=True)])
+        self.assertEqual(["no-gps"], [c.id for c in data.customers])
+        self.assertIsNone(data.customers[0].coordinates)
+
+    def test_mandatory_customer_with_malformed_gps_still_fails_before_solver(self):
         with self.assertRaisesRegex(ValueError, "няма валидни GPS"):
-            self.handler.load_data_from_json_records([self.record("no-gps", GPS="", Mandatory=True)])
+            self.handler.load_data_from_json_records([self.record("bad-gps", GPS="invalid", Mandatory=True)])
 
     def test_excel_column_marks_mandatory_customer(self):
         dataframe = pd.DataFrame(

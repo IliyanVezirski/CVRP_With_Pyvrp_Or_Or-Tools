@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from config import LocationConfig
@@ -91,6 +91,70 @@ class PyVRPNextActivityAdapterTests(unittest.TestCase):
         )
         solver._pyvrp_depot_coords = list(depots)
         return solver
+
+    def logging_case(self):
+        customers = make_customers(2, volume=1)
+        solver = self.make_solver(customers, [DEPOT, (42.1, 23.1)])
+        solver._pyvrp_client_to_customer_idx = [0, 1]
+        native_route = FakeRoute([
+            FakeActivity("depot", 0, 0), FakeActivity("client", 0, 0),
+            FakeActivity("client", 1, 0), FakeActivity("depot", 0, 1),
+        ])
+        vehicle_type = SimpleNamespace(num_available=1, start_depot=0, end_depot=0, name="internal_bus")
+        data = FakeProblemData(vehicle_type)
+        model = SimpleNamespace(depots=[object(), object()], clients=[object(), object()],
+                                vehicle_types=[vehicle_type], data=lambda: data)
+        result = FakeResult([native_route])
+        result.best.is_feasible = lambda: True
+        result.best.num_clients = lambda: 2
+        return solver, model, data, result
+
+    def test_candidate_extraction_is_quiet_and_identical_to_final_extraction(self):
+        solver, model, data, native = self.logging_case()
+        with patch("pyvrp_solver.PYVRP_LOCATION_API", True):
+            with self.assertNoLogs("pyvrp_solver", level="INFO"):
+                candidate = solver._extract_solution(model, data, native, log_summary=False)
+            with self.assertLogs("pyvrp_solver", level="INFO") as captured:
+                final = solver._extract_solution(model, data, native)
+        self.assertEqual(candidate, final)
+        self.assertEqual(sum(record.getMessage() == "Reshenie obraboteno:" for record in captured.records), 1)
+        self.assertTrue(any("Propushcheni klienti" in record.getMessage() for record in captured.records))
+
+    def test_quiet_candidate_extraction_does_not_suppress_warnings(self):
+        solver, model, data, _ = self.logging_case()
+        with self.assertLogs("pyvrp_solver", level="WARNING") as captured:
+            solver._extract_solution(model, data, FakeResult([]), log_summary=False)
+        self.assertTrue(any("praznoto reshenie" in record.getMessage() for record in captured.records))
+
+    def test_geographic_audits_emit_only_one_final_summary(self):
+        solver, model, data, native = self.logging_case()
+        solver.config.solver_type = "pyvrp_experimental"
+        solver.config.customer_dropping_strategy = "geographic"
+        audits = []
+
+        def simulate_search(*args, audit, **kwargs):
+            # Execute the real callback and real extraction; never run a solver.
+            audits.extend([audit(native.best), audit(native.best)])
+            return native, {}
+
+        search_module = ModuleType("pyvrp_deferral_search")
+        search_module.solve_geographic = simulate_search
+        with patch.dict("sys.modules", {"pyvrp_deferral_search": search_module}), \
+             patch("pyvrp_solver.PYVRP_LOCATION_API", True), \
+             patch("pyvrp_solver.PYVRP_AVAILABLE", True), \
+             patch("pyvrp_solver.PYVRP_VERSION", "0.14.0"), \
+             patch.object(solver, "_exact_ortools_fallback_reason", return_value=None), \
+             patch.object(solver, "_create_pyvrp_model", return_value=model), \
+             patch.object(solver, "_create_solve_params", return_value=None), \
+             self.assertLogs("pyvrp_solver", level="INFO") as captured:
+            solution = solver.solve()
+        self.assertEqual(audits, [True, True])
+        self.assertTrue(solution.is_feasible)
+        self.assertEqual(solution.deferral_selection_score, native.cost())
+        messages = [record.getMessage() for record in captured.records]
+        self.assertEqual(messages.count("Reshenie obraboteno:"), 1)
+        self.assertEqual(sum("Geographic result:" in msg for msg in messages), 1)
+        self.assertTrue(any("Solving with PyVRP" in msg for msg in messages))
 
     def test_scheduled_activities_split_reload_courses_at_depots(self):
         reload_location = (42.1, 23.1)

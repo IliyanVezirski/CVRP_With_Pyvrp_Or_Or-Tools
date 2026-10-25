@@ -20,7 +20,9 @@ import time
 from types import SimpleNamespace
 
 mode = os.environ.get("FAKE_PYVRP_NEXT_MODE", "success")
-version = "0.13.4" if mode == "self_check_version_mismatch" else "0.14.0a0"
+version = "0.13.4" if mode == "self_check_version_mismatch" else "0.14.0"
+if mode == "alpha_version":
+    version = "0.14.0a0"
 metadata = {
     "protocol_version": 1,
     "solver_backend": "pyvrp_next",
@@ -148,8 +150,17 @@ class PyVRPNextRuntimeTests(unittest.TestCase):
         self.assertEqual((42.0, 23.0), result.received_depot)
         self.assertEqual("pyvrp_experimental", result.solver_backend)
         self.assertEqual("pyvrp_experimental", result.solver_actual_backend)
-        self.assertEqual("0.14.0a0", result.solver_version)
+        self.assertEqual("0.14.0", result.solver_version)
         self.assertFalse(result.solver_fallback_used)
+
+    def test_geographic_mode_rejects_old_worker_without_silent_fallback(self):
+        config = make_config(str(self.worker), customer_dropping_strategy="geographic",
+                             pyvrp_next_fallback_to_stable=True)
+        with patch.dict(os.environ, {"FAKE_PYVRP_NEXT_MODE": "success"}), \
+             patch.object(runtime, "_solve_with_stable_fallback") as fallback:
+            with self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, "geographic_deferral"):
+                solve(config)
+            fallback.assert_not_called()
 
     def test_worker_progress_is_forwarded_to_parent_logger(self):
         config = make_config(str(self.worker))
@@ -225,9 +236,14 @@ assert raw.getvalue().decode("utf-8").strip() == "Ред на депата"
 
         with (
             patch.dict(os.environ, {"FAKE_PYVRP_NEXT_MODE": "self_check_version_mismatch"}),
-            self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, r"must use PyVRP 0\.14"),
+            self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, r"must use pinned PyVRP 0\.14\.0"),
         ):
             solve(config)
+
+    def test_solve_result_rejects_alpha_worker(self):
+        with patch.dict(os.environ, {"FAKE_PYVRP_NEXT_MODE": "alpha_version"}):
+            with self.assertRaisesRegex(runtime.PyVRPNextRuntimeError, "rebuild the worker"):
+                solve(make_config(str(self.worker)))
 
     def test_solve_result_rejects_worker_without_hard_mandatory_capability(self):
         config = make_config(str(self.worker))

@@ -122,6 +122,7 @@ class MultiTripConfigSurfaceTests(unittest.TestCase):
                 "include_vehicles": False,
                 "include_output": True,
                 "include_set_data": True,
+                "include_input": False,
             },
             persist.call_args.kwargs,
         )
@@ -259,7 +260,7 @@ class MultiTripConfigSurfaceTests(unittest.TestCase):
         page = api._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
         self.assertIn('id="multiTripEnabled"', page)
         self.assertIn("Разреши повторни курсове", page)
-        self.assertIn("Запази само бусовете глобално", page)
+        self.assertIn("Запази бусовете", page)
         self.assertIn('class="vehicle-card-header"', page)
         self.assertIn('class="vehicle-number"', page)
         self.assertIn("renumberVehicleCards", page)
@@ -281,10 +282,10 @@ class MultiTripConfigSurfaceTests(unittest.TestCase):
         cfg = config.get_config()
         page = api._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
 
-        self.assertIn('<section class="vehicles-section">', page)
+        self.assertIn('<section class="vehicles-section" id="fleetSection">', page)
         self.assertNotIn('<details class="vehicles-section"', page)
-        self.assertEqual(3, page.count('class="settings-card settings-accordion'))
-        for panel_name in ("solver", "output", "set-data"):
+        self.assertEqual(4, page.count('class="settings-card settings-accordion'))
+        for panel_name in ("input", "solver", "output", "set-data"):
             self.assertIn(f'data-settings-panel="{panel_name}">', page)
             self.assertNotIn(f'data-settings-panel="{panel_name}" open', page)
         self.assertIn('content:"Разпъни"', page)

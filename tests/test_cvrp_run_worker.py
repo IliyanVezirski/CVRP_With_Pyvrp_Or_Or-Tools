@@ -41,6 +41,7 @@ class CVRPRunWorkerTests(unittest.TestCase):
 
             fake_server_module = types.ModuleType("cvrp_api_server")
             fake_server_module._build_web_run_config_override = build_override
+            fake_server_module._prepare_web_run_dates = lambda cfg: None
 
             with (
                 patch.dict(sys.modules, {"cvrp_api_server": fake_server_module}),
@@ -129,6 +130,7 @@ class CVRPRunWorkerTests(unittest.TestCase):
                 raise ValueError("Unsupported web run setting: output.unknown")
 
             fake_server_module._build_web_run_config_override = reject
+            fake_server_module._prepare_web_run_dates = lambda cfg: None
 
             with (
                 patch.dict(sys.modules, {"cvrp_api_server": fake_server_module}),

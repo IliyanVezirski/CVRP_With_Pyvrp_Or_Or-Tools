@@ -377,5 +377,85 @@ class VehicleMapGroupingTests(unittest.TestCase):
         self.assertIn("1 клиент(а) без GPS", rendered)
         self.assertIn("Няма клиенти с валидни GPS координати", rendered)
 
+class UnservedOverviewTests(unittest.TestCase):
+    def setUp(self):
+        self.customer = VehicleMapGroupingTests._customer
+        self.generator = VehicleMapGroupingTests._map_generator
+        self.config = VehicleMapGroupingTests._config_without_zones()
+        self.served = self.customer("S", "Served", 42.71, "")
+        self.dropped = self.customer("D", "Dropped <shop>", 42.72, "<b>note</b>")
+        self.warehouse = self.customer("W", "Warehouse", 42.73, "")
+        self.missing = Customer("M", "No GPS", None, 1, "")
+        self.route = VehicleMapGroupingTests._route(1, "A", [self.served])
+        self.solution = SimpleNamespace(routes=[self.route], dropped_customers=[self.dropped, self.served])
+        self.allocation = SimpleNamespace(warehouse_customers=[self.warehouse, self.dropped, self.missing])
+
+    def test_union_deduplicates_excludes_served_and_reports_missing_gps(self):
+        with patch("output_handler.get_config", return_value=self.config):
+            data = self.generator("osm")._unserved_map_data(self.solution, self.allocation)
+        self.assertEqual(data["total"], 3)
+        self.assertEqual(data["missingCoordinates"], 1)
+        self.assertEqual({p["customerId"] for p in data["markers"]}, {"D", "W"})
+        popup = next(p["popup"] for p in data["markers"] if p["customerId"] == "D")
+        self.assertIn("Dropped &lt;shop&gt;", popup)
+        self.assertIn("&lt;b&gt;note&lt;/b&gt;", popup)
+        self.assertNotIn("<b>note</b>", popup)
+
+    def test_folium_overview_has_hidden_layer_and_toggle(self):
+        with patch("output_handler.get_config", return_value=self.config):
+            overview = self.generator("osm").create_map(self.solution, self.allocation, (42.7, 23.3))
+        layers = [c for c in overview._children.values() if getattr(c, "layer_name", None) == "Необслужени клиенти"]
+        self.assertEqual(len(layers), 1)
+        self.assertFalse(layers[0].show)
+        self.assertFalse(layers[0].control)
+        self.assertEqual(len(layers[0]._children), 2)
+        rendered = overview.get_root().render()
+        self.assertIn('button.setAttribute("aria-pressed", "false")', rendered)
+        self.assertIn("Покажи необслужените", rendered)
+        self.assertIn("map.removeLayer(layer)", rendered)
+        self.assertIn("const missing = 1", rendered)
+        # The layer is only added in the click callback, not during map load.
+        self.assertNotIn(layers[0].get_name() + ".addTo(", rendered)
+
+    def test_unserved_order_at_served_customer_is_not_hidden(self):
+        self.served.document = "served-order"
+        same_customer = self.customer("S", "Served customer, pending order", 42.71, "")
+        same_customer.document = "pending-order"
+        self.solution.dropped_customers = [same_customer]
+        self.allocation.warehouse_customers = []
+        with patch("output_handler.get_config", return_value=self.config):
+            data = self.generator("osm")._unserved_map_data(self.solution, self.allocation)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["markers"][0]["customerId"], "S")
+        self.assertIn("pending-order", data["markers"][0]["popup"])
+
+    def test_google_overview_markers_start_hidden_and_individual_maps_exclude_data(self):
+        generator = self.generator("google")
+        with patch("output_handler.get_config", return_value=self.config):
+            overview = generator.create_map(self.solution, self.allocation, (42.7, 23.3)).html_content
+            individual = generator._build_google_html("Driver", (42.7, 23.3), [self.route], [(42.7, 23.3)], single_route_number=1).html_content
+        data = json.loads(re.search(r"const MAP_DATA = (.*);", overview).group(1))
+        self.assertEqual(data["unserved"]["total"], 3)
+        self.assertEqual(len(data["unserved"]["markers"]), 2)
+        self.assertIn("position: point.position, map: null", overview)
+        self.assertIn("markers.forEach(marker => marker.setMap(visible ? map : null))", overview)
+        individual_data = json.loads(re.search(r"const MAP_DATA = (.*);", individual).group(1))
+        self.assertIsNone(individual_data["unserved"])
+        self.assertNotIn("Dropped &lt;shop&gt;", individual)
+
+    def test_empty_and_invalid_coordinates_do_not_break_overview(self):
+        self.solution.dropped_customers = []
+        self.allocation.warehouse_customers = []
+        generator = self.generator("osm")
+        self.assertEqual(generator._unserved_map_data(self.solution, self.allocation),
+                         {"total": 0, "missingCoordinates": 0, "markers": []})
+        for coords in ((float("nan"), 23), (91, 23), (42,), (42, "bad")):
+            self.missing.coordinates = coords
+            self.allocation.warehouse_customers = [self.missing]
+            data = generator._unserved_map_data(self.solution, self.allocation)
+            self.assertEqual(data["missingCoordinates"], 1)
+            self.assertEqual(data["markers"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
