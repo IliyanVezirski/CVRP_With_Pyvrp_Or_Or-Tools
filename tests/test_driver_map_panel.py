@@ -90,6 +90,27 @@ class DriverMapPanelTests(unittest.TestCase):
                     self.assertIn('top:max(12px,env(safe-area-inset-top))', page)
                     self.assertNotIn('position:fixed; bottom:12px; left:12px', page)
 
+    def test_close_control_stays_in_sticky_header_for_every_map_panel(self):
+        css = _compact_map_controls_css()
+        for selector in ('.route-client-panel > .route-client-header',
+                         '.multi-course-panel > .multi-course-header',
+                         '#route-filter .client-panel > .client-panel-header'):
+            self.assertIn(selector, css)
+        self.assertIn('position:sticky; top:0; z-index:10; background:#fff', css)
+        self.assertIn('flex:0 0 44px', css)
+        self.assertIn('min-width:0; flex:1 1 auto; overflow-wrap:anywhere', css)
+        self.assertIn('focus.focus({preventScroll:true})', customer_panel_visibility_js())
+        self.assertIn("content.className='driver-panel-content'", customer_panel_visibility_js())
+        self.assertIn('if(node!==header)content.appendChild(node)', customer_panel_visibility_js())
+        self.assertIn('display:flex; flex-direction:column; overflow:hidden !important', css)
+        self.assertIn('flex:1 1 auto; min-height:0; min-width:0; overflow:auto', css)
+        for provider in ('osm', 'google'):
+            for multiple in (False, True):
+                with self.subTest(provider=provider, multiple=multiple):
+                    _, _, page, _ = self.create(provider, True, multiple)
+                    self.assertIn('position:sticky; top:0; z-index:10', page)
+                    self.assertIn("close.addEventListener('click',()=>setOpen(false))", page)
+
     def test_google_modes_share_settings_and_valid_javascript(self):
         for multiple in (False, True):
             _, _, page, _ = self.create("google", True, multiple)

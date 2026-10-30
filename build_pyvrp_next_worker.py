@@ -27,6 +27,7 @@ BUILD_DIR = BUILD_ROOT / "pyvrp-next"
 SPEC_DIR = BUILD_DIR / "spec"
 WORKER_SCRIPT = PROJECT_DIR / "pyvrp_next_worker.py"
 WORKER_NAME = "CVRP_PyVRP_Next_Worker"
+WORKER_BACKEND = "pyvrp_next"
 WORKER_PACKAGE_DIR = DIST_DIR / WORKER_NAME
 
 
@@ -88,6 +89,8 @@ def _build_command() -> list[str]:
 
     for module in (
         "pyvrp_solver",
+        "tsp_pyvrp",
+        "tsp_pyvrp_runtime",
         "service_time",
         "customer_deferral",
         "pyvrp_deferral_search",
@@ -132,7 +135,7 @@ def _verify_executable(executable: Path, expected_version: str) -> None:
         metadata.get("ok") is not True
         or metadata.get("kind") != "self_check"
         or metadata.get("protocol_version") != 1
-        or metadata.get("solver_backend") != "pyvrp_next"
+        or metadata.get("solver_backend") != WORKER_BACKEND
         or metadata.get("solver_version") != expected_version
         or expected_version != PYVRP_NEXT_VERSION
     ):

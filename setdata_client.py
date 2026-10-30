@@ -473,6 +473,10 @@ def upload_solution_set_data(solution: CVRPSolution, config: Any, warehouse_allo
     unserved_customers = list(getattr(solution, "dropped_customers", []) or [])
     if warehouse_allocation is not None:
         unserved_customers.extend(list(getattr(warehouse_allocation, "warehouse_customers", []) or []))
+    # This gate applies before both ordinary and missing-GPS paths, including
+    # makeGroup/final-flag payload generation. Reports still retain these orders.
+    if not getattr(set_data, "enable_excluded_set_data_upload", True):
+        unserved_customers = [c for c in unserved_customers if not getattr(c, "manually_excluded", False)]
     missing_gps_customers = [c for c in unserved_customers if customer_has_missing_gps(c)]
     unserved_customers = [c for c in unserved_customers if not customer_has_missing_gps(c)]
     missing_gps_rows = (

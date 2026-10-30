@@ -14,11 +14,17 @@ def customer_panel_visibility_js():
       toggle.setAttribute('aria-controls',panel.id);toggle.setAttribute('aria-expanded','false');
       const close=document.createElement('button');close.type='button';close.className='driver-panel-close';close.textContent='×';
       close.setAttribute('aria-label','Скрий клиентите');close.title='Скрий клиентите';
-      panel.querySelector('.route-client-header,.multi-course-header,.client-panel-header').append(close);
+      const header=panel.querySelector('.route-client-header,.multi-course-header,.client-panel-header');
+      header.append(close);
+      // Keep the close control outside the scrollable content, including on
+      // mobile WebViews where sticky headers inside fixed panels are unreliable.
+      const content=document.createElement('div');content.className='driver-panel-content';
+      Array.from(panel.childNodes).forEach(node=>{if(node!==header)content.appendChild(node);});
+      panel.appendChild(content);
       container.insertBefore(toggle,panel);panel.hidden=true;
       function setOpen(open) {
         panel.hidden=!open;toggle.hidden=open;toggle.setAttribute('aria-expanded',String(open));
-        const focus=open?close:toggle;if(focus.focus)focus.focus();
+        const focus=open?close:toggle;if(focus.focus)focus.focus({preventScroll:true});
       }
       toggle.addEventListener('click',()=>setOpen(true));
       close.addEventListener('click',()=>setOpen(false));

@@ -23,6 +23,7 @@ and uses the same endpoint in visible and hidden API server modes.
 from __future__ import annotations
 
 import argparse
+from operations_web import theme_css
 import ast
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
@@ -119,6 +120,7 @@ _OUTPUT_COMPAT_FIELD_SPECS = {
     ),
 }
 _SET_DATA_COMPAT_DEFAULTS = {
+    "enable_excluded_set_data_upload": True,
     "set_data_excluded_id_grafik": "",
     "enable_unserved_final_done_flag_update": True,
     "enable_missing_gps_set_data_upload": True,
@@ -127,6 +129,7 @@ _SET_DATA_COMPAT_DEFAULTS = {
     "set_data_missing_gps_bukva_template": "HOF1-{stop_number}",
 }
 _SET_DATA_COMPAT_FIELD_SPECS = {
+    "enable_excluded_set_data_upload": ("bool", "enable_set_data_upload", "Разреши изпращане на ръчно изключените заявки."),
     "set_data_excluded_id_grafik": ("str", "enable_set_data_upload", "Направление за ръчно изключените клиенти."),
     "enable_missing_gps_set_data_upload": ("bool", "enable_set_data_upload", "Изпращане на заявки без GPS."),
     "set_data_missing_gps_done_flag": ("str", "enable_set_data_upload", "Директен DoneFlag за заявки без GPS."),
@@ -241,6 +244,7 @@ _ALLOWED_SETTING_SECTIONS = {
 # into an arbitrary local process launcher.
 _PROTECTED_REQUEST_SETTING_FIELDS = {
     ("cvrp", "pyvrp_next_worker_path"),
+    ("cvrp", "pyvrp_0141_worker_path"),
     ("cvrp", "vroom_worker_path"),
     ("cvrp", "vrp_worker_path"),
 }
@@ -315,6 +319,8 @@ _TOP_LEVEL_SETTING_ALIASES = {
     "tsp_default_service_time_minutes": ("api", "tsp_default_service_time_minutes"),
     "tsp_service_time_minutes": ("api", "tsp_default_service_time_minutes"),
     "tsp_objective_metric": ("api", "tsp_objective_metric"),
+    "tsp_search_seconds": ("api", "tsp_search_seconds"),
+    "tsp_solver_type": ("api", "tsp_solver_type"),
     "tsp_metric": ("api", "tsp_objective_metric"),
     "tsp_optimize_by": ("api", "tsp_objective_metric"),
     "tsp_use_time_windows": ("api", "tsp_use_time_windows"),
@@ -453,6 +459,8 @@ _QUERY_SETTING_ALIASES = {
     "tsp_default_service_time_minutes": "tsp_default_service_time_minutes",
     "tsp_service_time_minutes": "tsp_service_time_minutes",
     "tsp_objective_metric": "tsp_objective_metric",
+    "tsp_search_seconds": "tsp_search_seconds",
+    "tsp_solver_type": "tsp_solver_type",
     "tsp_metric": "tsp_metric",
     "tsp_optimize_by": "tsp_optimize_by",
     "tsp_use_time_windows": "tsp_use_time_windows",
@@ -698,8 +706,8 @@ def _api_commands_reference(
             "use_time_windows": "api.tsp_use_time_windows",
             "time_window_wait_weight": "api.tsp_time_window_wait_weight",
             "time_window_late_weight": "api.tsp_time_window_late_weight",
-            "enable_two_opt": "api.tsp_enable_two_opt",
-            "two_opt_max_passes": "api.tsp_two_opt_max_passes",
+            "solver": "PyVRP 0.14; няма автоматично преминаване към друг алгоритъм",
+            "search_seconds": "api.tsp_search_seconds (1–120 секунди); POST tsp_search_seconds има приоритет",
             "response_format": "api.tsp_response_format: json връща JSON, html връща HTML body на картата",
             "generate_local_html_map": "api.tsp_generate_html_map",
             "upload_html_map": "api.tsp_upload_html_map",
@@ -1289,6 +1297,9 @@ def _resolve_depot_reference(config: MainConfig, value: Any) -> Optional[tuple[f
 
 def _resolve_web_depot_name(config: MainConfig, value: Any) -> tuple[float, float]:
     """Resolve only a canonical configured depot name, never arbitrary GPS text."""
+    from fleet_automation import read as read_operations, apply_locations
+    config = deepcopy(config)
+    apply_locations(config, read_operations())
     requested = str(value or "").strip().casefold()
     for name, coords in get_named_depots(config.locations).items():
         if str(name).strip().casefold() == requested:
@@ -1904,7 +1915,9 @@ _WEB_GUI_API_FIELDS = {
 _WEB_GUI_PERSIST_API_FIELDS = _WEB_GUI_API_FIELDS | {"web_gui_run_defaults_json"}
 
 # Shared fleet and server/security settings are never part of a planning profile.
-_SHARED_EXCLUSION_FIELDS = {("input", "excluded_customer_ids"), ("set_data", "set_data_excluded_id_grafik")}
+_SHARED_EXCLUSION_FIELDS = {("input", "excluded_customer_ids"), ("input", "excluded_document_ids"),
+                            ("set_data", "set_data_excluded_id_grafik"),
+                            ("set_data", "enable_excluded_set_data_upload")}
 
 
 def _shared_exclusions(config_obj):
@@ -1914,18 +1927,24 @@ def _shared_exclusions(config_obj):
 
 def _save_shared_exclusions(payload):
     from input_handler import normalise_excluded_customer_ids
-    if not isinstance(payload, dict) or set(payload) != {"customer_ids", "direction"}:
+    if (not isinstance(payload, dict) or not {"customer_ids", "direction"} <= set(payload)
+            or set(payload) - {"customer_ids", "direction", "document_ids", "send_enabled"}):
         raise ValueError("Подай списък с клиенти и направление.")
     if not isinstance(payload["direction"], str):
         raise ValueError("Направлението трябва да е текст.")
+    if "send_enabled" in payload and not isinstance(payload["send_enabled"], bool):
+        raise ValueError("Изпращането трябва да е включено или изключено.")
     ids = normalise_excluded_customer_ids(payload["customer_ids"])
     direction = payload["direction"].strip()
     if any(c.isspace() for c in direction):
         raise ValueError("Въведи един номер на направление без интервали.")
     with _CONFIG_TRANSACTION_LOCK:
         config_obj = deepcopy(get_config())
+        common = _shared_exclusions(config_obj)
         config_obj.input.excluded_customer_ids = ids
+        config_obj.input.excluded_document_ids = normalise_excluded_customer_ids(payload.get("document_ids", common["document_ids"]))
         config_obj.set_data.set_data_excluded_id_grafik = direction
+        config_obj.set_data.enable_excluded_set_data_upload = payload.get("send_enabled", common["send_enabled"])
         # Migrate only these two old profile values; preserve every other setting.
         raw = getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""
         if raw:
@@ -1939,13 +1958,16 @@ def _save_shared_exclusions(payload):
             include_vehicles=False, include_exclusions=True)
         current = config_module.config_manager.config
         current.input.excluded_customer_ids = ids
+        current.input.excluded_document_ids = config_obj.input.excluded_document_ids
         current.set_data.set_data_excluded_id_grafik = direction
+        current.set_data.enable_excluded_set_data_upload = config_obj.set_data.enable_excluded_set_data_upload
         current.api.web_gui_run_defaults_json = config_obj.api.web_gui_run_defaults_json
         return {"status": "saved", "scope": "shared_customer_exclusions", "backup_file": backup}
 
 
 _WEB_RUN_INPUT_FIELDS = {
     "excluded_customer_ids",
+    "excluded_document_ids",
     "input_source", "excel_file_path", "sheet_name", "json_url",
     "json_http_method", "json_command", "json_sklad", "json_done_flag",
     "json_extra_query", "json_override_date", "json_timeout_seconds",
@@ -1988,6 +2010,7 @@ _WEB_RUN_OUTPUT_FIELDS = {
     "charts_output_dir",
 }
 _WEB_RUN_SET_DATA_FIELDS = {
+    "enable_excluded_set_data_upload",
     "set_data_excluded_id_grafik",
     "enable_set_data_upload",
     "set_data_url",
@@ -2757,7 +2780,7 @@ def _vehicle_to_web_dict(vehicle: VehicleConfig, config_obj: Optional[MainConfig
         "fixed_cost": int(getattr(vehicle, "fixed_cost", 0) or 0),
         "max_distance_km": getattr(vehicle, "max_distance_km", None),
         "max_time_hours": parse_work_hours(getattr(vehicle, "max_time_hours", 8)),
-        "service_time_minutes": int(getattr(vehicle, "service_time_minutes", 8)),
+        "service_time_minutes": float(getattr(vehicle, "service_time_minutes", 8)),
         "max_customers_per_route": getattr(vehicle, "max_customers_per_route", None),
         "max_customers_per_day": getattr(vehicle, "max_customers_per_day", None),
         "end_location": _coords_to_text(getattr(vehicle, "end_location", None)),
@@ -2802,6 +2825,8 @@ def _web_config_revision(config_obj: MainConfig) -> str:
         "vehicles": [_vehicle_to_web_dict(vehicle, config_obj) for vehicle in config_obj.vehicles],
         "profile": str(getattr(config_obj.api, "web_gui_run_defaults_json", "") or ""),
     }
+    from fleet_automation import read as read_operations, revision as operations_revision
+    snapshot['operations'] = operations_revision(read_operations())
     return sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -2817,7 +2842,14 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
     saved_web_run_settings = _stored_web_run_settings(api_config, active_only=True)
     effective_web_settings = _merge_web_run_settings(global_web_run_settings, saved_web_run_settings)
 
+    from operations_web import payload as operations_payload
+    operations = operations_payload(cfg)
+    from fleet_automation import apply_locations as apply_operations_locations, read as read_operations
+    display_config = deepcopy(cfg)
+    apply_operations_locations(display_config, read_operations())
     return {
+        "operations": operations,
+        "operations_web": operations_payload(cfg, 'web'),
         "status": "ok",
         "app_name": str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"),
         "web_gui": {
@@ -2839,14 +2871,14 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
             for field_name in sorted(_WEB_GUI_CVRP_FIELDS)
             if hasattr(cvrp, field_name)
         },
-        "vehicles": [_vehicle_to_web_dict(vehicle, cfg) for vehicle in (cfg.vehicles or [])],
+        "vehicles": [_vehicle_to_web_dict(vehicle, display_config) for vehicle in (cfg.vehicles or [])],
         "customer_exclusions": _shared_exclusions(cfg),
         "depots": [
             {
                 "name": str(name),
                 "coordinates": _coords_to_text(coords),
             }
-            for name, coords in get_named_depots(cfg.locations).items()
+            for name, coords in get_named_depots(display_config.locations).items()
         ],
         "vehicle_types": [
             vehicle_type.value
@@ -2922,8 +2954,8 @@ def _replace_class_field_literal(content: str, class_name: str, field_name: str,
         # A preserved config.py can be older than the executable. Insert the
         # known additive fields during the first global Web save instead of
         # silently leaving the external config structurally incompatible.
-        if class_name == "InputConfig" and field_name == "excluded_customer_ids":
-            return class_block.rstrip() + f'\n    excluded_customer_ids: str = {_python_literal(value)}\n\n'
+        if class_name == "InputConfig" and field_name in {"excluded_customer_ids", "excluded_document_ids"}:
+            return class_block.rstrip() + f'\n    {field_name}: str = {_python_literal(value)}\n\n'
         if class_name == "OutputConfig" and field_name in _OUTPUT_COMPAT_FIELD_SPECS:
             annotation, anchor_name, comment = _OUTPUT_COMPAT_FIELD_SPECS[field_name]
             anchor_pattern = rf'(?m)^(\s*){re.escape(anchor_name)}\s*:.*$'
@@ -3054,7 +3086,9 @@ def _persist_web_gui_config(
 
     if include_exclusions:
         content = _replace_class_field_literal(content, "InputConfig", "excluded_customer_ids", config_obj.input.excluded_customer_ids)
+        content = _replace_class_field_literal(content, "InputConfig", "excluded_document_ids", getattr(config_obj.input, "excluded_document_ids", ""))
         content = _replace_class_field_literal(content, "SetDataConfig", "set_data_excluded_id_grafik", config_obj.set_data.set_data_excluded_id_grafik)
+        content = _replace_class_field_literal(content, "SetDataConfig", "enable_excluded_set_data_upload", getattr(config_obj.set_data, "enable_excluded_set_data_upload", True))
         content = _replace_class_field_literal(content, "APIConfig", "web_gui_run_defaults_json", config_obj.api.web_gui_run_defaults_json)
     compile(content, config_path, "exec")
     backup_path = _backup_config_py(config_path)
@@ -3272,7 +3306,9 @@ def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
     config_obj = deepcopy(get_config())
     common = _shared_exclusions(config_obj)
     config_obj.input.excluded_customer_ids = common["customer_ids"]
+    config_obj.input.excluded_document_ids = common["document_ids"]
     config_obj.set_data.set_data_excluded_id_grafik = common["direction"]
+    config_obj.set_data.enable_excluded_set_data_upload = common["send_enabled"]
     if bool(payload.get("clear", False)):
         config_obj.api.web_gui_run_defaults_json = ""
         applied: list[str] = ["api.web_gui_run_defaults_json.clear"]
@@ -3437,6 +3473,8 @@ def _web_gui_login_html(api_config) -> str:
     .error:empty {{ display:none; }}
     .setup {{ margin:0 0 16px; padding:12px; border-radius:8px; background:#eff6ff; color:#1e40af; font-size:14px; }}
     @media(max-width:480px) {{ body {{ padding:16px; }} .brand {{ padding:20px 24px; }} .login-content {{ padding:24px; }} }}
+    {theme_css()}
+    .brand {{ background:var(--accent-dark); }} #loginButton {{ color:var(--accent-ink); }} #loginButton:hover {{ background:var(--accent-hover); }}
   </style>
 </head>
 <body>
@@ -3488,6 +3526,7 @@ def _web_gui_login_html(api_config) -> str:
 
 
 def _web_gui_html(api_config, host: str, port: int) -> str:
+    from operations_ui import markup as operations_markup, css as operations_css, script as operations_script
     from supervisor_ui import supervisor_css, supervisor_toolbar, supervisor_progress, supervisor_script
     from web_portal import (dispatcher_labels, portal_css, portal_navigation,
                             portal_heading, portal_input_settings, portal_script, portal_exclusions_dialog)
@@ -3596,6 +3635,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     .full {{ grid-column:1 / -1; }}
     {portal_css()}
     {supervisor_css()}
+    {operations_css()}
+    {theme_css()}
   </style>
 </head>
 <body>
@@ -3615,6 +3656,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
   </header>
   {portal_exclusions_dialog()}
   <main>
+    {operations_markup()}
     <section class="vehicles-section" id="fleetSection">
       <div class="section-head">
         <div>
@@ -3650,13 +3692,13 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
           <div class="settings-accordion-body">
           <p class="settings-accordion-description">Цел, време за търсене и допълнителни курсове.</p>
           <div class="solver-settings-grid">
-            <div><label for="solverType">Solver</label><select id="solverType" title="VRP-Rust е отделен експериментален sidecar; зоните влияят в distance режим, а pure time минимизира само продължителността. VROOM 1.15 не поддържа свързани повторни курсове."><option value="pyvrp">PyVRP 0.13</option><option value="pyvrp_experimental">PyVRP 0.14</option><option value="or_tools">OR-Tools</option><option value="vroom">VROOM 1.15</option><option value="vrp">VRP-Rust</option></select></div>
+            <div><label for="solverType">Solver</label><select id="solverType" title="VRP-Rust е отделен експериментален sidecar; зоните влияят в distance режим, а pure time минимизира само продължителността. VROOM 1.15 не поддържа свързани повторни курсове."><option value="pyvrp">PyVRP 0.13</option><option value="pyvrp_experimental">PyVRP 0.14.0</option><option value="pyvrp_0141">PyVRP 0.14.1</option><option value="or_tools">OR-Tools</option><option value="vroom">VROOM 1.15</option><option value="vrp">VRP-Rust</option></select></div>
             <div><label for="objectiveMetric">Цел</label><select id="objectiveMetric" title="time = оптимизация по време; distance = оптимизация по километри."><option value="time">Време</option><option value="distance">Разстояние</option></select></div>
             <div><label for="solverTimeLimit">Лимит (сек.)</label><input id="solverTimeLimit" type="number" min="1" max="86400"></div>
             <div class="check-line"><input id="timeObjectiveIncludeWaiting" type="checkbox"><label for="timeObjectiveIncludeWaiting">Целият работен ден (само време)</label></div>
             <div class="check-line"><input id="multiTripEnabled" type="checkbox"><label for="multiTripEnabled">Разреши повторни курсове</label></div>
           </div>
-          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental">
+          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,pyvrp_0141">
             <h4>PyVRP качество</h4>
             <div class="muted">Допълнителни настройки за задълбочено търсене на по-добър план.</div>
             <div class="solver-settings-grid">
@@ -3685,7 +3727,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div><label for="pyvrpPenaltyMax">Максимална penalty</label><input id="pyvrpPenaltyMax" type="number" min="0" max="1000000000" step="0.1"></div>
             </div>
           </div>
-          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,or_tools,vroom,vrp">
+          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,pyvrp_0141,or_tools,vroom,vrp">
             <h4>Пропускане на клиенти</h4>
             <div class="muted">Избери правило за индивидуалната глоба. Задължителните клиенти не могат да се пропускат. Географският приоритет е наличен само за PyVRP 0.14.</div>
             <div class="solver-settings-grid">
@@ -3715,11 +3757,11 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               </div>
             </div>
           </div>
-          <div class="solver-fine-panel" data-solvers="pyvrp_experimental">
+          <div class="solver-fine-panel" data-solvers="pyvrp_experimental,pyvrp_0141">
             <h4>PyVRP 0.14 — изчакване и резервен метод</h4>
             <div class="solver-settings-grid">
               <div><label for="pyvrpNextTimeout">Worker timeout (сек.)</label><input id="pyvrpNextTimeout" type="number" min="0" max="86400" title="0 = solver лимитът плюс автоматичен резерв от 180 секунди за построяване и запис."></div>
-              <div class="check-line"><input id="pyvrpNextFallback" type="checkbox"><label for="pyvrpNextFallback">Fallback към PyVRP 0.13</label></div>
+              <div class="check-line" data-solvers="pyvrp_experimental"><input id="pyvrpNextFallback" type="checkbox"><label for="pyvrpNextFallback">Резервна PyVRP 0.13 (за 0.14.0)</label></div>
             </div>
           </div>
           <div class="solver-fine-panel" data-solvers="or_tools">
@@ -3756,7 +3798,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
               <div class="check-line"><input id="vrpLogProgress" type="checkbox"><label for="vrpLogProgress">Progress лог</label></div>
             </div>
           </div>
-          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,or_tools">
+          <div class="solver-fine-panel" data-solvers="pyvrp,pyvrp_experimental,pyvrp_0141,or_tools">
             <h4>Паралелно търсене</h4>
             <div class="solver-settings-grid">
               <div><label for="solverNumWorkers">Брой процеси</label><input id="solverNumWorkers" type="number" min="-1" max="256" title="-1 = всички ядра без едно."></div>
@@ -3884,7 +3926,6 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       <div class="actions run-actions">
         <button onclick="resetActiveProfile()">Върни записаните настройки</button>
         <details class="advanced-actions" id="globalStartActions" hidden><summary>Допълнителни действия</summary><div class="actions">
-          <button id="globalPlanButton" onclick="startRun(true)">Стартирай с основните настройки</button>
           <button class="danger" onclick="shutdownProgram()">Изключи програмата</button>
         </div></details>
       </div>
@@ -4216,7 +4257,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
 
     function updateDeferralFields() {{
-      const supportsGeographic = value("solverType") === "pyvrp_experimental";
+      const supportsGeographic = ["pyvrp_experimental", "pyvrp_0141"].includes(value("solverType"));
       $("customerDroppingStrategy").querySelector('[value="geographic"]').disabled = !supportsGeographic;
       if (!supportsGeographic) put("customerDroppingStrategy", "legacy");
       const geographic = value("customerDroppingStrategy") === "geographic";
@@ -4279,7 +4320,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const pyvrpSeedRaw = value("pyvrpSeed").trim();
       const settings = {{
         solver_type:value("solverType"),
-        customer_dropping_strategy:value("solverType") === "pyvrp_experimental" ? value("customerDroppingStrategy") : "legacy",
+        customer_dropping_strategy:["pyvrp_experimental", "pyvrp_0141"].includes(value("solverType")) ? value("customerDroppingStrategy") : "legacy",
         allow_customer_skipping:bool("allowCustomerSkipping"),
         enable_priority_dropping:bool("priorityDroppingEnabled"),
         drop_volume_weight:requiredNumber("dropVolumeWeight", "Тежест обем", 0, Number.MAX_VALUE),
@@ -4771,6 +4812,7 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     }}
     {portal_script()}
     {supervisor_script()}
+    {operations_script()}
     initialiseDispatcherControls();
     initialiseSupervisorUI();
     $("outUploadEnabled").addEventListener("change", () => {{
@@ -4869,6 +4911,10 @@ def _run_status_snapshot() -> Dict[str, Any]:
 
 
 def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
+    from tsp_pyvrp_runtime import worker_for
+    from tsp_pyvrp import selected_backend
+    tsp_backend = selected_backend(api_config)
+    tsp_native_worker = worker_for(tsp_backend.version)
     public_url = _build_public_base_url(api_config, host, port)
     api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
     trigger_endpoint = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
@@ -4933,8 +4979,12 @@ def _api_health_payload(api_config, host: str, port: int) -> Dict[str, Any]:
                 "use_time_windows": bool(getattr(api_config, "tsp_use_time_windows", True)),
                 "time_window_wait_weight": float(getattr(api_config, "tsp_time_window_wait_weight", 1.0) or 1.0),
                 "time_window_late_weight": float(getattr(api_config, "tsp_time_window_late_weight", 20.0) or 20.0),
-                "enable_two_opt": bool(getattr(api_config, "tsp_enable_two_opt", True)),
-                "two_opt_max_passes": int(getattr(api_config, "tsp_two_opt_max_passes", 30) or 30),
+                "solver": "pyvrp",
+                "solver_version": tsp_backend.version,
+                "solver_type": tsp_backend.public,
+                "worker": tsp_native_worker.status(),
+                "search_seconds": float(getattr(api_config, "tsp_search_seconds", 10)),
+                "time_window_policy": "prefer_on_time_else_penalise_and_warn",
                 "response_format": _normalise_tsp_response_format(getattr(api_config, "tsp_response_format", "json")),
                 "generate_local_html_map": bool(getattr(api_config, "tsp_generate_html_map", True)),
                 "upload_html_map": bool(getattr(api_config, "tsp_upload_html_map", True)),
@@ -5339,6 +5389,11 @@ def _run_tsp_in_subprocess(payload: Dict[str, Any], query: Optional[Dict[str, li
     api_config = get_config().api
     timeout_seconds = int(getattr(api_config, "tsp_worker_timeout_seconds", 30) or 30)
     timeout_seconds = max(1, timeout_seconds)
+    # Two frozen processes may need to unpack, obtain the matrix, and search.
+    # Preserve the stored setting, but don't kill the native search at 30s.
+    from tsp_pyvrp import search_seconds
+    request_config, _, _ = _build_request_config_override(payload, query)
+    timeout_seconds = max(timeout_seconds, search_seconds(payload, request_config or get_config()) + 120)
     tsp_run_id = uuid.uuid4().hex[:12]
     logs_dir = _api_logs_dir()
     input_path = os.path.join(logs_dir, f"api_tsp_{tsp_run_id}_input.json")
@@ -5788,6 +5843,8 @@ def _schedule_program_shutdown(server, delay_seconds: float = 0.35) -> None:
             logger.warning("Server shutdown failed before process exit: %s", exc)
         time.sleep(0.25)
         logger.info("Exiting CVRP API process after shutdown request")
+        from tsp_pyvrp_runtime import close_all
+        close_all()
         os._exit(0)
 
     threading.Thread(target=shutdown_worker, name="CVRPApiShutdown", daemon=True).start()
@@ -6036,6 +6093,11 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
         if subpath == "/api/config":
             self._send_json(200, _web_gui_config_payload(host, port))
             return
+        if subpath == "/api/operations":
+            from operations_web import payload as operations_payload
+            profile = (parse_qs(urlparse(self.path).query).get('profile') or ['global'])[0]
+            self._send_json(200, operations_payload(_reload_config_from_disk(), profile))
+            return
         if subpath == "/api/status":
             self._send_json(200, {
                 "status": "ok",
@@ -6175,6 +6237,18 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 return
 
             payload = self._read_json_body(required=True, max_bytes=_MAX_WEB_REQUEST_BODY_BYTES)
+            if subpath == "/api/operations":
+                from fleet_automation import save as save_operations
+                from operations_web import payload as operations_payload
+                with _CONFIG_TRANSACTION_LOCK:
+                    cfg = _reload_config_from_disk()
+                    save_operations(payload, cfg)
+                self._send_json(200, {'status':'saved', 'operations':operations_payload(cfg)})
+                return
+            if subpath == "/api/operations/check":
+                from operations_web import start_check
+                self._send_json(202, start_check(_reload_config_from_disk(), payload.get('profile','global')))
+                return
             if subpath == "/api/config":
                 result = _apply_web_gui_config_save(payload)
                 host = self.server.server_address[0]
@@ -6511,6 +6585,11 @@ def run_server(host: str | None = None, port: int | None = None):
     _configure_api_logging()
 
     server = ThreadingHTTPServer((host, port), CVRPApiHandler)
+    try:
+        from tsp_pyvrp import warmup as warmup_tsp
+        warmup_tsp(get_config())
+    except Exception:
+        logger.exception("TSP PyVRP warmup failed; a new start will be attempted on the next TSP request")
     public_url = _build_public_base_url(api_config, host, port)
     api_endpoint = _normalise_endpoint(getattr(api_config, "api_endpoint", "/solve"))
     trigger_endpoint = _normalise_endpoint(getattr(api_config, "trigger_endpoint", "/run"))
@@ -6529,11 +6608,16 @@ def run_server(host: str | None = None, port: int | None = None):
     logger.info("TSP daily report endpoint: %s%s", public_url, tsp_report_endpoint)
     logger.info("Shutdown endpoint: %s%s", public_url, shutdown_endpoint)
     _start_tsp_report_scheduler()
+    from operations_web import start_scheduler as start_fleet_scheduler
+    fleet_scheduler_stop = start_fleet_scheduler(_reload_config_from_disk)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Stopping CVRP API server")
     finally:
+        fleet_scheduler_stop.set()
+        from tsp_pyvrp_runtime import close_all
+        close_all()
         server.server_close()
 
 

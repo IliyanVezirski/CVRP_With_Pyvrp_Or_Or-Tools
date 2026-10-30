@@ -108,6 +108,9 @@ put('solverType','pyvrp_experimental'); put('customerDroppingStrategy','geograph
 collected=collectCvrpSettings();
 assert.equal(collected.customer_dropping_strategy,'geographic');
 assert.equal(collected.drop_volume_weight,0.2);
+put('solverType','pyvrp_0141');
+collected=collectCvrpSettings();
+assert.equal(collected.customer_dropping_strategy,'geographic');
 """)
 
     def test_leaflet_toggle_is_hidden_then_shows_and_hides(self):

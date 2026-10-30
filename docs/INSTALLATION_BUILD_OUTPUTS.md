@@ -106,10 +106,11 @@ Batch файловете първо търсят `Bizant.exe`. Ако той л�
 | `or_tools` | OR-Tools | основната `.venv`/главният EXE |
 | `pyvrp` | PyVRP 0.13 | основната `.venv`/главният EXE |
 | `pyvrp_experimental` | стабилен PyVRP 0.14.0 | `.venv-pyvrp-next` или отделен EXE worker |
+| `pyvrp_0141` | стабилен PyVRP 0.14.1 | `.venv-pyvrp-0141` или отделен EXE worker |
 | `vroom` | official pyvroom 1.15 | `.venv-vroom` или отделен EXE worker |
 | `vrp` | VRP-Rust/`vrp-cli` 1.24 | `.venv-vrp-rust` или отделен EXE worker |
 
-Worker path настройките (`pyvrp_next_worker_path`, `vroom_worker_path` и
+Worker path настройките (`pyvrp_next_worker_path`, `pyvrp_0141_worker_path`, `vroom_worker_path` и
 `vrp_worker_path`) са инсталационни. Не трябва да се подават от недоверена API
 заявка. Когато са празни, runtime-ът първо търси source средата, а после
 стандартната worker директория до build-а.
@@ -130,7 +131,7 @@ Worker path настройките (`pyvrp_next_worker_path`, `vroom_worker_path
 и build проверките използват една и съща стойност. `--self-check` проверява и
 импорта на адаптера, не само наличието на библиотеката.
 
-В GUI продължава да се избира **PyVRP 0.14**. Ключът `pyvrp_experimental` е
+В GUI се избира **PyVRP 0.14.0**. Ключът `pyvrp_experimental` е
 запазен за съвместимост на съществуващите конфигурации и API заявки, но вече
 означава стабилния 0.14.0 backend. Настройките, формулите и ограниченията не се
 мигрират/нулират. Обновяването на source средата не подменя готови EXE файлове;
@@ -157,6 +158,29 @@ pre-flight self-check; валидира се отговорът от реалн�
 Актуалният worker трябва да показва `capabilities.hard_mandatory_customers=true`
 в `--self-check`. Worker от по-стар build без capability-то се отказва умишлено;
 изгради го отново от същия source като главния EXE.
+
+### 4.1.1. Допълнителна PyVRP 0.14.1
+
+Тази версия не заменя 0.14.0. Отделен избор в GUI/Web: **PyVRP 0.14.1**;
+CVRP/API ключ: `pyvrp_0141`. Средата и worker-ът имат собствена версия и път:
+
+```powershell
+.\.venv\Scripts\python.exe setup_pyvrp_0141.py
+.\.venv-pyvrp-0141\Scripts\python.exe pyvrp_0141_worker.py --self-check
+.\.venv-pyvrp-0141\Scripts\python.exe build_pyvrp_0141_worker.py
+& "D:\Iliyan\dist\pyvrp-0141\CVRP_PyVRP_0141_Worker.exe" --self-check
+```
+
+Setup приема и `--wheel` с локален **0.14.1** wheel. Не променя `.venv` или
+`.venv-pyvrp-next`. Пълният `build_exe.py` вече изисква и тази четвърта worker
+среда. Дистрибуцията трябва да съдържа папките `pyvrp-next`, `pyvrp-0141`,
+`vroom` и `vrp-rust`. Старите `config.py` получават новите полета в паметта,
+без презаписване или автоматична смяна на избрания решител.
+
+При техническа грешка в 0.14.1 няма fallback към друга PyVRP версия.
+Съществуващият OR-Tools fallback за точно моделиране на определени ограничения
+е запазен и се отчита като такъв. За TSP независимият избор е
+`api.tsp_solver_type="pyvrp_0141"`; старият default остава 0.14.0.
 
 ### 4.2. VROOM 1.15
 
@@ -202,7 +226,7 @@ worker-а.
 Преди build спрете работещите `Bizant.exe` и companion worker-и. Иначе
 Windows или антивирусен софтуер може да държи стария EXE заключен.
 
-Уверете се, че съществуват и трите изолирани среди, след което изпълнете:
+Уверете се, че съществуват и четирите изолирани среди, след което изпълнете:
 
 ```powershell
 Set-Location "D:\Iliyan\bizant_source"
@@ -214,7 +238,7 @@ Build скриптът:
 1. проверява библиотеките в основната `.venv`;
 2. генерира вътрешния PyInstaller spec и version info;
 3. изгражда главния `Bizant.exe`;
-4. изгражда и self-check-ва PyVRP 0.14 worker-а;
+4. изгражда и self-check-ва отделните PyVRP 0.14.0 и 0.14.1 worker-и;
 5. изгражда и self-check-ва VROOM worker-а;
 6. изгражда и self-check-ва VRP-Rust worker-а;
 7. създава четирите batch стартера;
@@ -227,7 +251,7 @@ EXE може вече да е създаден, но build-ът се отчит�
 ### 5.1. Build на друго място
 
 `CVRP_DIST_DIR` задава release директорията, а `CVRP_BUILD_DIR` — временните
-PyInstaller файлове. Стойностите се наследяват и от трите worker build скрипта:
+PyInstaller файлове. Стойностите се наследяват и от четирите worker build скрипта:
 
 ```powershell
 $env:CVRP_DIST_DIR = "D:\Iliyan\dist_new"
@@ -265,6 +289,8 @@ dist\
   data\
   pyvrp-next\
     CVRP_PyVRP_Next_Worker.exe
+  pyvrp-0141\
+    CVRP_PyVRP_0141_Worker.exe
   vroom\
     CVRP_VROOM_Worker.exe
   vrp-rust\
@@ -290,7 +316,7 @@ Set-Location "D:\Iliyan\dist"
 curl.exe "http://127.0.0.1:8070/health"
 ```
 
-Проверете и трите worker-а с показаните по-горе `--self-check` команди.
+Проверете и четирите worker-а с показаните по-горе `--self-check` команди.
 
 ## 6. Конфигурация, записване и backup-и
 
@@ -725,10 +751,10 @@ character` прави tolerant decode. Така стар endpoint може да 
 
 Преди предаване на нов build:
 
-1. изпълнете `pip check` в основната и трите companion среди;
+1. изпълнете `pip check` в основната и четирите companion среди;
 2. build-нете в нова или проверена release директория;
 3. потвърдете, че config е копиран или запазен според избрания режим;
-4. изпълнете self-check на трите frozen worker-а;
+4. изпълнете self-check на четирите frozen worker-а;
 5. отворете Settings и проверете активния config;
 6. стартирайте API на localhost и проверете `/health`;
 7. направете тест без `setData` и без route upload;

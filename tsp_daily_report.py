@@ -91,6 +91,8 @@ def record_tsp_result(config: MainConfig, result: Dict[str, Any], payload: Optio
         "map_file": _clean_text(result.get("map_file")),
         "map_upload": deepcopy(result.get("map_upload")),
         "tsp_process": deepcopy(result.get("tsp_process")),
+        "solver": deepcopy(result.get("solver")),
+        "time_window_violations": deepcopy(result.get("time_window_violations") or []),
         "skipped_customers": deepcopy(result.get("skipped_customers") or []),
         "delivery_order": deepcopy(result.get("delivery_order") or []),
     }

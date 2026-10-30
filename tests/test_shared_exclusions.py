@@ -18,7 +18,8 @@ def test_legacy_lists_are_combined_for_both_profiles_and_direct_run():
     cfg.api.web_gui_run_defaults_json = json.dumps({'version':2, 'settings':{
         'input':{'excluded_customer_ids':'B,A'}, 'set_data':{'set_data_excluded_id_grafik':'456'}}})
     before = deepcopy(cfg)
-    assert shared_customer_exclusions(cfg) == {'customer_ids':'A\nB', 'direction':'123', 'direction_conflict':True}
+    assert shared_customer_exclusions(cfg) == {'customer_ids':'A\nB', 'document_ids':'', 'send_enabled':True,
+                                             'direction':'123', 'direction_conflict':True}
     for profile in ['web', 'global']:
         with patch.object(api, 'get_config', return_value=cfg):
             effective = api._build_web_run_config_override({'profile':profile, 'run_settings':{
@@ -122,14 +123,15 @@ let fail=false;
 let calls=[];
 const fetch=async(url,options)=>{calls.push(JSON.parse(options.body));if(fail)throw Error('Неуспешен запис');
   return {config:{customer_exclusions:{customer_ids:'003',direction:'0008'},revision:'new'}};};
-const controls=new Function('$','state','put','value','apiFetch',script+';return {openExclusions,closeExclusions,saveExclusions,updateExclusionButton};')
- ($,state,(id,v)=>$(id).value=v,id=>$(id).value,fetch);
+const controls=new Function('$','state','put','value','apiFetch','bool',script+';return {openExclusions,closeExclusions,saveExclusions,updateExclusionButton};')
+ ($,state,(id,v)=>{if(typeof v==='boolean')$(id).checked=v;else $(id).value=v;},id=>$(id).value,fetch,id=>!!$(id).checked);
 (async()=>{
  controls.openExclusions();assert.equal($('exclusionsDialog').open,true);
  $('inExcludedCustomers').value='discard';controls.closeExclusions();
  assert.equal(calls.length,0);controls.openExclusions();assert.equal($('inExcludedCustomers').value,'001\n002');
- $('inExcludedCustomers').value='003';$('setDataExcludedGrafik').value='0008';await controls.saveExclusions();
- assert.deepEqual(calls[0],{customer_ids:'003',direction:'0008'});
+ $('inExcludedCustomers').value='003';$('setDataExcludedGrafik').value='0008';
+ $('inExcludedDocuments').value='000123';$('sendExcludedCustomers').checked=false;await controls.saveExclusions();
+ assert.deepEqual(calls[0],{customer_ids:'003',direction:'0008',document_ids:'000123',send_enabled:false});
  assert.equal($('excludedCustomersCount').textContent,'· 1');assert.equal($('exclusionsDialog').open,false);
  assert.deepEqual(state.vehicles,['draft']);assert.deepEqual(state.web_run_settings,{draft:true});
  controls.openExclusions();fail=true;await controls.saveExclusions();assert.equal($('exclusionsDialog').open,true);

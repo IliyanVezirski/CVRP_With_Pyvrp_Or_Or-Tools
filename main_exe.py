@@ -373,6 +373,12 @@ def self_check_exe():
         raise ValueError("Runtime config lacks deferral fields: " + ", ".join(missing))
     page = cvrp_api_server._web_gui_html(cfg.api, "127.0.0.1", cfg.api.api_port)
     assert 'id="customerDroppingStrategy"' in page
+    assert 'id="operationsDialog"' in page
+    assert 'id="globalPlanButton"' in page
+    import fleet_automation
+    import operations_web
+    assert fleet_automation.store_path().parent.parent == Path(config.__file__).resolve().parent
+    json.dumps(operations_web.payload(cfg))
     assert hasattr(config_gui.ConfigGUI, "_validate_values")
     from main import vehicle_config_to_worker_dict, vehicle_configs_from_worker_dicts
     import multiprocessing

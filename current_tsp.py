@@ -2,7 +2,8 @@
 
 This module is intentionally separate from the CVRP solvers. It receives one
 driver's current GPS position and a list of remaining customers, orders those
-customers as an open TSP route, generates the same individual HTML map used by
+customers from a fixed start (defaulting to the configured Sofia depot) to an
+optional fixed end, otherwise ending at the last customer, generates the same individual HTML map used by
 normal routes, and optionally uploads that map with the driver ID in pData2[].
 """
 
@@ -44,6 +45,7 @@ from input_handler import (
 )
 from osrm_client import DistanceMatrix, OSRMClient
 from output_handler import InteractiveMapGenerator, OutputHandler
+from tsp_pyvrp import search_seconds as _pyvrp_search_seconds, solve_order as _pyvrp_solve_order
 
 
 logger = logging.getLogger(__name__)
@@ -107,11 +109,21 @@ _CUSTOMER_COMMENT_KEYS = ("comment", "delivery_comment", "DeliveryComment", "not
 
 
 def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -> Dict[str, Any]:
-    """Solve a current open TSP route for a single driver and return JSON data."""
+    """Solve a current TSP route for a single driver and return JSON data."""
     if not isinstance(payload, dict):
         raise ValueError("TSP заявката трябва да бъде JSON обект.")
 
     active_config = config or get_config()
+    from fleet_automation import read as read_operations, apply_locations
+    operations = read_operations()
+    if operations['locations']:
+        active_config = deepcopy(active_config)
+        apply_locations(active_config, operations)
+    if 'tsp_solver_type' in payload:
+        active_config = deepcopy(active_config)
+        active_config.api.tsp_solver_type = payload['tsp_solver_type']
+    from tsp_pyvrp import selected_backend
+    tsp_backend = selected_backend(active_config)
     driver_id = _require_text(
         _first_present(payload, *_tsp_field_names(active_config, "tsp_driver_id_field", _DRIVER_ID_KEYS)),
         "driver_id",
@@ -119,13 +131,13 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     driver_name = _clean_text(
         _first_present(payload, *_tsp_field_names(active_config, "tsp_driver_name_field", _DRIVER_NAME_KEYS))
     )
-    start_location = _require_coords(
+    start_location = _tsp_endpoint_or_depot(
         _first_present(payload, *_tsp_field_names(active_config, "tsp_driver_location_field", _DRIVER_LOCATION_KEYS)),
         "driver_location",
+        active_config,
     )
-    end_location = _parse_coords(
-        _first_present(payload, *_tsp_field_names(active_config, "tsp_end_location_field", _END_LOCATION_KEYS))
-    )
+    raw_end = _first_present(payload, *_tsp_field_names(active_config, "tsp_end_location_field", _END_LOCATION_KEYS))
+    end_location = None if raw_end is None or (isinstance(raw_end, str) and not raw_end.strip()) else _require_coords(raw_end, "end_location")
     customers_payload = _extract_customer_records(payload, active_config)
     if not customers_payload:
         raise ValueError("TSP заявката няма клиенти.")
@@ -140,8 +152,7 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     use_time_windows = _tsp_use_time_windows(payload, active_config)
     wait_weight = _tsp_time_window_wait_weight(payload, active_config)
     late_weight = _tsp_time_window_late_weight(payload, active_config)
-    two_opt_enabled = _tsp_two_opt_enabled(payload, active_config)
-    two_opt_max_passes = _tsp_two_opt_max_passes(payload, active_config)
+    search_time = _pyvrp_search_seconds(payload, active_config)
     vehicle_type = _vehicle_type(payload)
     vehicle_config = _vehicle_config_for_type(active_config, vehicle_type)
     _prepare_customer_service_times(customers, vehicle_config, payload, service_time_minutes)
@@ -154,19 +165,17 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         end_node = len(matrix_locations) - 1
 
     matrix = _build_distance_matrix(active_config, matrix_locations, tsp_valhalla_config)
-    ordered_customers, route_node_order = _solve_open_tsp_order(
-        customers,
-        matrix,
-        metric=metric,
-        start_time_minutes=start_time_minutes,
-        service_time_minutes=service_time_minutes,
-        use_time_windows=use_time_windows,
-        wait_weight=wait_weight,
-        late_weight=late_weight,
-        two_opt_enabled=two_opt_enabled,
-        two_opt_max_passes=two_opt_max_passes,
-        end_node=end_node,
-    )
+    solver_locations, solver_distances, solver_durations = _tsp_solver_matrix(matrix, end_node)
+    solver_result = _pyvrp_solve_order(dict(
+        locations=solver_locations, distances=solver_distances, durations=solver_durations,
+        metric=metric, start_seconds=start_time_minutes * 60,
+        wait_weight=wait_weight, late_weight=late_weight, search_seconds=search_time,
+        clients=[dict(service_seconds=_tsp_customer_service_seconds(c, service_time_minutes),
+                      windows=time_windows_to_seconds(customer_time_windows_minutes(c)) if use_time_windows else [])
+                 for c in customers],
+    ), active_config)
+    route_node_order = solver_result["order"]
+    ordered_customers = [customers[node - 1] for node in route_node_order]
     schedule_entries, total_distance_km, total_time_minutes = _build_schedule_entries(
         ordered_customers,
         route_node_order,
@@ -193,6 +202,17 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
     setattr(route, "open_route", True)
     setattr(route, "total_turnover", sum(float(getattr(customer, "turnover", 0) or 0) for customer in ordered_customers))
     setattr(route, "tsp_metric", metric)
+    late_visits = [dict(customer_id=str(e["customer"].id), customer_name=e["customer"].name,
+                       late_minutes=round(e["late_minutes"], 2))
+                   for e in schedule_entries if e.get("late_minutes", 0) > 0]
+    if late_visits:
+        logger.warning("TSP PyVRP: %s клиента извън работното време: %s", len(late_visits),
+                       "; ".join(f"{v['customer_name']}: {v['late_minutes']:g} мин" for v in late_visits))
+    solver_metadata = dict(name="pyvrp", version=solver_result["solver_version"],
+                           search_seconds=search_time, time_windows_satisfied=not late_visits,
+                           late_customers=len(late_visits), fallback_used=False)
+    logger.info("TSP PyVRP %s: %s клиента, %.3f км, %.2f мин, закъснели: %s",
+                solver_result["solver_version"], len(customers), total_distance_km, total_time_minutes, len(late_visits))
     if tsp_valhalla_config is not None:
         setattr(route, "tsp_valhalla_config", tsp_valhalla_config)
         setattr(route, "tsp_routing_profile", "valhalla_truck")
@@ -221,12 +241,15 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         "driver_id": driver_id,
         "driver_name": driver_name,
         "metric": metric,
+        "solver": solver_metadata,
+        "time_window_violations": late_visits,
         "tsp_settings": {
+            "solver_type": tsp_backend.public,
             "use_time_windows": use_time_windows,
             "wait_weight": wait_weight,
             "late_weight": late_weight,
-            "two_opt_enabled": two_opt_enabled,
-            "two_opt_max_passes": two_opt_max_passes,
+            "solver": "pyvrp",
+            "search_seconds": search_time,
             "service_time_minutes": service_time_minutes,
             "routing_profile": "valhalla_truck" if tsp_valhalla_config is not None else "default",
             "valhalla_truck": _tsp_valhalla_truck_settings_json(tsp_valhalla_config),
@@ -297,6 +320,31 @@ def _require_coords(value: Any, field_name: str) -> Tuple[float, float]:
     if coords is None:
         raise ValueError(f"Невалидни или липсващи координати: {field_name}")
     return coords
+
+
+def _tsp_solver_matrix(matrix: DistanceMatrix, end_node: Optional[int]):
+    """An open route uses a solver-only sink with zero travel from every stop.
+
+    Keep the real matrix untouched: schedules and maps must not include this
+    virtual depot. PyVRP still chooses the last customer as part of its search.
+    """
+    if end_node is not None:
+        return matrix.locations, matrix.distances, matrix.durations
+    size = len(matrix.locations) + 1
+    return (
+        list(matrix.locations) + [matrix.locations[0]],
+        [list(row) + [0.0] for row in matrix.distances] + [[0.0] * size],
+        [list(row) + [0.0] for row in matrix.durations] + [[0.0] * size],
+    )
+
+
+def _tsp_endpoint_or_depot(value: Any, field_name: str, config: MainConfig) -> Tuple[float, float]:
+    """Only an absent/blank start defaults to Sofia; malformed GPS is an error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        depot = _require_coords(config.locations.depot_location, "locations.depot_location")
+        logger.info("TSP: %s липсва — използвам главното депо (София): %s", field_name, depot)
+        return depot
+    return _require_coords(value, field_name)
 
 
 def _parse_coords(value: Any) -> Optional[Tuple[float, float]]:
@@ -1397,6 +1445,9 @@ def _build_schedule_entries(
         raw_arrival_seconds = current_clock_seconds + travel_seconds
         windows = time_windows_to_seconds(customer_time_windows_minutes(customer)) if use_time_windows else []
         _, wait_seconds, window_index, status = choose_time_window_for_arrival(raw_arrival_seconds, windows)
+        late_minutes = max(0.0, raw_arrival_seconds - windows[-1][1]) / 60 if windows else 0.0
+        if late_minutes:
+            status += f" · закъснение {late_minutes:.1f} мин"
         if status and len(windows) > 1 and window_index >= 0:
             status = f"{status} (прозорец {window_index + 1})"
         arrival_after_wait_seconds = raw_arrival_seconds + wait_seconds
@@ -1415,6 +1466,7 @@ def _build_schedule_entries(
                 "travel_time_minutes": travel_seconds / 60,
                 "service_time_minutes": visit_service_seconds / 60,
                 "wait_minutes": wait_seconds / 60,
+                "late_minutes": late_minutes,
                 "total_time_for_step": (travel_seconds + wait_seconds + visit_service_seconds) / 60,
                 "cumulative_time": total_time_seconds / 60,
                 "start_time_minutes": start_time_minutes,
@@ -1521,6 +1573,7 @@ def _schedule_entry_to_json(entry: Dict[str, Any]) -> Dict[str, Any]:
         "cumulative_distance_km": round(_parse_float(entry.get("cumulative_distance"), 0.0), 3),
         "travel_time_minutes": round(_parse_float(entry.get("travel_time_minutes"), 0.0), 2),
         "wait_minutes": round(_parse_float(entry.get("wait_minutes"), 0.0), 2),
+        "late_minutes": round(_parse_float(entry.get("late_minutes"), 0.0), 2),
         "comment": html.unescape(str(entry.get("delivery_comment", "") or "")),
     }
 

@@ -82,6 +82,8 @@ class StableReleaseContractTests(unittest.TestCase):
 @unittest.skipUnless(adapter.PYVRP_AVAILABLE and adapter.PYVRP_VERSION == PYVRP_NEXT_VERSION,
                      "Requires isolated stable PyVRP 0.14.0 environment")
 class NativeStable014Tests(unittest.TestCase):
+    backend_name = "pyvrp_experimental"
+    expected_version = "0.14.0"
     def test_dynamic_zone_discount_selects_target_vehicle_in_both_deferral_modes(self):
         from config import CenterZoneConfig, LocationConfig, VehicleType
         from tests.test_pyvrp_multitrip import DEPOT, make_config, make_customers, make_matrix, make_vehicle
@@ -96,7 +98,7 @@ class NativeStable014Tests(unittest.TestCase):
                     make_vehicle(config_id="preferred", vehicle_type=VehicleType.CENTER_BUS)]
         for strategy in ("legacy", "geographic"):
             with self.subTest(strategy=strategy):
-                config = make_config(enable_multiple_trips=False, solver_type="pyvrp_experimental",
+                config = make_config(enable_multiple_trips=False, solver_type=self.backend_name,
                                      customer_dropping_strategy=strategy, allow_customer_skipping=True,
                                      pyvrp_use_extended_operators=True)
                 solver = adapter.PyVRPSolver(config, vehicles, customers, make_matrix(customers),
@@ -163,13 +165,13 @@ class NativeStable014Tests(unittest.TestCase):
         locations = LocationConfig(depot_location=DEPOT)
         for strategy in ("legacy", "geographic"):
             with self.subTest(strategy=strategy):
-                config = make_config(solver_type="pyvrp_experimental", customer_dropping_strategy=strategy,
+                config = make_config(solver_type=self.backend_name, customer_dropping_strategy=strategy,
                                      enable_customer_time_windows=True, allow_customer_skipping=True,
                                      pyvrp_use_extended_operators=True, pyvrp_next_worker_path="",
                                      pyvrp_next_worker_timeout_seconds=30, pyvrp_next_fallback_to_stable=False)
                 solution = runtime.solve_cvrp_pyvrp_next(allocation, DEPOT, make_matrix(customers),
                                                        config, locations, [vehicle])
-                self.assertEqual("0.14.0", solution.solver_version)
+                self.assertEqual(self.expected_version, solution.solver_version)
                 self.assertFalse(solution.solver_fallback_used)
                 self.assertTrue(solution.is_feasible)
                 self.assertEqual([], solution.dropped_customers)

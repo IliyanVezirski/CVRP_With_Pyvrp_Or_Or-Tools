@@ -194,6 +194,7 @@ def portal_heading() -> str:
       <div><h2 class="visually-hidden" id="profileTitle">Тестове</h2>""" + portal_navigation() + """</div>
       <div class="profile-actions">
         <button class="primary" id="planButton" onclick="startRun()" disabled>Стартирай тест</button>
+        <button id="globalPlanButton" onclick="startRun(true)" disabled>Стартирай официално</button>
       </div>
     </div>
     """
@@ -233,8 +234,13 @@ def portal_exclusions_dialog() -> str:
       <p class="muted">Общи за тестовете и основното стартиране.</p>
       <label for="inExcludedCustomers">Клиентски номера</label>
       <textarea id="inExcludedCustomers" rows="5" placeholder="По един на ред или със запетая" autofocus></textarea>
+      <label for="inExcludedDocuments">Номера на документи (IdDoc)</label>
+      <textarea id="inExcludedDocuments" rows="4" placeholder="Напр. 0004536890 — по един на ред или със запетая"></textarea>
+      <p class="muted">Въведи целия номер с началните нули. Изключва се само посочената поръчка.</p>
       <label for="setDataExcludedGrafik">Направление</label>
       <input id="setDataExcludedGrafik" type="text" placeholder="Както необслужените">
+      <label><input id="sendExcludedCustomers" type="checkbox" style="width:auto"> Изпращай изключените през SetData</label>
+      <p class="muted">При включено изпращане на необслужените. В Excel остават и при изключена отметка.</p>
       <div id="exclusionsStatus" class="form-status" role="status"></div>
       <div class="actions"><button id="exclusionsCancel" onclick="closeExclusions()">Отказ</button>
       <button id="exclusionsSave" class="primary" onclick="saveExclusions()">Запази</button></div>
@@ -254,12 +260,16 @@ def portal_script() -> str:
     function updateExclusionButton() {
       $('excludedCustomersButton').disabled=!state;
       const ids=String((state.customer_exclusions || {}).customer_ids || '').split(/[\s,;]+/).filter(Boolean);
-      $('excludedCustomersCount').textContent=ids.length ? '· ' + new Set(ids).size : '';
+      const docs=String((state.customer_exclusions || {}).document_ids || '').split(/[\s,;]+/).filter(Boolean);
+      const count=new Set(ids).size + new Set(docs).size;
+      $('excludedCustomersCount').textContent=count ? '· ' + count : '';
     }
     function openExclusions() {
       if(!state)return;
       const saved=state.customer_exclusions || {};
       put('inExcludedCustomers',saved.customer_ids || '');
+      put('inExcludedDocuments',saved.document_ids || '');
+      put('sendExcludedCustomers',saved.send_enabled !== false);
       put('setDataExcludedGrafik',saved.direction || '');
       $('exclusionsStatus').textContent=saved.direction_conflict ? 'Има различни стари направления. Избери общото и запази.' : '';
       $('exclusionsDialog').showModal();
@@ -274,7 +284,8 @@ def portal_script() -> str:
       $('exclusionsStatus').textContent='';
       try {
         const result=await apiFetch('/customer-exclusions',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({customer_ids:value('inExcludedCustomers'),direction:value('setDataExcludedGrafik')})});
+          body:JSON.stringify({customer_ids:value('inExcludedCustomers'),direction:value('setDataExcludedGrafik'),
+            document_ids:value('inExcludedDocuments'),send_enabled:bool('sendExcludedCustomers')})});
         state.customer_exclusions=result.config.customer_exclusions;
         state.revision=result.config.revision;
         updateExclusionButton();
@@ -328,7 +339,7 @@ def portal_script() -> str:
       $('runSettingsSection').setAttribute('role','tabpanel');
       $('runSettingsSection').setAttribute('aria-labelledby',global ? 'globalProfileTab':'webProfileTab');
       $('profileTitle').textContent = global ? 'Основни настройки' : 'Тестове';
-      $('planButton').hidden = global;
+      $('planButton').hidden = false;
       $('globalStartActions').hidden = !global;
       updatePlanSummary();
       syncSupervisorActions();
@@ -382,13 +393,14 @@ def portal_script() -> str:
     }
     async function submitPlan(useGlobal=false) {
       if(!state || settingsSaveBusy || planStarting || (state.run_status && state.run_status.running)) return;
+      if(useGlobal && !confirm('Да стартирам ли официално с основните настройки? Ако изпращането е включено, резултатите ще бъдат изпратени към свързаната система.')) return;
       if(vehicleSettingsDirty) {
         const text='Първо запази промените по бусовете или ги отхвърли чрез „Обнови“.';
         setRunSettingsMessage(text,'bad');setVehicleSettingsMessage(text,'bad');
         if($('fleetSection').scrollIntoView)$('fleetSection').scrollIntoView({behavior:'smooth',block:'start'});
         return;
       }
-      const settings=useGlobal ? state.web_run_global_settings : collectRunSettings();
+      const settings=useGlobal ? state.web_run_global_settings : activeProfile === 'global' ? structuredClone(state.web_run_settings) : collectRunSettings();
       if(!useGlobal && bool('outClearUploadToken')) settings.output.route_maps_upload_token='';
       const payload={profile:useGlobal ? 'global':'web',run_settings:useGlobal ? {} : settings,expected_revision:state.revision};
       planStarting=true;syncSupervisorActions();

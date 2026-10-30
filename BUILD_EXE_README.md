@@ -17,6 +17,7 @@ cd "D:\Iliyan\bizant_source"
 
 - `Bizant.exe`;
 - `pyvrp-next\CVRP_PyVRP_Next_Worker.exe`;
+- `pyvrp-0141\CVRP_PyVRP_0141_Worker.exe`;
 - `vroom\CVRP_VROOM_Worker.exe`;
 - `vrp-rust\CVRP_VRP_Rust_Worker.exe`.
 

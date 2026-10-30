@@ -25,6 +25,7 @@ wheels/
 .venv/
 .venv-vroom/
 .venv-pyvrp-next/
+.venv-pyvrp-0141/
 .venv-vrp-rust/
 venv/
 ENV/

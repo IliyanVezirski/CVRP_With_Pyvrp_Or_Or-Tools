@@ -60,12 +60,14 @@ class ConfigGUI:
 
     SOLVER_LABELS = {
         "pyvrp": "PyVRP 0.13",
-        "pyvrp_experimental": "PyVRP 0.14",
+        "pyvrp_experimental": "PyVRP 0.14.0",
+        "pyvrp_0141": "PyVRP 0.14.1",
         "or_tools": "OR-Tools",
         "vroom": "VROOM 1.15",
         "vrp": "VRP-Rust (experimental)",
     }
     SOLVER_VALUES_BY_LABEL = {label: value for value, label in SOLVER_LABELS.items()}
+    SOLVER_VALUES_BY_LABEL["PyVRP 0.14"] = "pyvrp_experimental"  # Legacy GUI label.
 
     SECTION_LABELS = {
         "input": "Входни данни",
@@ -514,6 +516,9 @@ class ConfigGUI:
             self._set_control_enabled(key, tsp_windows_enabled)
 
         self._show_solver_fine_settings(current("cvrp.solver_type", "pyvrp"))
+        solver = current("cvrp.solver_type", "pyvrp")
+        solver = self.SOLVER_VALUES_BY_LABEL.get(solver, solver)
+        self._set_control_enabled("cvrp.pyvrp_next_fallback_to_stable", solver == "pyvrp_experimental")
         from customer_deferral import DEFERRAL_FIELDS, DEFERRAL_LABELS
         selected = current("cvrp.customer_dropping_strategy", DEFERRAL_LABELS["legacy"])
         geographic = selected in {"geographic", DEFERRAL_LABELS["geographic"]}
@@ -550,7 +555,7 @@ class ConfigGUI:
         pyvrp_parallel = getattr(self, "pyvrp_parallel_specific", None)
         ortools_parallel = getattr(self, "ortools_parallel_specific", None)
         if pyvrp_parallel is not None:
-            if solver_type in {"pyvrp", "pyvrp_experimental"}:
+            if solver_type in {"pyvrp", "pyvrp_experimental", "pyvrp_0141"}:
                 pyvrp_parallel.grid()
             else:
                 pyvrp_parallel.grid_remove()
@@ -971,7 +976,7 @@ class ConfigGUI:
         if solver_type not in set(config.CVRP_SOLVER_TYPES):
             errors.append((
                 "cvrp.solver_type",
-                "Решителят трябва да бъде pyvrp, pyvrp_experimental, or_tools, vroom или vrp.",
+                "Решителят трябва да бъде pyvrp, pyvrp_experimental, pyvrp_0141, or_tools, vroom или vrp.",
             ))
         if solver_type == "vroom" and self._parse_bool_value(
             values.get("cvrp.enable_multiple_trips", False)
@@ -1937,7 +1942,7 @@ tsp_daily_report_time                 -> api.tsp_daily_report_time
             (
                 "Solver настройки:",
                 """
-cvrp.solver_type                       pyvrp, pyvrp_experimental, or_tools, vroom или vrp
+cvrp.solver_type                       pyvrp, pyvrp_experimental, pyvrp_0141, or_tools, vroom или vrp
 cvrp.enable_multiple_trips             разрешава динамични допълнителни курсове
 cvrp.objective_metric                  distance = най-къси км, time = най-кратко време
 cvrp.time_objective_include_waiting    при time включва чакането в целия работен ден
@@ -5974,7 +5979,7 @@ setData не трябва да се пуска:
             self.SOLVER_LABELS.get(c.solver_type, c.solver_type),
             "combo",
             solver_options,
-                         tooltip="pyvrp = стабилната линия 0.13.x (минимум 0.13.4); pyvrp_experimental = 0.14 sidecar; or_tools = OR-Tools; vroom = official VROOM 1.15 sidecar (без повторни курсове); vrp = VRP-Rust experimental sidecar."); r += 1
+                         tooltip="pyvrp = 0.13.x; pyvrp_experimental = отделна 0.14.0; pyvrp_0141 = отделна 0.14.1; or_tools = OR-Tools; vroom = VROOM 1.15 (без повторни курсове); vrp = VRP-Rust experimental sidecar."); r += 1
         self._add_field(basic, r, "cvrp.objective_metric", "Цел на оптимизацията:", getattr(c, "objective_metric", "distance"),
                          "combo", ["distance", "time"],
                          tooltip="distance = най-къси километри. time = най-кратко време по OSRM/Valhalla duration матрицата."); r += 1
@@ -6044,16 +6049,24 @@ setData не трябва да се пуска:
 
         pyvrp_next, r = self._add_group(
             f,
-            "PyVRP 0.14.0 — стабилна версия",
-            "PyVRP 0.13.x остава отделна опция. Тези настройки са за стабилния 0.14.0 worker; конфигурационният ключ остава pyvrp_experimental.",
+            "PyVRP 0.14.0 / 0.14.1",
+            "Две отделни версии с общи правила. 0.14.1 не преминава автоматично към друг решител при грешка.",
         )
         self._add_field(
             pyvrp_next,
             r,
             "cvrp.pyvrp_next_worker_path",
-            "Worker път:",
+            "Worker път 0.14.0:",
             getattr(c, "pyvrp_next_worker_path", ""),
             tooltip="Празно = търси стандартния companion worker до приложението. Може да е отделен Python/EXE worker за PyVRP 0.14.",
+        ); r += 1
+        self._add_field(
+            pyvrp_next,
+            r,
+            "cvrp.pyvrp_0141_worker_path",
+            "Worker път 0.14.1:",
+            getattr(c, "pyvrp_0141_worker_path", ""),
+            tooltip="Празно = отделният worker в pyvrp-0141 до приложението.",
         ); r += 1
         self._add_field(
             pyvrp_next,
@@ -6067,10 +6080,10 @@ setData не трябва да се пуска:
             pyvrp_next,
             r,
             "cvrp.pyvrp_next_fallback_to_stable",
-            "Fallback към stable:",
+            "Резервна 0.13 (само за 0.14.0):",
             getattr(c, "pyvrp_next_fallback_to_stable", False),
             "bool",
-            tooltip="Ако experimental worker-ът липсва или се провали, използва стабилния PyVRP 0.13. Изключено = ясна грешка без скрита подмяна.",
+            tooltip="Само за 0.14.0: при техническа грешка позволява резервна 0.13. Версия 0.14.1 не използва тази опция.",
         ); r += 1
 
         vroom_group, r = self._add_group(
@@ -6316,6 +6329,7 @@ setData не трябва да се пуска:
         self.solver_fine_panels = {
             "pyvrp": (pyvrp_quality, pyvrp_penalty, parallel),
             "pyvrp_experimental": (pyvrp_quality, pyvrp_penalty, pyvrp_next, parallel),
+            "pyvrp_0141": (pyvrp_quality, pyvrp_penalty, pyvrp_next, parallel),
             "or_tools": (ortools, parallel),
             "vroom": (vroom_group,),
             "vrp": (vrp_group,),
@@ -7110,10 +7124,11 @@ setData не трябва да се пуска:
                         tooltip="Колко силно чакането влияе на TSP подреждането. 0 = почти не го интересува чакането."); r += 1
         self._add_field(tsp_optimization, r, "api.tsp_time_window_late_weight", "Тежест закъснение:", getattr(api, "tsp_time_window_late_weight", 20.0), "float",
                         tooltip="Колко силно закъснението след работно време влияе на TSP подреждането. По-високо = по-строго."); r += 1
-        self._add_field(tsp_optimization, r, "api.tsp_enable_two_opt", "2-opt подобрение:", getattr(api, "tsp_enable_two_opt", True), "bool",
-                        tooltip="Прави допълнително локално подобрение след първоначалното greedy подреждане."); r += 1
-        self._add_field(tsp_optimization, r, "api.tsp_two_opt_max_passes", "2-opt обходи:", getattr(api, "tsp_two_opt_max_passes", 30), "int",
-                        tooltip="Повече обходи могат леко да подобрят реда, но забавят TSP при много клиенти."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_search_seconds", "Търсене с PyVRP (сек):", getattr(api, "tsp_search_seconds", 10.0), "float",
+                        tooltip="От 1 до 120 секунди. PyVRP подрежда всички клиенти; неизбежните закъснения се отбелязват."); r += 1
+        self._add_field(tsp_optimization, r, "api.tsp_solver_type", "Версия на PyVRP за TSP:", getattr(api, "tsp_solver_type", "pyvrp_experimental"), "combo",
+                        options=["pyvrp_experimental", "pyvrp_0141"],
+                        tooltip="pyvrp_experimental = 0.14.0; pyvrp_0141 = 0.14.1. Правилата са еднакви."); r += 1
         self._add_field(tsp_optimization, r, "api.tsp_worker_timeout_seconds", "Worker timeout (сек):", getattr(api, "tsp_worker_timeout_seconds", 30), "int",
                         tooltip="Максимално време за отделния TSP процес, когато основният CVRP solver вече работи."); r += 1
 
@@ -7951,6 +7966,7 @@ TSP имената на полетата се настройват от GUI:
             "cvrp.pyvrp_penalty_min": ("pyvrp_penalty_min", "float"),
             "cvrp.pyvrp_penalty_max": ("pyvrp_penalty_max", "float"),
             "cvrp.pyvrp_next_worker_path": ("pyvrp_next_worker_path", "str"),
+            "cvrp.pyvrp_0141_worker_path": ("pyvrp_0141_worker_path", "str"),
             "cvrp.pyvrp_next_worker_timeout_seconds": ("pyvrp_next_worker_timeout_seconds", "int"),
             "cvrp.pyvrp_next_fallback_to_stable": ("pyvrp_next_fallback_to_stable", "bool"),
             "cvrp.vroom_worker_path": ("vroom_worker_path", "str"),
@@ -8032,6 +8048,8 @@ TSP имената на полетата се настройват от GUI:
             "api.web_gui_trusted_proxy_ips": ("web_gui_trusted_proxy_ips", "str"),
             "api.tsp_default_service_time_minutes": ("tsp_default_service_time_minutes", "int"),
             "api.tsp_objective_metric": ("tsp_objective_metric", "str"),
+            "api.tsp_search_seconds": ("tsp_search_seconds", "float"),
+            "api.tsp_solver_type": ("tsp_solver_type", "str"),
             "api.tsp_use_time_windows": ("tsp_use_time_windows", "bool"),
             "api.tsp_time_window_wait_weight": ("tsp_time_window_wait_weight", "float"),
             "api.tsp_time_window_late_weight": ("tsp_time_window_late_weight", "float"),
@@ -8255,6 +8273,21 @@ TSP имената на полетата се настройват от GUI:
     def _replace_field_value(self, content, field_name, raw_val, ftype):
         """Замества стойността на поле в config.py"""
         import re
+        if field_name in {"tsp_solver_type", "pyvrp_0141_worker_path"}:
+            if field_name == "tsp_solver_type":
+                from tsp_pyvrp import selected_backend
+                from types import SimpleNamespace
+                selected_backend(SimpleNamespace(tsp_solver_type=raw_val))
+            if not re.search(rf"\b{field_name}\s*:", content):
+                cls = "APIConfig" if field_name == "tsp_solver_type" else "CVRPConfig"
+                content = re.sub(rf"(class {cls}:[^\n]*\n)",
+                                 rf'\g<1>    {field_name}: str = ""\n', content, count=1)
+        if field_name == "tsp_search_seconds":
+            from tsp_pyvrp import search_seconds
+            search_seconds({"tsp_search_seconds": raw_val}, None)
+            if not re.search(r"\btsp_search_seconds\s*:", content):
+                content = re.sub(r"(class APIConfig:[^\n]*\n)",
+                                 r"\1    tsp_search_seconds: float = 10.0\n", content, count=1)
 
         if ftype == "bool":
             new_val = "True" if raw_val else "False"

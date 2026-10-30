@@ -16,6 +16,7 @@ import math
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
+from copy import deepcopy
 import logging
 import importlib
 import config
@@ -56,8 +57,34 @@ def mark_excluded_customers(customers, input_config):
     excluded = set(normalise_excluded_customer_ids(
         getattr(input_config, "excluded_customer_ids", "")
     ).splitlines())
+    documents = set(normalise_excluded_customer_ids(
+        getattr(input_config, "excluded_document_ids", "")
+    ).splitlines())
+    partitioned = []
     for customer in customers:
-        customer.manually_excluded = str(customer.id).strip() in excluded
+        by_customer = str(customer.id).strip() in excluded
+        source_docs = list(getattr(customer, "grouped_documents", None) or [])
+        excluded_docs = [d for d in source_docs if str(d.get("document", "")).strip() in documents]
+        if not by_customer and excluded_docs and len(excluded_docs) < len(source_docs):
+            # Also support already-grouped input supplied directly to a run.
+            # Never remove all orders of a customer for a single excluded IdDoc.
+            for selected, flag in (([d for d in source_docs if d not in excluded_docs], False),
+                                   (excluded_docs, True)):
+                visit = deepcopy(customer)
+                visit.grouped_documents = deepcopy(selected)
+                visit.volume = sum(float(d.get("volume", 0) or 0) for d in selected)
+                for attr in ("document", "plas_doc", "source_id_skld"):
+                    setattr(visit, attr, _unique_join([d.get(attr, "") for d in selected]))
+                visit.mandatory = any(_parse_mandatory_flag(d.get("mandatory", False)) for d in selected)
+                service = [d.get("service_time_minutes") for d in selected if d.get("service_time_minutes") is not None]
+                visit.service_time_minutes = max(service) if service else None
+                visit.manually_excluded = flag
+                partitioned.append(visit)
+        else:
+            customer.manually_excluded = by_customer or bool(excluded_docs) or (
+                not source_docs and str(getattr(customer, "document", "")).strip() in documents)
+            partitioned.append(customer)
+    customers[:] = partitioned
 
 
 def shared_customer_exclusions(config):
@@ -75,9 +102,13 @@ def shared_customer_exclusions(config):
     old_send = legacy.get("set_data") if isinstance(legacy.get("set_data"), dict) else {}
     ids = normalise_excluded_customer_ids(getattr(getattr(config, "input", None), "excluded_customer_ids", ""))
     old_ids = normalise_excluded_customer_ids(old_input.get("excluded_customer_ids", ""))
+    documents = normalise_excluded_customer_ids(getattr(getattr(config, "input", None), "excluded_document_ids", ""))
+    old_documents = normalise_excluded_customer_ids(old_input.get("excluded_document_ids", ""))
     direction = str(getattr(getattr(config, "set_data", None), "set_data_excluded_id_grafik", "") or "").strip()
     old_direction = str(old_send.get("set_data_excluded_id_grafik", "") or "").strip()
     return {"customer_ids": normalise_excluded_customer_ids(ids + "\n" + old_ids),
+            "document_ids": normalise_excluded_customer_ids(documents + "\n" + old_documents),
+            "send_enabled": bool(getattr(getattr(config, "set_data", None), "enable_excluded_set_data_upload", True)),
             "direction": direction or old_direction,
             "direction_conflict": bool(direction and old_direction and direction != old_direction)}
 
@@ -736,6 +767,7 @@ class InputHandler:
         from copy import copy
         self.config = copy(main_config.input)
         self.config.excluded_customer_ids = shared_customer_exclusions(main_config)["customer_ids"]
+        self.config.excluded_document_ids = shared_customer_exclusions(main_config)["document_ids"]
     
     def load_data(self, file_path: Optional[str] = None) -> InputData:
         """Зарежда данни от файл или HTTP JSON"""
@@ -1173,6 +1205,7 @@ class InputHandler:
 
     def _group_customer_documents(self, customers: List[Customer], source_label: str) -> List[Customer]:
         """Group multiple documents for the same customer/location into one delivery stop."""
+        mark_excluded_customers(customers, self.config)
         if not bool(getattr(self.config, "enable_customer_document_grouping", True)):
             return customers
 
@@ -1190,6 +1223,7 @@ class InputHandler:
                 customer_id.lower(),
                 round(float(customer.coordinates[0]), 6),
                 round(float(customer.coordinates[1]), 6),
+                customer.manually_excluded,
             )
             if key not in grouped:
                 customer.grouped_documents = self._normalise_grouped_documents(customer)

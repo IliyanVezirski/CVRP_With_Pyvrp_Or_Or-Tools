@@ -52,7 +52,7 @@ function change(id,val){if(typeof val === 'boolean')$(id).checked=val;else $(id)
   assert.equal($('webProfileTab').textContent,'Тестове');
   assert.equal($('pageTitle').textContent,'Bizant');
   assert.equal($('divisionPath').textContent,'/hell','Show the configured GUI path, not the browser alias');
-  assert.equal(document.querySelectorAll('dialog').length,1);
+  assert.equal(document.querySelectorAll('dialog').length,2);
   assert.equal($('exclusionsDialog').hasAttribute('open'),false);
   assert.equal($('serverLine').textContent,'');
   assert.equal(document.querySelector('.profile-summary'),null);
@@ -270,7 +270,7 @@ function change(id,val){if(typeof val === 'boolean')$(id).checked=val;else $(id)
   controls.switchProfile('global');
   assert.equal($('profileChangeCount').textContent,'','A clean profile must not inherit the other profile change count');
   assert.equal($('profileTitle').textContent,'Основни настройки');
-  assert.equal($('planButton').hidden,true);
+  assert.equal($('planButton').hidden,false);
   assert.equal($('globalStartActions').hidden,false);
   assert.notEqual($('inWarehouses').value,'UNSAVED WEB');
   change('inWarehouses','UNSAVED GLOBAL');
@@ -330,7 +330,7 @@ function change(id,val){if(typeof val === 'boolean')$(id).checked=val;else $(id)
   controls.setStatus(logData.run_status);await new Promise(setImmediate);
   await controls.startRun(true);
   assert.deepEqual(JSON.parse(runRequests().at(-1).options.body),{profile:'global',run_settings:{},expected_revision:'synthetic-revision'});
-  assert.equal(confirmationCount,confirmationsBeforeStart);
+  assert.equal(confirmationCount,confirmationsBeforeStart+1);
   assert.deepEqual(scrollCalls,[]);
   logData.run_status={running:false,status:'completed'};
   controls.setStatus(logData.run_status);await new Promise(setImmediate);

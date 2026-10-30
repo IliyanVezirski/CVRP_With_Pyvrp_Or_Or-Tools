@@ -552,7 +552,7 @@ def solve_cvrp_worker(worker_args: Tuple[WarehouseAllocation, Dict, Dict, Distan
             default_used="pyvrp",
             default_version=_installed_package_version("pyvrp"),
         )
-    elif solver_type in {"pyvrp_experimental", "pyvrp_one"}:
+    elif solver_type in {"pyvrp_experimental", "pyvrp_0141", "pyvrp_one"}:
         solution = solve_cvrp_pyvrp_next(
             allocation=warehouse_allocation,
             depot_location=location_config.depot_location,
@@ -900,6 +900,15 @@ def run_optimization(
     logger = logging.getLogger(__name__)
     
     config = get_config()
+
+    if not getattr(config, '_fleet_operations_applied', False):
+        from fleet_automation import read as read_fleet_operations, effective as effective_fleet
+        operations = read_fleet_operations()
+        if operations['locations'] or operations['calendar']['enabled'] or any(v.get('enabled') for v in operations['flexible'].values()):
+            adjusted, fleet_info = effective_fleet(config, operations)
+            adjusted._fleet_operations_applied = True
+            logger.info('Действащи настройки на бусовете за %s: %s', fleet_info['date'], fleet_info['notes'])
+            return run_optimization(input_file, input_data_override, adjusted)
 
     from customer_deferral import (geographic_enabled, prepare_customer_depots,
                                    validate_deferral_config, solution_selection_key)

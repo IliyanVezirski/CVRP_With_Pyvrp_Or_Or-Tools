@@ -30,12 +30,15 @@ from customer_deferral import GEOGRAPHIC_CAPABILITY
 from service_time import SERVICE_FORMULA_CAPABILITY
 from pyvrp_next_version import PYVRP_NEXT_VERSION
 from pyvrp_backends import STABLE
+from tsp_pyvrp import TSP_CAPABILITY
 
 
 PROTOCOL_VERSION = 1
 WORKER_PROTOCOL_BACKEND = "pyvrp_next"
 REQUIRED_PYVRP_VERSION_PREFIX = "0.14"
 WORKER_CAPABILITIES = {
+    "tsp_persistent_v1": True,
+    TSP_CAPABILITY: True,
     'physical_bus_schedules_v1': True,
     SERVICE_FORMULA_CAPABILITY: True,
     HARD_MANDATORY_CUSTOMERS_CAPABILITY: True,
@@ -123,6 +126,7 @@ def self_check(backend=STABLE) -> int:
         version = _pyvrp_version(backend)
         # Advertise the capability only after its module/native imports work.
         importlib.import_module("pyvrp_deferral_search")
+        importlib.import_module("tsp_pyvrp")
         adapter = importlib.import_module("pyvrp_solver")
         if not adapter.PYVRP_AVAILABLE or adapter.PYVRP_VERSION != version:
             raise WorkerValidationError("PyVRP solver adapter is not compatible with this runtime")
@@ -311,6 +315,68 @@ def run_worker(input_path: str, output_path: str, backend=STABLE) -> int:
         return 1
 
 
+def run_tsp_worker(input_path: str, output_path: str, backend=STABLE) -> int:
+    request_id = ""
+    version = ""
+    try:
+        version = _pyvrp_version(backend)
+        request = json.loads(Path(input_path).read_text(encoding="utf-8"))
+        request_id = request.get("request_id", "")
+        if request.get("kind") != TSP_CAPABILITY or not request_id:
+            raise WorkerValidationError("Invalid TSP request envelope")
+        from tsp_pyvrp import solve_native
+        result = dict(ok=True, **solve_native(request["payload"]))
+    except Exception as exc:
+        result = dict(ok=False, error=str(exc))
+        traceback.print_exc()
+    result.update(kind=TSP_CAPABILITY, request_id=request_id, solver_version=version)
+    Path(output_path).write_text(json.dumps(result, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    return 0 if result["ok"] else 1
+
+
+def serve_tsp(backend=STABLE) -> int:
+    """Load native libraries once; all transport stays on inherited private pipes."""
+    import contextlib
+    import queue
+    import threading
+    from tsp_pyvrp_runtime import PROTOCOL
+    from tsp_pyvrp import solve_native
+    version = _pyvrp_version(backend)
+    protocol_output = sys.stdout
+    sys.stdin.reconfigure(encoding="utf-8")
+    # Keep progress, warnings and accidental prints away from the JSON protocol.
+    with contextlib.redirect_stdout(sys.stderr):
+        import pyvrp
+        from pyvrp.IteratedLocalSearch import IteratedLocalSearchParams
+        from pyvrp.stop import MaxRuntime
+    def send(message):
+        message.update(protocol=PROTOCOL, solver_version=version)
+        protocol_output.write(json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n")
+        protocol_output.flush()
+    requests = queue.Queue()
+    def read_requests():
+        for line in sys.stdin:
+            requests.put(line)
+        # Parent closed its pipe or died. Also stops a currently hung native solve.
+        os._exit(0)
+    threading.Thread(target=read_requests, daemon=True).start()
+    send(dict(kind="ready", pid=os.getpid()))
+    while True:
+        request_id = ""
+        try:
+            request = json.loads(requests.get())
+            request_id = request.get("request_id", "")
+            if request.get("protocol") != PROTOCOL or not request_id:
+                raise WorkerValidationError("Invalid persistent TSP request")
+            with contextlib.redirect_stdout(sys.stderr):
+                result = dict(ok=True, **solve_native(request["payload"]))
+        except Exception as exc:
+            result = dict(ok=False, error=str(exc))
+            traceback.print_exc(file=sys.stderr)
+        result.update(kind=TSP_CAPABILITY, request_id=request_id)
+        send(result)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Experimental PyVRP 0.14 worker")
     parser.add_argument(
@@ -320,6 +386,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input_pickle", nargs="?")
     parser.add_argument("output_pickle", nargs="?")
+    parser.add_argument("--tsp", action="store_true", help="Solve a single-driver TSP JSON request.")
+    parser.add_argument("--tsp-serve", action="store_true", help="Persistent private JSON-pipe TSP worker.")
     return parser
 
 
@@ -328,9 +396,13 @@ def main(argv: list[str] | None = None, *, backend=STABLE) -> int:
     args = _build_parser().parse_args(argv)
     if args.self_check:
         return self_check(backend)
+    if args.tsp_serve:
+        return serve_tsp(backend)
     if not args.input_pickle or not args.output_pickle:
         print("input_pickle and output_pickle are required", file=sys.stderr)
         return 2
+    if args.tsp:
+        return run_tsp_worker(args.input_pickle, args.output_pickle, backend)
     return run_worker(args.input_pickle, args.output_pickle, backend)
 
 

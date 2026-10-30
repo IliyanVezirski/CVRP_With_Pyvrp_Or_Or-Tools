@@ -27,7 +27,13 @@ ALPHA = PyVRPBackend(
     "pyvrp-one", "pyvrp_one_worker.py", "CVRP_PyVRP_One_Worker.exe",
     "pyvrp_one_worker_path", "2c1b582e7ea9bb4cc8cd986f784d4c25b9ebdd1b",
 )
+PATCH_0141 = PyVRPBackend(
+    "pyvrp_0141", "pyvrp_0141", "0.14.1", "0.14",
+    "pyvrp-0141", "pyvrp_0141_worker.py", "CVRP_PyVRP_0141_Worker.exe",
+    "pyvrp_0141_worker_path",
+)
 
 
 def backend_for(config):
-    return ALPHA if getattr(config, "solver_type", "") == ALPHA.public else STABLE
+    name = getattr(config, "solver_type", "")
+    return {ALPHA.public: ALPHA, PATCH_0141.public: PATCH_0141}.get(name, STABLE)

@@ -24,7 +24,7 @@ def validate_deferral_config(config):
         raise ValueError("Начин на пропускане: legacy (обем и близост) или geographic (географски приоритет).")
     if not geographic_enabled(config):
         return
-    if config.solver_type not in {"pyvrp_experimental", "pyvrp_one"}:
+    if config.solver_type not in {"pyvrp_experimental", "pyvrp_0141", "pyvrp_one"}:
         raise ValueError("Новото географско пропускане изисква PyVRP 0.14 или 1.x.")
     for name, low, high in (
         ("drop_geo_reference_km", 1, 1000),

@@ -15,8 +15,8 @@ from enum import Enum
 # Public solver identifiers shared by the desktop GUI, Web/API validation and
 # the runtime dispatcher.  The stable PyVRP backend intentionally remains the
 # default; the experimental backend is executed by an isolated sidecar.
-CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "pyvrp_one", "or_tools", "vroom", "vrp")
-PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental", "pyvrp_one"})
+CVRP_SOLVER_TYPES = ("pyvrp", "pyvrp_experimental", "pyvrp_0141", "pyvrp_one", "or_tools", "vroom", "vrp")
+PYVRP_SOLVER_TYPES = frozenset({"pyvrp", "pyvrp_experimental", "pyvrp_0141", "pyvrp_one"})
 
 
 # --- Path Configuration ---
@@ -797,6 +797,7 @@ class InputConfig:
     mandatory_column: str = "Задължителен"  # Optional Excel колона: true/false, 1/0 или да/не.
     enable_customer_document_grouping: bool = True  # Групира няколко документа за един и същ клиент/GPS в едно посещение.
     excluded_customer_ids: str = ""  # Клиентски номера, изпращани директно към необслужените.
+    excluded_document_ids: str = ""  # Точни номера на документи (IdDoc), със запазени водещи нули.
     sheet_name: Optional[str] = None  # Име на листа в Excel файла. Ако е None, използва се първият наличен.
     encoding: str = "utf-8"           # Кодировка на файла.
 
@@ -960,6 +961,7 @@ class CVRPConfig:
 
     # --- Experimental PyVRP 0.14 sidecar ---
     pyvrp_next_worker_path: str = ""
+    pyvrp_0141_worker_path: str = ""
     # Isolated, pinned 1.x alpha. Never replaces either existing PyVRP runtime.
     pyvrp_one_worker_path: str = ""
     # Празно = runtime-ът търси стандартния companion worker до приложението.
@@ -1146,6 +1148,8 @@ class APIConfig:
     tsp_default_service_time_minutes: int = 8  # TSP service time по подразбиране, ако POST не подаде service_time_minutes.
     tsp_objective_metric: str = "time"  # TSP цел по подразбиране: time или distance.
     tsp_use_time_windows: bool = True  # Дали TSP подреждането да отчита работното време на клиентите.
+    tsp_search_seconds: float = 10.0  # Време за търсене с PyVRP за текущия маршрут.
+    tsp_solver_type: str = "pyvrp_experimental"  # pyvrp_experimental=0.14.0; pyvrp_0141=0.14.1.
     tsp_time_window_wait_weight: float = 1.0  # Тежест на чакането при TSP greedy подреждане.
     tsp_time_window_late_weight: float = 20.0  # Тежест на закъснението след работно време при TSP greedy подреждане.
     tsp_enable_two_opt: bool = True  # Включва 2-opt подобрение след първоначалното TSP подреждане.
@@ -1204,6 +1208,7 @@ class SetDataConfig:
     set_data_unserved_final_done_flag: str = "1973"  # Финален DoneFlag само за необслужените; празно = общият set_data_done_flag.
     set_data_unserved_id_grafik: str = "1004501000"  # IdGrafik за необслужени клиенти, ако няма шаблон.
     set_data_excluded_id_grafik: str = ""  # Отделно направление за ръчно изключените; празно = текущото за необслужени.
+    enable_excluded_set_data_upload: bool = True  # Допълнителна защита: не изпращай ръчно изключените, когато е False.
     set_data_unserved_id_grafik_template: str = "{id_grafik}"  # Шаблон за IdGrafik на необслужени.
     set_data_unserved_bukva_template: str = "HOF1-{stop_number}"  # Шаблон за Bukva на необслужени клиенти.
     enable_missing_gps_set_data_upload: bool = True  # Отделно изпращане на заявките без въведени GPS.

@@ -32,7 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 from pyvrp_next_version import PYVRP_NEXT_VERSION
-from pyvrp_backends import STABLE, ALPHA, backend_for
+from pyvrp_backends import STABLE, ALPHA, PATCH_0141, backend_for
 
 
 PROTOCOL_VERSION = 1
@@ -198,9 +198,9 @@ def validate_mandatory_customer_solution(
         labels.setdefault(mandatory_visit_fingerprint(customer), _customer_label(customer))
 
     problems: list[str] = []
-    excluded_ids = {str(c.id).strip() for c in warehouse_customers
+    excluded_ids = {mandatory_visit_fingerprint(c) for c in warehouse_customers
                     if getattr(c, "manually_excluded", False)}
-    if any(str(c.id).strip() in excluded_ids or getattr(c, "manually_excluded", False)
+    if any(mandatory_visit_fingerprint(c) in excluded_ids or getattr(c, "manually_excluded", False)
            for c in served_customers):
         problems.append("Ръчно изключен клиент е включен в маршрут.")
     if warehouse_mandatory:
@@ -335,6 +335,25 @@ def _dist_worker_candidates() -> list[Path]:
 
 def _resolve_worker_command(config: Any) -> list[str]:
     """Resolve the worker without ever falling back to the stable interpreter."""
+    if backend_for(config) == PATCH_0141:
+        explicit = _normalise_path(getattr(config, PATCH_0141.path_setting, ""))
+        if explicit is not None:
+            return _command_for_explicit_worker(explicit)
+        if not getattr(sys, "frozen", False):
+            python = PROJECT_DIR / ".venv-pyvrp-0141" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            script = PROJECT_DIR / PATCH_0141.script
+            if python.is_file() and script.is_file():
+                return [str(python), str(script)]
+        root = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                else PROJECT_DIR.parent / "dist")
+        for candidate in (root / PATCH_0141.directory / PATCH_0141.executable,
+                          root / PATCH_0141.directory / Path(PATCH_0141.executable).stem / PATCH_0141.executable):
+            if candidate.is_file():
+                return [str(candidate)]
+        raise PyVRPNextRuntimeError(
+            "PyVRP 0.14.1 не е инсталиран. Изпълнете setup_pyvrp_0141.py и "
+            "build_pyvrp_0141_worker.py. Друг решител няма да бъде използван автоматично."
+        )
     if backend_for(config) == ALPHA:
         explicit = _normalise_path(getattr(config, ALPHA.path_setting, ""))
         if explicit is not None:
@@ -876,7 +895,7 @@ def solve_cvrp_pyvrp_next(
             vehicle_configs,
         )
     except PyVRPNextRuntimeError as exc:
-        if backend_for(config) == ALPHA or geographic_enabled(config) or not bool(getattr(config, "pyvrp_next_fallback_to_stable", False)):
+        if backend_for(config) in (ALPHA, PATCH_0141) or geographic_enabled(config) or not bool(getattr(config, "pyvrp_next_fallback_to_stable", False)):
             raise
         return _solve_with_stable_fallback(
             allocation,

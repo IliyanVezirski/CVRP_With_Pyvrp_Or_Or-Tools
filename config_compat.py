@@ -39,6 +39,50 @@ def ensure_vehicle_schema(source: str) -> str:
 
 def compile_external_config(source: str, filename: str):
     source = ensure_vehicle_schema(source)
+    # Add new solver choices/fields in memory only. Existing saved values win.
+    tree = ast.parse(source)
+    additions = {
+        "CVRPConfig": {
+            "pyvrp_0141_worker_path": ('str', ''),
+            # Older installations predate geographic deferral. Keep their
+            # original policy; supply only the missing schema in memory.
+            "customer_dropping_strategy": ('str', 'legacy'),
+            "drop_geo_reference_km": ('float', 20.0),
+            "drop_geo_strength": ('float', 1.0),
+            "drop_repair_max_ejections": ('int', 6),
+            "drop_repair_budget_fraction": ('float', 0.15),
+        },
+        "APIConfig": {"tsp_solver_type": ('str', 'pyvrp_experimental')},
+        "InputConfig": {"excluded_document_ids": ('str', '')},
+        "SetDataConfig": {"enable_excluded_set_data_upload": ('bool', True)},
+    }
+    for node in reversed(tree.body):
+        if isinstance(node, ast.ClassDef) and node.name in additions:
+            fields = {item.target.id for item in node.body
+                      if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)}
+            missing = {k:v for k,v in additions[node.name].items() if k not in fields}
+            if missing:
+                lines = source.splitlines(keepends=True)
+                before = ''.join(lines[:node.end_lineno]).rstrip('\r\n')
+                extra = ''.join(f'\n    {k}: {v[0]} = {v[1]!r}' for k,v in missing.items())
+                source = before + extra + '\n' + ''.join(lines[node.end_lineno:])
+    source += '\n' + '\n'.join([
+        'if "CVRP_SOLVER_TYPES" in globals() and "pyvrp_0141" not in CVRP_SOLVER_TYPES:',
+        '    CVRP_SOLVER_TYPES = tuple(CVRP_SOLVER_TYPES) + ("pyvrp_0141",)',
+        'if "PYVRP_SOLVER_TYPES" in globals():',
+        '    PYVRP_SOLVER_TYPES = frozenset(PYVRP_SOLVER_TYPES) | {"pyvrp_0141"}',
+    ]) + '\n'
+    # Runtime-only schema upgrade; deployment never rewrites saved settings.
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "APIConfig":
+            fields = {item.target.id for item in node.body
+                      if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)}
+            if "tsp_search_seconds" not in fields:
+                lines = source.splitlines(keepends=True)
+                before = "".join(lines[:node.end_lineno]).rstrip("\r\n")
+                source = before + '\n    tsp_search_seconds: float = 10.0\n' + "".join(lines[node.end_lineno:])
+            break
     tree = ast.parse(source)
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "InputConfig":

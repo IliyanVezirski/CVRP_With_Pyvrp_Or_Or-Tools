@@ -74,8 +74,10 @@ class SolverGuiPanelsTests(unittest.TestCase):
 
     def test_every_solver_has_a_web_panel_and_safe_runtime_fields(self):
         page = api._web_gui_html(config.get_config().api, "127.0.0.1", 8085)
-        for solver in config.CVRP_SOLVER_TYPES:
-            self.assertIn(solver, page)
+        # The unfinished 1.x alpha is a runtime-only backend, not a UI choice.
+        # Desktop and Web expose the same supported choices, including 0.14.1.
+        for solver in ConfigGUI.SOLVER_LABELS:
+            self.assertIn(f'<option value="{solver}">', page)
         for field_id in (
             "pyvrpNumNeighbours",
             "pyvrpNextTimeout",

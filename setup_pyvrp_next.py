@@ -28,6 +28,7 @@ from pyvrp_next_version import PYVRP_NEXT_VERSION
 
 PROJECT_DIR = Path(__file__).resolve().parent
 NEXT_VENV_DIR = PROJECT_DIR / ".venv-pyvrp-next"
+BUILD_SCRIPT = "build_pyvrp_next_worker.py"
 PYVRP_REQUIREMENT = re.compile(r"^\s*pyvrp(?:\[|\s|[<>=!~@])", re.IGNORECASE)
 COMMIT_HASH = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -100,7 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--python",
         default=_default_base_python(),
-        help="Base Python used to create .venv-pyvrp-next.",
+        help=f"Base Python used to create {NEXT_VENV_DIR.name}.",
     )
     parser.add_argument(
         "--skip-project-requirements",
@@ -177,12 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     _run([str(python_exe), "-m", "pip", "install", "--upgrade", "pyinstaller"])
 
     version = _verify_environment(python_exe)
-    print(f"Stable 0.14 environment ready: PyVRP {version}")
+    print(f"Isolated environment ready: PyVRP {version}")
     print(f"Python: {python_exe}")
     print(
         "Next: run \""
         + str(python_exe)
-        + "\" build_pyvrp_next_worker.py"
+        + "\" " + BUILD_SCRIPT
     )
     return 0
 

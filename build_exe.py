@@ -497,6 +497,29 @@ def build_pyvrp_next_worker() -> bool:
     return True
 
 
+def build_pyvrp_0141_worker() -> bool:
+    """Build the additional pinned runtime without replacing the 0.14.0 worker."""
+    from pyvrp_backends import PATCH_0141
+    python = PROJECT_DIR / ".venv-pyvrp-0141" / "Scripts" / "python.exe"
+    executable = DIST_DIR / PATCH_0141.directory / PATCH_0141.executable
+    if not python.is_file():
+        print('Missing PyVRP 0.14.1 environment. Run setup_pyvrp_0141.py first.')
+        return False
+    try:
+        _run([str(python), str(PROJECT_DIR / 'build_pyvrp_0141_worker.py')])
+        result = subprocess.run([str(executable), '--self-check'], capture_output=True,
+                                text=True, encoding='utf-8', timeout=180, check=True)
+        from pyvrp_next_runtime import _validate_worker_metadata
+        metadata = _parse_last_json_line(result.stdout)
+        if metadata.get('ok') is not True or metadata.get('kind') != 'self_check':
+            raise RuntimeError('Invalid 0.14.1 worker self-check')
+        _validate_worker_metadata(metadata, context='build', backend=PATCH_0141)
+        return True
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        print(f'PyVRP 0.14.1 build failed: {exc}')
+        return False
+
+
 def verify_vroom_worker() -> str:
     """Run the frozen VROOM sidecar self-check and return its pyvroom version."""
     if not VROOM_WORKER.is_file():
@@ -789,6 +812,10 @@ def main() -> int:
             f"Build is incomplete: {MAIN_EXE_FILENAME} was created, but the required "
             "PyVRP 0.14 companion worker was not built successfully."
         )
+        return 1
+
+    if not build_pyvrp_0141_worker():
+        print('Build incomplete: required PyVRP 0.14.1 companion worker is missing.')
         return 1
 
     if not build_vroom_worker():

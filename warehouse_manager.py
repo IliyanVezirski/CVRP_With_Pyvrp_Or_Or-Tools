@@ -83,8 +83,10 @@ class WarehouseManager:
         # Изчисляване на общия капацитет
         from input_handler import mark_excluded_customers, shared_customer_exclusions
         from types import SimpleNamespace
+        exclusions = shared_customer_exclusions(self.main_config)
         mark_excluded_customers(input_data.customers, SimpleNamespace(
-            excluded_customer_ids=shared_customer_exclusions(self.main_config)["customer_ids"]))
+            excluded_customer_ids=exclusions["customer_ids"],
+            excluded_document_ids=exclusions["document_ids"]))
         excluded = [c for c in input_data.customers if c.manually_excluded]
         missing_gps = [c for c in input_data.customers if customer_has_missing_gps(c) and not c.manually_excluded]
         route_customers = [c for c in input_data.customers if not customer_has_missing_gps(c) and not c.manually_excluded]

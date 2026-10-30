@@ -669,8 +669,33 @@ def _compact_map_controls_css() -> str:
     return """
       .route-client-panel[hidden], .multi-course-panel[hidden], #route-filter .client-panel[hidden], .driver-panel-toggle[hidden] {display:none !important;}
       .driver-panel-toggle {border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#172b4d; padding:10px 14px; min-height:44px; font:600 14px Arial,sans-serif; cursor:pointer; box-shadow:0 2px 10px #172b4d22;}
-      .driver-panel-close {border:0; border-radius:6px; background:#f1f5f9; color:#172b4d; min-width:44px; min-height:44px; font-size:22px; cursor:pointer; flex-shrink:0;}
+      .driver-panel-close {appearance:none; border:0; border-radius:6px; background:#f1f5f9; color:#172b4d; width:44px; height:44px; min-width:44px; min-height:44px; padding:0; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; font:22px/1 Arial,sans-serif; cursor:pointer; flex:0 0 44px;}
+      .route-client-panel > .route-client-header,
+      .multi-course-panel > .multi-course-header,
+      #route-filter .client-panel > .client-panel-header {
+        position:sticky; top:0; z-index:10; background:#fff;
+        display:flex; align-items:center; justify-content:space-between; gap:8px;
+        min-height:44px; padding:4px 0; box-sizing:border-box;
+        border-bottom:1px solid #e2e8f0;
+      }
+      .route-client-panel > .route-client-header h4,
+      .multi-course-panel > .multi-course-header > b,
+      #route-filter .client-panel > .client-panel-header > b {
+        min-width:0; flex:1 1 auto; overflow-wrap:anywhere;
+      }
       .driver-panel-toggle:focus-visible, .driver-panel-close:focus-visible {outline:2px solid #2563eb; outline-offset:2px;}
+      .route-client-panel[data-driver-visibility-ready],
+      .multi-course-panel[data-driver-visibility-ready],
+      #route-filter .client-panel[data-driver-visibility-ready] {
+        display:flex; flex-direction:column; overflow:hidden !important;
+      }
+      [data-driver-visibility-ready] > .route-client-header,
+      [data-driver-visibility-ready] > .multi-course-header,
+      [data-driver-visibility-ready] > .client-panel-header {flex:0 0 auto;}
+      .driver-panel-content {
+        flex:1 1 auto; min-height:0; min-width:0; overflow:auto;
+        overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+      }
       .route-client-panel, .multi-course-panel, #route-filter .client-panel {
         box-sizing:border-box; height:85vh !important; height:85dvh !important;
         max-height:85vh !important; max-height:85dvh !important;
@@ -1993,6 +2018,8 @@ class InteractiveMapGenerator:
                 time_window_text = str(
                     schedule_entry.get("time_window_text", "") if schedule_entry else ""
                 ).strip()
+                if schedule_entry and schedule_entry.get("late_minutes", 0) > 0:
+                    time_window_text += f" · ⚠ Закъснение {schedule_entry['late_minutes']:.1f} мин"
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
                 has_time_window = self._customer_has_declared_time_window(customer)
                 has_comment = bool(delivery_comment)
@@ -2092,6 +2119,7 @@ class InteractiveMapGenerator:
                 "startPoint": self._google_route_start_point(route),
                 "routeStartTime": route_start_time_text,
                 "routeEndTime": self._route_end_time_text(route),
+                "tspWarningHtml": self._tsp_warning_html(route),
                 "markers": markers,
                 "path": [self._json_coords(point) for point in geometry],
                 "dashed": dashed,
@@ -3047,6 +3075,7 @@ class InteractiveMapGenerator:
             ${{routeEndText ? '<div class="client-route-stat"><span>Край:</span><b>' + escapeHtml(routeEndText) + '</b></div>' : ''}}
           </div>
           ${{renderGoogleSegments(route)}}
+          ${{route.tspWarningHtml || ''}}
           <div class="client-list"></div>
         </div>
       `;
@@ -4345,6 +4374,15 @@ class InteractiveMapGenerator:
             return f"{text[:-3]}.0"
         return text.rstrip("0")
 
+    def _tsp_warning_html(self, route: Route) -> str:
+        late = [e for e in (getattr(route, "schedule_entries", None) or []) if e.get("late_minutes", 0) > 0]
+        if not late:
+            return ""
+        labels = "; ".join(f"{html.escape(str(e['customer'].name))}: {e['late_minutes']:.1f} мин" for e in late)
+        return ('<div class="tsp-time-warning" role="status" style="padding:10px;margin:8px 0;'
+                'background:#fff1f2;border:1px solid #fda4af;border-radius:8px;color:#9f1239">'
+                f'<b>Извън работното време: {len(late)} клиента</b><br>{labels}</div>')
+
     def _route_stats_html(self, route: Route) -> str:
         start_time = self._route_start_time_text(route)
         end_time = self._route_end_time_text(route)
@@ -4378,6 +4416,7 @@ class InteractiveMapGenerator:
                 {start_html}
                 {end_html}
             </div>
+            {self._tsp_warning_html(route)}
         '''
 
     def _street_view_url(self, coords: Tuple[float, float]) -> str:
@@ -5452,6 +5491,8 @@ class InteractiveMapGenerator:
                 arrival_time_text = self._schedule_entry_text(schedule_entry, "arrival")
                 departure_time_text = self._schedule_entry_text(schedule_entry, "departure")
                 time_window_text = str(schedule_entry.get("time_window_text", "") if schedule_entry else "").strip()
+                if schedule_entry and schedule_entry.get("late_minutes", 0) > 0:
+                    time_window_text += f" · ⚠ Закъснение {schedule_entry['late_minutes']:.1f} мин"
                 has_time_window = self._customer_has_declared_time_window(customer)
                 delivery_comment = str(getattr(customer, "delivery_comment", "") or "").strip()
                 mandatory = is_mandatory_customer(customer)
