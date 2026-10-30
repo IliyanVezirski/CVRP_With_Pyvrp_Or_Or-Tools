@@ -32,7 +32,7 @@ assert new.post(base+'/demo/api/change-password',json={'current_password':long,'
 a=login('demo')
 data=a.get(base+'/demo/api/config').json()
 ops=data['operations_web'];key=ops['vehicles'][0]['key']
-policies={key:{'enabled':True,'rules':[{'min':0,'max':None,'service':{'mode':'fixed','seconds':123}}]}}
+policies={key:{'enabled':True,'rules':[{'min':0,'max':None,'service':{'mode':'fixed','seconds':123+seconds}}]}}
 fleet_body={'vehicles':data['vehicles'],'dynamic_policies':policies,
             'operations_revision':ops['revision'],'expected_revision':data['revision']}
 saved=a.post(base+'/demo/api/vehicles',json=fleet_body)
