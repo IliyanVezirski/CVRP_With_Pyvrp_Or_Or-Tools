@@ -93,3 +93,7 @@ desktop.ini
 # Local configuration snapshots may contain deployment credentials.
 config_backups/
 .venv-pyvrp-one/
+profiles/
+profiles.json
+profiles.lock
+data/*.lock

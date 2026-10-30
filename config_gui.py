@@ -29,6 +29,8 @@ if getattr(sys, 'frozen', False):
     _base_dir = os.path.dirname(sys.executable)
 else:
     _base_dir = os.path.dirname(os.path.abspath(__file__))
+from profile_runtime import profile_dir as _profile_dir
+if _profile_dir(): _base_dir=str(_profile_dir())
 sys.path.insert(0, _base_dir)
 import config
 from display_units import volume_unit_label, validate_volume_unit_label, total_volume_unit_label, customer_volume_unit_label
@@ -36,7 +38,7 @@ from map_display_settings import mandatory_customer_comment, validate_mandatory_
 from web_gui_auth import CredentialStore, CredentialStoreError, CredentialValidationError
 
 
-_WEB_GUI_PASSWORD_MIN_LENGTH = 8
+_WEB_GUI_PASSWORD_MIN_LENGTH = 1
 
 
 def _validate_web_gui_credential_form(username, password, confirmation):
@@ -101,6 +103,8 @@ class ConfigGUI:
         from config_compat import reload_config_module
         reload_config_module(config)
         self.cfg = config.get_config()
+        from profile_settings import prepare as prepare_profile_settings
+        prepare_profile_settings(self)
         self.widgets = {}  # field_key → widget
         self.controls = {}  # field_key → visible input control
         self.control_default_states = {}
@@ -150,6 +154,8 @@ class ConfigGUI:
                 f"<Alt-Key-{index + 1}>",
                 lambda event, section_index=index: self._select_section(section_index),
             )
+        from profile_settings import attach as attach_profile_settings
+        attach_profile_settings(self)
 
     # ── UI ────────────────────────────────────────────────────
 
@@ -7858,6 +7864,10 @@ TSP имената на полетата се настройват от GUI:
         return values
 
     def _apply_to_config_file(self, values: dict):
+        from profile_settings import save as save_profile_settings
+        return save_profile_settings(self,values,self._apply_to_config_file_unlocked)
+
+    def _apply_to_config_file_unlocked(self, values: dict):
         """Записва промените директно в config.py чрез текстова замяна"""
         config_path = os.path.join(_base_dir, "config.py")
         with open(config_path, "r", encoding="utf-8") as f:
@@ -9018,6 +9028,13 @@ TSP имената на полетата се настройват от GUI:
             self.root.destroy()
 
     def _save_and_run(self):
+        if _profile_dir():
+            if self._save_config(show_success=False):
+                from profile_runtime import home
+                from profile_store import read
+                port=read(home())['port']
+                webbrowser.open(f'http://127.0.0.1:{port}/'+os.environ['BIZANT_PROFILE'])
+            return
         self.status_var.set("Проверявам и записвам преди стартиране...")
         if not self._save_config(show_success=False):
             return

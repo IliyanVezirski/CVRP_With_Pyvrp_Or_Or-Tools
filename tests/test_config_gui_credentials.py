@@ -19,17 +19,20 @@ class CredentialFormValidationTests(unittest.TestCase):
         self.assertEqual(username, "iliyan")
         self.assertEqual(validated_password, password)
 
-    def test_empty_mismatch_and_short_password_are_rejected(self):
+    def test_empty_and_mismatched_password_are_rejected(self):
         invalid_values = (
             ("", "long enough", "long enough"),
             ("user", "", ""),
             ("user", "long enough", "different"),
-            ("user", "short", "short"),
         )
         for values in invalid_values:
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):
                     _validate_web_gui_credential_form(*values)
+
+    def test_short_and_long_passwords_are_preserved(self):
+        for password in ('x','ю '*10000):
+            self.assertEqual(_validate_web_gui_credential_form('user',password,password),('user',password))
 
 
 class CredentialStoreWiringTests(unittest.TestCase):

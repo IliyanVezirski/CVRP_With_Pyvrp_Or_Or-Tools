@@ -194,7 +194,7 @@ def portal_heading() -> str:
       <div><h2 class="visually-hidden" id="profileTitle">Тестове</h2>""" + portal_navigation() + """</div>
       <div class="profile-actions">
         <button class="primary" id="planButton" onclick="startRun()" disabled>Стартирай тест</button>
-        <button id="globalPlanButton" onclick="startRun(true)" disabled>Стартирай официално</button>
+        <button id="globalPlanButton" onclick="startRun(true)" disabled>Стартирай</button>
       </div>
     </div>
     """
@@ -234,7 +234,7 @@ def portal_exclusions_dialog() -> str:
       <p class="muted">Общи за тестовете и основното стартиране.</p>
       <label for="inExcludedCustomers">Клиентски номера</label>
       <textarea id="inExcludedCustomers" rows="5" placeholder="По един на ред или със запетая" autofocus></textarea>
-      <label for="inExcludedDocuments">Номера на документи (IdDoc)</label>
+      <label for="inExcludedDocuments">Номера на документи</label>
       <textarea id="inExcludedDocuments" rows="4" placeholder="Напр. 0004536890 — по един на ред или със запетая"></textarea>
       <p class="muted">Въведи целия номер с началните нули. Изключва се само посочената поръчка.</p>
       <label for="setDataExcludedGrafik">Направление</label>

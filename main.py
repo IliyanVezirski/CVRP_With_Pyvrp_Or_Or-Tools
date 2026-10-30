@@ -901,6 +901,12 @@ def run_optimization(
     
     config = get_config()
 
+    from profile_runtime import guard_run, profile_dir
+    if profile_dir() and not getattr(config,'_profile_guard_applied',False):
+        adjusted=guard_run(copy.deepcopy(config))
+        adjusted._profile_guard_applied=True
+        return run_optimization(input_file,input_data_override,adjusted)
+
     if not getattr(config, '_fleet_operations_applied', False):
         from fleet_automation import read as read_fleet_operations, effective as effective_fleet
         operations = read_fleet_operations()

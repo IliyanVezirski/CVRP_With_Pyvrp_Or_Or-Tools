@@ -51,8 +51,8 @@ function change(id,val){if(typeof val === 'boolean')$(id).checked=val;else $(id)
   assert.equal($('profileTitle').textContent,'Тестове');
   assert.equal($('webProfileTab').textContent,'Тестове');
   assert.equal($('pageTitle').textContent,'Bizant');
-  assert.equal($('divisionPath').textContent,'/hell','Show the configured GUI path, not the browser alias');
-  assert.equal(document.querySelectorAll('dialog').length,2);
+  assert.equal($('divisionPath').textContent,'Hell','Show the profile name without a slash');
+  assert.equal(document.querySelectorAll('dialog').length,4);
   assert.equal($('exclusionsDialog').hasAttribute('open'),false);
   assert.equal($('serverLine').textContent,'');
   assert.equal(document.querySelector('.profile-summary'),null);

@@ -186,7 +186,7 @@ _SHUTDOWN_COMMANDS = {"shutdown", "stop", "stop_program", "exit", "quit"}
 _REQUEST_BODY_LOG_LIMIT = 100_000
 _MAX_API_REQUEST_BODY_BYTES = 50 * 1024 * 1024
 _MAX_WEB_REQUEST_BODY_BYTES = 1024 * 1024
-_MAX_LOGIN_REQUEST_BODY_BYTES = 16 * 1024
+_MAX_LOGIN_REQUEST_BODY_BYTES = _MAX_WEB_REQUEST_BODY_BYTES
 _CLIENT_SOCKET_TIMEOUT_SECONDS = 30
 _SENSITIVE_HEADER_NAMES = {
     "authorization",
@@ -204,7 +204,7 @@ _TSP_REPORT_SCHEDULER_LOCK = threading.Lock()
 _TSP_REPORT_SCHEDULER_STARTED = False
 _TSP_REPORT_SCHEDULER_LAST_ATTEMPT: Dict[str, str] = {}
 _CONFIG_RELOAD_LOCK = threading.Lock()
-_CONFIG_TRANSACTION_LOCK = threading.RLock()
+from profile_runtime import CONFIG_LOCK as _CONFIG_TRANSACTION_LOCK
 _WEB_AUTH_LOCK = threading.Lock()
 _WEB_AUTH_SERVICE: Optional[WebGUIAuthService] = None
 _WEB_SESSION_COOKIE = "CVRP_WEB_SESSION"
@@ -640,6 +640,10 @@ def _child_python_executable() -> str:
 
 
 def _configured_run_command() -> list[str]:
+    from profile_runtime import profile_dir
+    if profile_dir():
+        from profile_server import command
+        return command()
     if getattr(sys, "frozen", False):
         return [sys.executable]
 
@@ -1928,7 +1932,7 @@ def _shared_exclusions(config_obj):
 def _save_shared_exclusions(payload):
     from input_handler import normalise_excluded_customer_ids
     if (not isinstance(payload, dict) or not {"customer_ids", "direction"} <= set(payload)
-            or set(payload) - {"customer_ids", "direction", "document_ids", "send_enabled"}):
+            or set(payload) - {"customer_ids", "direction", "document_ids", "send_enabled", "expected_revision"}):
         raise ValueError("Подай списък с клиенти и направление.")
     if not isinstance(payload["direction"], str):
         raise ValueError("Направлението трябва да е текст.")
@@ -1939,6 +1943,7 @@ def _save_shared_exclusions(payload):
     if any(c.isspace() for c in direction):
         raise ValueError("Въведи един номер на направление без интервали.")
     with _CONFIG_TRANSACTION_LOCK:
+        _check_save_revision(payload)
         config_obj = deepcopy(get_config())
         common = _shared_exclusions(config_obj)
         config_obj.input.excluded_customer_ids = ids
@@ -2171,6 +2176,8 @@ def _web_gui_subpath(path: str, api_config) -> str:
 
 
 def _web_auth_base_dir() -> str:
+    from profile_runtime import profile_dir
+    if profile_dir(): return str(profile_dir())
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(config_module.__file__))
@@ -2661,6 +2668,8 @@ def _build_web_run_config_override(payload: Any = None) -> tuple[MainConfig, lis
     saved = _stored_web_run_settings(base_config.api, strict=True, active_only=True) if profile == "web" else {}
     request_config = deepcopy(base_config)
     applied = _apply_web_run_settings(request_config, _merge_web_run_settings(saved, request_settings))
+    from profile_runtime import guard_run
+    guard_run(request_config)
     return request_config, list(dict.fromkeys(applied)), []
 
 
@@ -2849,6 +2858,7 @@ def _web_gui_config_payload(host: str, port: int, refresh_from_disk: bool = True
     apply_operations_locations(display_config, read_operations())
     return {
         "operations": operations,
+        "profile_identity": __import__('profile_runtime').metadata(),
         "operations_web": operations_payload(cfg, 'web'),
         "status": "ok",
         "app_name": str(getattr(api_config, "web_gui_title", "CVRP Optimizer") or "CVRP Optimizer"),
@@ -3112,7 +3122,16 @@ def _persist_web_gui_config(
 
 def _apply_web_gui_config_save(payload: Any) -> Dict[str, Any]:
     with _CONFIG_TRANSACTION_LOCK:
-        return _apply_web_gui_config_save_locked(payload)
+        _check_save_revision(payload)
+        return _apply_web_gui_config_save_locked({k:v for k,v in payload.items() if k!='expected_revision'})
+
+
+def _check_save_revision(payload):
+    if not isinstance(payload,dict): raise ValueError('Невалидни настройки.')
+    if isinstance(payload,dict) and payload.get('expected_revision') is not None:
+        current=_reload_config_from_disk()
+        if payload['expected_revision']!=_web_config_revision(current):
+            raise ValueError('Настройките са променени от друг прозорец. Обнови страницата преди запис.')
 
 
 def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
@@ -3228,7 +3247,35 @@ def _apply_web_gui_config_save_locked(payload: Any) -> Dict[str, Any]:
 
 def _apply_web_gui_vehicles_save(payload: Any) -> Dict[str, Any]:
     with _CONFIG_TRANSACTION_LOCK:
-        return _apply_web_gui_vehicles_save_locked(payload)
+        _check_save_revision(payload)
+        clean={k:v for k,v in payload.items() if k!='expected_revision'}
+        if 'dynamic_policies' not in clean: return _apply_web_gui_vehicles_save_locked(clean)
+        import fleet_automation as fleet
+        policies=clean.pop('dynamic_policies')
+        expected=clean.pop('operations_revision',None)
+        with fleet.LOCK:
+            settings=fleet.read()
+            if expected!=fleet.revision(settings): raise ValueError('Правилата са променени. Обнови страницата.')
+            if not isinstance(policies,dict): raise ValueError('Невалидни динамични правила.')
+            validated={key:dict(enabled=fleet._boolean(value.get('enabled',False)),rules=fleet.validate_rules(value.get('rules',[]))) for key,value in policies.items()}
+            before=deepcopy(get_config())
+            keys={str(v.get('config_id') or f'row:{i}') for i,v in enumerate(clean.get('vehicles',[])) if isinstance(v,dict)}
+            if set(validated)-keys: raise ValueError('Бусът е променен. Обнови страницата.')
+            result=_apply_web_gui_vehicles_save_locked(clean)
+            try:
+                fleet.save({'section':'flexible','value':validated,'revision':expected},get_config())
+            except Exception:
+                # Restore the base if the companion policy store could not save.
+                path=os.path.abspath(config_module.__file__)
+                fd,temp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='.rollback_')
+                os.close(fd)
+                try:
+                    shutil.copy2(result['backup_file'],temp);os.replace(temp,path)
+                finally:
+                    if os.path.exists(temp): os.unlink(temp)
+                config_module.config_manager.config=before
+                raise
+            return result
 
 
 def _apply_web_gui_vehicles_save_locked(payload: Any) -> Dict[str, Any]:
@@ -3295,7 +3342,8 @@ def _apply_web_gui_vehicles_save_locked(payload: Any) -> Dict[str, Any]:
 
 def _save_web_run_defaults(payload: Any) -> Dict[str, Any]:
     with _CONFIG_TRANSACTION_LOCK:
-        return _save_web_run_defaults_locked(payload)
+        _check_save_revision(payload)
+        return _save_web_run_defaults_locked({k:v for k,v in payload.items() if k!='expected_revision'})
 
 
 def _save_web_run_defaults_locked(payload: Any) -> Dict[str, Any]:
@@ -3527,6 +3575,10 @@ def _web_gui_login_html(api_config) -> str:
 
 def _web_gui_html(api_config, host: str, port: int) -> str:
     from operations_ui import markup as operations_markup, css as operations_css, script as operations_script
+    from profile_web import markup as account_markup, script as account_script
+    from dynamic_service_ui import script as dynamic_service_script
+    from calendar_ui import script as calendar_script, css as calendar_css
+    from zone_map_ui import markup as zone_map_markup, script as zone_map_script
     from supervisor_ui import supervisor_css, supervisor_toolbar, supervisor_progress, supervisor_script
     from web_portal import (dispatcher_labels, portal_css, portal_navigation,
                             portal_heading, portal_input_settings, portal_script, portal_exclusions_dialog)
@@ -3636,13 +3688,14 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     {portal_css()}
     {supervisor_css()}
     {operations_css()}
+    {calendar_css()}
     {theme_css()}
   </style>
 </head>
 <body>
   <header class="workspace-header">
     <div>
-      <div class="workspace-brand"><h1 id="pageTitle">Bizant</h1><span class="division-path" id="divisionPath" aria-label="Дивизия">{html.escape(base_path)}</span></div>
+      <div class="workspace-brand"><h1 id="pageTitle">Bizant</h1><span class="division-path" id="divisionPath" aria-label="Дивизия">{html.escape(base_path.strip('/').replace('_',' ').title())}</span></div>
       <div class="muted" id="serverLine">Зареждам...</div>
     </div>
     {supervisor_progress()}
@@ -3651,12 +3704,16 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       <span id="statusPill" class="pill">Зареждане…</span>
       <button onclick="loadAll()">Обнови</button>
       <button id="stopPlanButton" onclick="stopRun()" hidden>Спри изчислението</button>
+      <a href="/" style="color:inherit;text-decoration:none">Профили</a>
+      <button onclick="openPassword()">Парола</button>
       <button onclick="logout()">Изход</button>
     </div>
   </header>
   {portal_exclusions_dialog()}
   <main>
     {operations_markup()}
+    {account_markup()}
+    {zone_map_markup()}
     <section class="vehicles-section" id="fleetSection">
       <div class="section-head">
         <div>
@@ -4014,6 +4071,9 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       const request = Object.assign({{cache:"no-store", credentials:"same-origin"}}, options);
       request.headers = Object.assign({{}}, options.headers || {{}});
       const method = String(request.method || "GET").toUpperCase();
+      if (method === "POST" && ["/config","/vehicles","/run-defaults","/customer-exclusions"].includes(path) && request.body && state?.revision) {{
+        const payload=JSON.parse(request.body);payload.expected_revision=state.revision;request.body=JSON.stringify(payload);
+      }}
       if (!{{GET:1, HEAD:1}}[method]) request.headers["X-CSRF-Token"] = cookieValue("CVRP_WEB_CSRF");
       const response = await fetch(bootstrap.apiBase + path, request);
       if (response.status === 401 || response.status === 403) {{
@@ -4400,7 +4460,8 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
       vehicleTypes = data.vehicle_types || vehicleTypes;
       depotOptions = data.depots || [];
       $("pageTitle").textContent = "Bizant";
-      $("serverLine").textContent = "";
+      if(data.profile_identity) $("divisionPath").textContent=data.profile_identity.name;
+      $("serverLine").textContent = data.profile_identity?.trial_mode ? "Тестова инсталация · SetData и качването на карти са блокирани" : "";
       setStatus(data.run_status || {{}});
     }}
 
@@ -4813,6 +4874,10 @@ def _web_gui_html(api_config, host: str, port: int) -> str:
     {portal_script()}
     {supervisor_script()}
     {operations_script()}
+    {dynamic_service_script()}
+    {calendar_script()}
+    {zone_map_script()}
+    {account_script()}
     initialiseDispatcherControls();
     initialiseSupervisorUI();
     $("outUploadEnabled").addEventListener("change", () => {{
@@ -5370,6 +5435,10 @@ def _cvrp_run_is_active() -> bool:
 
 
 def _tsp_worker_command(input_path: str, output_path: str) -> list[str]:
+    from profile_runtime import profile_dir
+    if profile_dir():
+        from profile_server import command
+        return command()+['--tsp-worker',input_path,output_path]
     if getattr(sys, "frozen", False):
         return [sys.executable, "--tsp-worker", input_path, output_path]
 
@@ -5378,6 +5447,10 @@ def _tsp_worker_command(input_path: str, output_path: str) -> list[str]:
 
 
 def _web_run_worker_command(input_path: str, output_path: str) -> list[str]:
+    from profile_runtime import profile_dir
+    if profile_dir():
+        from profile_server import command
+        return command()+['--web-run-worker',input_path,output_path]
     if getattr(sys, "frozen", False):
         return [sys.executable, "--web-run-worker", input_path, output_path]
 
@@ -6201,6 +6274,16 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if subpath == '/api/change-password':
+            try:
+                payload=self._read_json_body(required=True,max_bytes=_MAX_WEB_REQUEST_BODY_BYTES)
+                with _CONFIG_TRANSACTION_LOCK:
+                    service.change_password(identity.username,payload.get('current_password'),payload.get('new_password'),payload.get('confirmation'),client_ip=self.client_address[0])
+                self._send_json(200,{'status':'changed'},extra_headers=_web_session_cookie_headers(api_config,self.headers,clear=True))
+            except Exception:
+                self._send_json(400,{'error':'Паролата не е променена. Провери текущата парола и потвърждението. При поредица грешки изчакай няколко минути.'})
+            return
+
         if subpath == "/api/stop-run":
             self._send_json(200, _stop_active_run())
             return
@@ -6587,7 +6670,10 @@ def run_server(host: str | None = None, port: int | None = None):
     server = ThreadingHTTPServer((host, port), CVRPApiHandler)
     try:
         from tsp_pyvrp import warmup as warmup_tsp
-        warmup_tsp(get_config())
+        # Shared-profile installations load TSP on first request. Keep eager
+        # warm-up for existing standalone TSP servers and their latency contract.
+        if not os.environ.get("BIZANT_PROFILE"):
+            warmup_tsp(get_config())
     except Exception:
         logger.exception("TSP PyVRP warmup failed; a new start will be attempted on the next TSP request")
     public_url = _build_public_base_url(api_config, host, port)

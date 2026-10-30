@@ -243,7 +243,7 @@ class DispatcherPortalTests(unittest.TestCase):
                 self.base.api.web_gui_title = 'Unrelated installation title'
                 page = api._web_gui_html(self.base.api, '127.0.0.1', 8095)
                 header = page.split('<body>', 1)[1].split('</header>', 1)[0]
-                self.assertIn('id="divisionPath" aria-label="Дивизия">' + api.html.escape(endpoint) + '</span>', header)
+                self.assertIn('id="divisionPath" aria-label="Дивизия">' + api.html.escape(endpoint.strip('/').replace('_',' ').title()) + '</span>', header)
                 self.assertNotIn('Unrelated installation title', header)
 
     def test_start_has_no_confirmation_dialog_or_scroll_to_logs(self):

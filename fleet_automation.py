@@ -200,11 +200,16 @@ def save(payload, config, path=None):
                     row = {'service':validate_service(policy.get('service', {'mode':'inherit'}))}
                     for field in VEHICLE_KEYS:
                         if field not in policy: continue
+                        if field != 'enabled' and policy[field] in (None, ''):
+                            continue  # A blank optional override inherits the fleet value.
                         row[field] = (_boolean(policy[field]) if field == 'enabled' else
                                       number(policy[field], field, 0.000001 if field == 'max_time_hours' else 0,
                                              field in ('count', 'start_time_minutes')))
                     if row.get('start_time_minutes', 0) >= 1440:
                         raise ValueError('Невалиден час на тръгване.')
+                    available=next(v.count for i,v in enumerate(config.vehicles) if vehicle_key(v,i)==key)
+                    if row.get('count',0)>available:
+                        raise ValueError(f'Графикът задава повече от наличните {available} буса. Първо промени автопарка.')
                     buses[key] = row
                 entries.append(dict(id=str(entry.get('id', len(entries))), name=str(entry.get('name', 'График'))[:120],
                                     enabled=_boolean(entry.get('enabled', True)), kind=kind, date=when,
@@ -318,7 +323,7 @@ def effective(config, settings=None, day=None, counts=None):
         if policy['mode'] == 'inherit':
             flex = settings['flexible'].get(key, {})
             policy = {'mode':'dynamic', 'rules':flex['rules']} if flex.get('enabled') else {'mode':'inherit'}
-            if policy['mode'] == 'dynamic': origin = 'Гъвкаво обслужване'
+            if policy['mode'] == 'dynamic': origin = 'Динамично обслужване'
         if policy['mode'] == 'dynamic':
             depot = depot_key(vehicle.start_location or result.locations.depot_location)
             average = counts.get(depot, {}).get('average')

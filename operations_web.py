@@ -64,6 +64,9 @@ def start_scheduler(get_config):
     def loop():
         while not stop.wait(15):
             try:
+                from profile_runtime import metadata
+                info=metadata()
+                if info and info.get('trial_mode',True): continue
                 settings = fleet.read()
                 rule = settings['check']
                 if not rule['enabled']: continue

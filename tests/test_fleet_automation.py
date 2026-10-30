@@ -32,6 +32,17 @@ def entry(kind='weekly',count=1,service=None):
                 vehicles={'van':{'count':count,'enabled':True,'service':service or {'mode':'inherit'}}})
 
 
+def test_calendar_rejects_counts_above_fleet_and_accepts_blank_inherited_limits(setup):
+    cfg,settings=setup
+    row=entry(count=3)
+    body={'section':'calendar','revision':fleet.revision(settings),'value':{'enabled':True,'entries':[row]}}
+    with pytest.raises(ValueError,match='наличните'):fleet.save(body,cfg)
+    row['vehicles']['van'].update(count=1,capacity=None,max_time_hours=7.5)
+    fleet.save(body,cfg)
+    saved=fleet.read()['calendar']['entries'][0]['vehicles']['van']
+    assert 'capacity' not in saved and saved['max_time_hours']==7.5
+
+
 def records(cfg, count=5, same_customer=False):
     return InputHandler(cfg).load_data_from_json_records([
         dict(IdCust='same' if same_customer else str(i),CustName='Test',GPS='42.7,23.3',Volume=1,

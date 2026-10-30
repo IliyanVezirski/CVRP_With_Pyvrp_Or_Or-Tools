@@ -85,6 +85,24 @@ def make_vehicle(**overrides):
 
 @unittest.skipUnless(ORTOOLS_AVAILABLE, "OR-Tools is not installed")
 class ORToolsMultiTripTests(unittest.TestCase):
+    def test_mandatory_multi_trip_search_accepts_feasible_single_trip_seed(self):
+        customers = make_customers(12)
+        for customer in customers[:4]:
+            customer.mandatory = True
+        config = make_config(allow_customer_skipping=True, time_limit_seconds=3,
+                             first_solution_strategy='PARALLEL_CHEAPEST_INSERTION')
+        vehicle = make_vehicle(count=2, capacity=100, max_customers_per_day=20)
+        depots = [START_DEPOT, FIXED_END]
+        solver = ORToolsSolver(config, [vehicle], customers,
+                               make_matrix(depots, customers), depots)
+        with self.assertLogs('cvrp_solver', level='INFO') as captured:
+            result = solver.solve()
+        self.assertTrue(result.is_feasible)
+        self.assertEqual(12, sum(len(r.customers) for r in result.routes))
+        self.assertTrue(any('валидно начално решение' in line for line in captured.output))
+        self.assertTrue(solver._create_data_model()['reload_nodes'])
+        self.assertTrue(config.enable_multiple_trips)
+
     def make_solver(self, customer_count, config=None, vehicle=None):
         customers = make_customers(customer_count)
         depots = [START_DEPOT, FIXED_END]

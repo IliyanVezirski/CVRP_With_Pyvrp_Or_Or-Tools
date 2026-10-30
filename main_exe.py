@@ -109,7 +109,10 @@ def _ensure_runtime_output_directories(config) -> None:
 def setup_exe_environment():
     """Настройва средата за EXE изпълнение"""
     # Променяме работната директория към директорията на EXE файла
-    if getattr(sys, 'frozen', False):
+    from profile_runtime import profile_dir
+    if profile_dir():
+        os.chdir(profile_dir())
+    elif getattr(sys, 'frozen', False):
         # Ако е EXE файл, използваме директорията на EXE файла
         exe_dir = Path(sys.executable).parent
         os.chdir(exe_dir)
@@ -141,6 +144,10 @@ def setup_exe_environment():
 
 # Динамично зареждане на config.py от директорията на EXE файла
 def load_config():
+    from profile_runtime import profile_dir, load_profile_config
+    if profile_dir():
+        load_profile_config()
+        return
     if getattr(sys, 'frozen', False):
         # За EXE файл, използваме директорията на EXE файла
         exe_dir = Path(sys.executable).parent
@@ -415,11 +422,23 @@ def web_run_worker_exe():
 
 if __name__ == "__main__":
     import multiprocessing
+    # Establish profile identity before importing solver modules or unpickling
+    # children. Environment is inherited by every isolated run/solver worker.
+    if '--profile' in sys.argv:
+        from profile_runtime import home
+        from profile_store import valid_slug, read
+        slug=valid_slug(sys.argv[sys.argv.index('--profile')+1])
+        if slug not in read(home())['profiles']: raise SystemExit('Unknown profile')
+        os.environ['BIZANT_PROFILE']=slug
+        os.environ['BIZANT_PROFILE_DIR']=str(home()/'profiles'/slug)
+    if os.environ.get('BIZANT_PROFILE_DIR'):
+        from profile_runtime import load_profile_config
+        load_profile_config()
     if getattr(sys, "frozen", False) and "--multiprocessing-fork" in sys.argv:
         # freeze_support dispatches directly into the pool worker and never
         # reaches load_config(). Install the same compatible schema BEFORE
         # unpickling/importing main; do not rewrite settings or create outputs.
-        worker_config_path = Path(sys.executable).parent / "config.py"
+        worker_config_path = Path(os.environ.get('BIZANT_PROFILE_DIR') or Path(sys.executable).parent) / "config.py"
         if worker_config_path.exists():
             worker_spec = importlib.util.spec_from_file_location("config", str(worker_config_path))
             worker_config = importlib.util.module_from_spec(worker_spec)
@@ -428,7 +447,23 @@ if __name__ == "__main__":
                                           str(worker_config_path)), worker_config.__dict__)
     multiprocessing.freeze_support()
     
-    if "--self-check" in sys.argv:
+    if '--profiles-server' in sys.argv or (len(sys.argv)==1 and not os.environ.get('BIZANT_PROFILE_DIR') and (Path(sys.executable).parent/'profiles.json').exists()):
+        from profile_runtime import home
+        from profile_server import serve
+        serve(home())
+    elif '--profiles-settings' in sys.argv:
+        from profile_runtime import home
+        from profile_store import read
+        if not os.environ.get('BIZANT_PROFILE'):
+            profiles=read(home())['profiles']
+            if not profiles: raise SystemExit('No profiles configured')
+            slug=next(iter(profiles))
+            os.environ['BIZANT_PROFILE']=slug
+            os.environ['BIZANT_PROFILE_DIR']=str(home()/'profiles'/slug)
+        load_config()
+        from config_gui import main as gui_main
+        gui_main()
+    elif "--self-check" in sys.argv:
         self_check_exe()
     elif "--web-run-worker" in sys.argv:
         web_run_worker_exe()

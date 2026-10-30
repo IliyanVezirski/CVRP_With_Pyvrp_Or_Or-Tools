@@ -900,6 +900,20 @@ class WebGUIAuthService:
 
         return self.sessions.revoke_session(token)
 
+    def change_password(self,username,current_password,new_password,confirmation,*,client_ip=''):
+        if self.rate_limiter.retry_after(client_ip,username): raise AuthenticationFailed()
+        # The existing credential revision invalidates all sessions, including
+        # the current one. The new password is never trimmed or truncated.
+        with self.credential_store._lock:
+            if self.credential_store.authenticate(username,current_password) is None:
+                self.rate_limiter.record_failure(client_ip,username)
+                raise AuthenticationFailed()
+            if new_password!=confirmation: raise CredentialValidationError('Паролите не съвпадат.')
+            _validate_password(new_password)
+            self.credential_store.reset_password(username,new_password)
+        self.sessions.revoke_user(username)
+        self.rate_limiter.record_success(client_ip,username)
+
 
 __all__ = [
     "AuthenticatedUser",

@@ -335,7 +335,7 @@ def supervisor_script():
         formulaBox.hidden=!formula;
         formulaDetails.hidden=!formula;
         if(!formula)formulaDetails.open=false;
-        row.querySelector('[data-field="service_time_minutes"]').closest('.vehicle-field').hidden=formula;
+        row.querySelector('[data-field="service_time_minutes"]').closest('.vehicle-field').hidden=formula || serviceMode.value==='dynamic';
         for(const key of formulaKeys)row.querySelector('[data-field="'+key+'"]').closest('.vehicle-field').hidden=!formula;
         preview.hidden=!formula;
         const [base,seconds,units,max]=formulaKeys.map(key=>Number(row.querySelector('[data-field="'+key+'"]').value));

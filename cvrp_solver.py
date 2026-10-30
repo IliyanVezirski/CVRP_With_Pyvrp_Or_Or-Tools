@@ -7,6 +7,7 @@ import random
 import math
 from display_units import volume_unit_label
 import time
+from copy import deepcopy
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import logging
@@ -266,7 +267,8 @@ class ORToolsSolver:
         if not ORTOOLS_AVAILABLE:
             logger.error("❌ OR-Tools не е инсталиран")
             return self._create_empty_solution()
-        
+
+        search_started = time.monotonic()
         try:
             # 1. Създаване на data model и мениджър
             data = self._create_data_model()
@@ -915,13 +917,56 @@ class ORToolsSolver:
 
             # 10. РЕШАВАНЕ
             logger.info(f"🚀 Стартирам решаване с пълни ограничения (времеви лимит: {self.config.time_limit_seconds}s)...")
-            solution = routing.SolveWithParameters(search_parameters)
+            initial = None
+            if data['reload_nodes'] and any(is_mandatory_customer(c) for c in self.customers):
+                # Insertion heuristics can fail to construct a first assignment
+                # with optional negative-demand reloads and mandatory visits,
+                # even when a single-trip assignment is feasible. Seed the SAME
+                # full model with a strictly feasible single-trip assignment;
+                # reloads remain available to the subsequent native search.
+                seed_config = deepcopy(self.config)
+                seed_config.enable_multiple_trips = False
+                seed_config.time_limit_seconds = max(1, min(5, int(self.config.time_limit_seconds) // 10))
+                seed_config.first_solution_strategy = 'PARALLEL_CHEAPEST_INSERTION'
+                seed_config.local_search_metaheuristic = 'GREEDY_DESCENT'
+                seed_config.log_search = False
+                seed_solver = ORToolsSolver(seed_config, self.vehicle_configs, self.customers,
+                                            self.distance_matrix, self.unique_depots,
+                                            self.center_zone_customers, self.location_config)
+                seed_solver._initialization_only = True
+                seed = seed_solver.solve()
+                if seed.is_feasible and getattr(seed_solver, '_native_routes', None) is not None:
+                    routing.CloseModelWithParameters(search_parameters)
+                    # Routing indices differ from node IDs when a separate
+                    # end-only depot is omitted by RoutingIndexManager.
+                    seed_indices = [[manager.NodeToIndex(node) for node in nodes]
+                                    for nodes in seed_solver._native_routes]
+                    initial = routing.ReadAssignmentFromRoutes(seed_indices, True)
+                    if initial:
+                        logger.info('OR-Tools: валидно начално решение; продължавам с разрешени допълнителни курсове.')
+                remaining = max(0.001, float(self.config.time_limit_seconds) - (time.monotonic() - search_started))
+                search_parameters.time_limit.FromMilliseconds(max(1, int(remaining * 1000)))
+            solution = (routing.SolveFromAssignmentWithParameters(initial, search_parameters)
+                        if initial else routing.SolveWithParameters(search_parameters))
+            if solution is None and initial is not None:
+                solution = initial  # Already validated by the full native model.
             
             # 11. ОБРАБОТКА НА РЕШЕНИЕТО
             if solution:
+                self._native_routes = []
+                for vehicle_id in range(data['num_vehicles']):
+                    nodes = []
+                    index = solution.Value(routing.NextVar(routing.Start(vehicle_id)))
+                    while not routing.IsEnd(index):
+                        nodes.append(manager.IndexToNode(index))
+                        index = solution.Value(routing.NextVar(index))
+                    self._native_routes.append(nodes)
                 return self._extract_solution(manager, routing, solution, data)
             else:
-                logger.error("❌ OR-Tools не намери решение!")
+                if getattr(self, '_initialization_only', False):
+                    logger.info('OR-Tools: няма начално решение без презареждане; използвам пълното multi-trip търсене.')
+                else:
+                    logger.error("❌ OR-Tools не намери решение!")
                 return self._create_empty_solution()
                 
         except Exception as e:

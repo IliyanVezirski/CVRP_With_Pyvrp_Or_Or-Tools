@@ -114,6 +114,8 @@ def solve_current_tsp_route(payload: Any, config: Optional[MainConfig] = None) -
         raise ValueError("TSP заявката трябва да бъде JSON обект.")
 
     active_config = config or get_config()
+    from profile_runtime import profile_dir, guard_run
+    if profile_dir(): active_config=guard_run(deepcopy(active_config))
     from fleet_automation import read as read_operations, apply_locations
     operations = read_operations()
     if operations['locations']:
@@ -780,6 +782,9 @@ def _tsp_generate_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bo
 
 
 def _tsp_upload_map_enabled(payload: Dict[str, Any], config: MainConfig) -> bool:
+    from profile_runtime import metadata
+    info=metadata()
+    if info and info.get('trial_mode',True): return False
     api_config = getattr(config, "api", None)
     default = bool(getattr(api_config, "tsp_upload_html_map", True))
     value = _first_present(payload, "upload_map", "upload_html_map", "tsp_upload_map", "tsp_upload_html_map")

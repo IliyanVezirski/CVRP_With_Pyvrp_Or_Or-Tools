@@ -100,4 +100,6 @@ def reload_config_module(module):
     """Reload in place so existing import references stay valid; never write disk."""
     path = Path(module.__file__)
     exec(compile_external_config(path.read_text(encoding="utf-8-sig"), str(path)), module.__dict__)
+    from profile_runtime import apply_identity
+    if hasattr(module,'get_config'): apply_identity(module.get_config())
     return module
