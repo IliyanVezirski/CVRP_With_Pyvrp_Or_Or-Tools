@@ -6542,7 +6542,7 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
                 result = {}
                 for key, item in value.items():
                     key_lower = str(key).lower()
-                    if any(marker in key_lower for marker in ("password", "token", "secret", "authorization", "api_key", "web_gui_users")):
+                    if any(marker in key_lower for marker in ("password", "confirmation", "token", "secret", "authorization", "api_key", "web_gui_users")):
                         result[key] = "***"
                     else:
                         result[key] = redact(item)
@@ -6556,7 +6556,7 @@ class CVRPApiHandler(BaseHTTPRequestHandler):
             safe_text = json.dumps(redact(json.loads(body_text)), ensure_ascii=False, separators=(",", ":"))
         except Exception:
             safe_text = re.sub(
-                r'(?i)("(?:password|[^"\\]*(?:token|secret|api_key|web_gui_users)[^"\\]*)"\s*:\s*)"(?:\\.|[^"\\])*"',
+                r'(?i)("[^"\\]*(?:password|confirmation|token|secret|api_key|web_gui_users)[^"\\]*"\s*:\s*)"(?:\\.|[^"\\])*"',
                 r'\1"***"',
                 body_text,
             )

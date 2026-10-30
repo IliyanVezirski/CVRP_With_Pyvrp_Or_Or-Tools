@@ -76,3 +76,11 @@ def test_settings_detects_concurrent_write(monkeypatch):
     monkeypatch.setattr(runtime,'config_hash',lambda:'new')
     monkeypatch.setattr(runtime,'CONFIG_LOCK',nullcontext())
     with pytest.raises(ValueError,match='променени'):save(app,{},lambda v:pytest.fail('must not write'))
+
+
+def test_password_confirmation_is_never_logged_even_in_malformed_json():
+    from cvrp_api_server import CVRPApiHandler
+    raw=json.dumps({'current_password':'old-private','new_password':'new-private','confirmation':'confirm-private'})
+    for body in (raw, raw[:-1]):
+        redacted=CVRPApiHandler._body_for_log(None,body)
+        assert 'private' not in redacted
